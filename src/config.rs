@@ -1,0 +1,510 @@
+use std::{fs, path::Path};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{CortexError, Result};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppConfig {
+    pub server: ServerConfig,
+    pub database: DatabaseConfig,
+    pub embedding: EmbeddingConfig,
+    pub indexing: IndexingConfig,
+    pub retrieval: RetrievalConfig,
+    pub working_set: WorkingSetConfig,
+    pub temporal: TemporalConfig,
+    pub context: ContextConfig,
+    pub logging: LoggingConfig,
+    pub languages: LanguageConfig,
+}
+
+impl AppConfig {
+    pub fn load(path: Option<&Path>) -> Result<Self> {
+        let config = if let Some(path) = path {
+            let source = fs::read_to_string(path).map_err(|error| CortexError::Io {
+                path: path.to_path_buf(),
+                source: error,
+            })?;
+            toml::from_str(&source)
+                .map_err(|error| CortexError::Configuration(error.to_string()))?
+        } else {
+            Self::default()
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.embedding.validate()?;
+        self.indexing.validate()?;
+        self.working_set.validate()?;
+        self.temporal.validate()?;
+        self.context.validate()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    pub mcp_transport: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            mcp_transport: "stdio".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DatabaseConfig {
+    pub path: String,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            path: ".cortexweave/cortexweave.db".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    pub base_url: String,
+    pub endpoint: String,
+    pub model: String,
+    pub dimension: Option<usize>,
+    pub batch_size: usize,
+    pub timeout_seconds: u64,
+    pub document_prefix: String,
+    pub query_prefix: String,
+    pub limits: EmbeddingLimitConfig,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "http://127.0.0.1:8081".into(),
+            endpoint: "/v1/embeddings".into(),
+            model: "local-embedding-model".into(),
+            dimension: None,
+            batch_size: 16,
+            timeout_seconds: 30,
+            document_prefix: String::new(),
+            query_prefix: String::new(),
+            limits: EmbeddingLimitConfig::default(),
+        }
+    }
+}
+
+impl EmbeddingConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.model.trim().is_empty() {
+            return Err(CortexError::Configuration(
+                "embedding.model cannot be empty".into(),
+            ));
+        }
+        if self.batch_size == 0 {
+            return Err(CortexError::Configuration(
+                "embedding.batch_size must be greater than zero".into(),
+            ));
+        }
+        if self.timeout_seconds == 0 {
+            return Err(CortexError::Configuration(
+                "embedding.timeout_seconds must be greater than zero".into(),
+            ));
+        }
+        if self.dimension == Some(0) {
+            return Err(CortexError::Configuration(
+                "embedding.dimension must be greater than zero when set".into(),
+            ));
+        }
+        self.limits.validate()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingLimitConfig {
+    pub max_input_tokens: Option<usize>,
+    pub max_batch_tokens: Option<usize>,
+    pub reserved_tokens: usize,
+    pub tokenizer: TokenizerKind,
+    pub tokenizer_path: Option<String>,
+}
+
+impl EmbeddingLimitConfig {
+    fn validate(&self) -> Result<()> {
+        if self.max_input_tokens == Some(0) {
+            return Err(CortexError::Configuration(
+                "embedding.limits.max_input_tokens must be greater than zero when set".into(),
+            ));
+        }
+        if self.max_batch_tokens == Some(0) {
+            return Err(CortexError::Configuration(
+                "embedding.limits.max_batch_tokens must be greater than zero when set".into(),
+            ));
+        }
+        if self
+            .max_input_tokens
+            .is_some_and(|limit| self.reserved_tokens >= limit)
+        {
+            return Err(CortexError::Configuration(
+                "embedding.limits.reserved_tokens must be smaller than max_input_tokens".into(),
+            ));
+        }
+        if self.tokenizer == TokenizerKind::HuggingFace
+            && self
+                .tokenizer_path
+                .as_deref()
+                .is_none_or(|path| path.trim().is_empty())
+        {
+            return Err(CortexError::Configuration(
+                "embedding.limits.tokenizer_path is required for the hugging_face tokenizer".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for EmbeddingLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_input_tokens: None,
+            max_batch_tokens: None,
+            reserved_tokens: 32,
+            tokenizer: TokenizerKind::ConservativeBytes,
+            tokenizer_path: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenizerKind {
+    #[default]
+    ConservativeBytes,
+    #[serde(rename = "huggingface", alias = "hugging_face")]
+    HuggingFace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IndexingConfig {
+    pub debounce_ms: u64,
+    pub max_file_bytes: u64,
+    pub max_concurrent_embedding_jobs: usize,
+    pub include_patterns: Vec<String>,
+    pub exclude_patterns: Vec<String>,
+    pub generic_chunks: GenericChunkConfig,
+    pub embedding_segments: EmbeddingSegmentConfig,
+}
+
+impl Default for IndexingConfig {
+    fn default() -> Self {
+        Self {
+            debounce_ms: 300,
+            max_file_bytes: 1_048_576,
+            max_concurrent_embedding_jobs: 2,
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            generic_chunks: GenericChunkConfig::default(),
+            embedding_segments: EmbeddingSegmentConfig::default(),
+        }
+    }
+}
+
+impl IndexingConfig {
+    fn validate(&self) -> Result<()> {
+        if self.max_concurrent_embedding_jobs == 0 {
+            return Err(CortexError::Configuration(
+                "indexing.max_concurrent_embedding_jobs must be greater than zero".into(),
+            ));
+        }
+        if self.max_file_bytes == 0 {
+            return Err(CortexError::Configuration(
+                "indexing.max_file_bytes must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingSegmentConfig {
+    pub overlap_tokens: usize,
+}
+
+impl Default for EmbeddingSegmentConfig {
+    fn default() -> Self {
+        Self { overlap_tokens: 64 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GenericChunkConfig {
+    pub target_chars: usize,
+    pub overlap_chars: usize,
+}
+
+impl Default for GenericChunkConfig {
+    fn default() -> Self {
+        Self {
+            target_chars: 3_000,
+            overlap_chars: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetrievalConfig {
+    pub default_k: usize,
+    pub semantic_weight: f32,
+    pub lexical_weight: f32,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            default_k: 8,
+            semantic_weight: 0.70,
+            lexical_weight: 0.30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkingSetConfig {
+    pub enabled: bool,
+    pub decay_half_life_minutes: f64,
+    pub activation_increment: f32,
+    pub max_activation_score: f32,
+    pub min_activation_score: f32,
+    pub max_items: usize,
+}
+
+impl Default for WorkingSetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            decay_half_life_minutes: 90.0,
+            activation_increment: 0.35,
+            max_activation_score: 1.0,
+            min_activation_score: 0.01,
+            max_items: 100,
+        }
+    }
+}
+
+impl WorkingSetConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.decay_half_life_minutes.is_finite() || self.decay_half_life_minutes <= 0.0 {
+            return Err(CortexError::Configuration(
+                "working_set.decay_half_life_minutes must be finite and greater than zero".into(),
+            ));
+        }
+        if !self.activation_increment.is_finite() || self.activation_increment <= 0.0 {
+            return Err(CortexError::Configuration(
+                "working_set.activation_increment must be finite and greater than zero".into(),
+            ));
+        }
+        if !self.max_activation_score.is_finite() || self.max_activation_score <= 0.0 {
+            return Err(CortexError::Configuration(
+                "working_set.max_activation_score must be finite and greater than zero".into(),
+            ));
+        }
+        if !self.min_activation_score.is_finite()
+            || self.min_activation_score < 0.0
+            || self.min_activation_score >= self.max_activation_score
+        {
+            return Err(CortexError::Configuration(
+                "working_set.min_activation_score must be finite, non-negative, and smaller than max_activation_score".into(),
+            ));
+        }
+        if self.max_items == 0 {
+            return Err(CortexError::Configuration(
+                "working_set.max_items must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TemporalConfig {
+    pub recency_half_life_hours: f64,
+}
+
+impl Default for TemporalConfig {
+    fn default() -> Self {
+        Self {
+            recency_half_life_hours: 72.0,
+        }
+    }
+}
+
+impl TemporalConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.recency_half_life_hours.is_finite() || self.recency_half_life_hours <= 0.0 {
+            return Err(CortexError::Configuration(
+                "temporal.recency_half_life_hours must be finite and greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextConfig {
+    pub candidate_pool_limit: usize,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            candidate_pool_limit: 50,
+        }
+    }
+}
+
+impl ContextConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.candidate_pool_limit == 0 {
+            return Err(CortexError::Configuration(
+                "context.candidate_pool_limit must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoggingConfig {
+    pub level: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LanguageConfig {
+    pub rust: bool,
+    pub python: bool,
+    pub javascript: bool,
+    pub typescript: bool,
+    pub csharp: bool,
+    pub go: bool,
+}
+
+impl Default for LanguageConfig {
+    fn default() -> Self {
+        Self {
+            rust: true,
+            python: true,
+            javascript: true,
+            typescript: true,
+            csharp: true,
+            go: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_configuration_keeps_defaults() {
+        let config: AppConfig = toml::from_str("[logging]\nlevel = 'debug'\n").unwrap();
+        assert_eq!(config.logging.level, "debug");
+        assert_eq!(config.retrieval.default_k, 8);
+        assert_eq!(config.working_set.max_items, 100);
+        assert_eq!(config.temporal.recency_half_life_hours, 72.0);
+        assert_eq!(config.context.candidate_pool_limit, 50);
+        assert!(config.languages.rust);
+        assert_eq!(
+            config.embedding.limits.tokenizer,
+            TokenizerKind::ConservativeBytes
+        );
+    }
+
+    #[test]
+    fn validates_embedding_capacity_limits() {
+        let invalid: AppConfig =
+            toml::from_str("[embedding.limits]\nmax_input_tokens = 32\nreserved_tokens = 32\n")
+                .unwrap();
+        assert!(invalid.validate().is_err());
+
+        let valid: AppConfig = toml::from_str(
+            "[embedding.limits]\nmax_input_tokens = 2048\nmax_batch_tokens = 4096\nreserved_tokens = 32\n",
+        )
+        .unwrap();
+        valid.validate().unwrap();
+
+        let independent_batch: AppConfig = toml::from_str(
+            "[embedding.limits]\nmax_input_tokens = 2048\nmax_batch_tokens = 2015\nreserved_tokens = 32\n",
+        )
+        .unwrap();
+        independent_batch.validate().unwrap();
+
+        let missing_tokenizer: AppConfig = toml::from_str(
+            "[embedding.limits]\ntokenizer = 'huggingface'\nmax_input_tokens = 2048\n",
+        )
+        .unwrap();
+        assert!(missing_tokenizer.validate().is_err());
+
+        let exact_tokenizer: AppConfig = toml::from_str(
+            "[embedding.limits]\ntokenizer = 'hugging_face'\ntokenizer_path = 'tokenizer.json'\nmax_input_tokens = 2048\n",
+        )
+        .unwrap();
+        exact_tokenizer.validate().unwrap();
+    }
+
+    #[test]
+    fn validates_working_set_coefficients() {
+        let invalid_half_life: AppConfig =
+            toml::from_str("[working_set]\ndecay_half_life_minutes = 0").unwrap();
+        assert!(invalid_half_life.validate().is_err());
+
+        let invalid_thresholds: AppConfig =
+            toml::from_str("[working_set]\nmin_activation_score = 1.0\nmax_activation_score = 1.0")
+                .unwrap();
+        assert!(invalid_thresholds.validate().is_err());
+
+        let valid: AppConfig = toml::from_str(
+            "[working_set]\ndecay_half_life_minutes = 45\nactivation_increment = 0.25\nmax_activation_score = 2.0\nmin_activation_score = 0.05\nmax_items = 50",
+        )
+        .unwrap();
+        valid.validate().unwrap();
+    }
+
+    #[test]
+    fn validates_temporal_recency_half_life() {
+        let invalid: AppConfig = toml::from_str("[temporal]\nrecency_half_life_hours = 0").unwrap();
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn validates_candidate_pool_limit() {
+        let invalid: AppConfig = toml::from_str("[context]\ncandidate_pool_limit = 0").unwrap();
+        assert!(invalid.validate().is_err());
+    }
+}

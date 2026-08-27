@@ -1,0 +1,75 @@
+[server]
+mcp_transport = "stdio"
+# Supply the MCP workspace hint at launch with `serve --workspace-root <path>`
+# or CORTEXWEAVE_WORKSPACE_ROOT. It is intentionally not persisted here.
+
+[database]
+path = ".cortexweave/cortexweave.db"
+
+[embedding]
+base_url = "http://127.0.0.1:8081"
+endpoint = "/v1/embeddings"
+model = "local-embedding-model"
+# Set this to make same-name embedding dimension changes trigger safe re-indexing.
+# dimension = 384
+batch_size = 16
+timeout_seconds = 30
+# Leave these empty for generic embedding models. For nomic-embed-text-v1.5 use:
+# document_prefix = "search_document: "
+# query_prefix = "search_query: "
+
+[embedding.limits]
+# Set these to the embedding server's actual runtime limits.
+# max_input_tokens = 2048
+# max_batch_tokens = 4096
+reserved_tokens = 32
+tokenizer = "conservative_bytes"
+# For exact local counting, use both of the following instead:
+# tokenizer = "huggingface"
+# tokenizer_path = "C:/path/to/tokenizer.json"
+
+[indexing]
+debounce_ms = 300
+max_file_bytes = 1048576
+max_concurrent_embedding_jobs = 2
+# Root-relative glob controls. Excludes take precedence over includes.
+# include_patterns = ["src/**", "README.md"]
+# exclude_patterns = ["src/generated/**"]
+
+[indexing.generic_chunks]
+target_chars = 3000
+overlap_chars = 300
+
+[indexing.embedding_segments]
+# Token overlap applied only when a logical analyzer chunk exceeds the embedding limit.
+overlap_tokens = 64
+
+[retrieval]
+default_k = 8
+semantic_weight = 0.70
+lexical_weight = 0.30
+
+[working_set]
+enabled = true
+decay_half_life_minutes = 90
+activation_increment = 0.35
+max_activation_score = 1.0
+min_activation_score = 0.01
+max_items = 100
+
+[temporal]
+recency_half_life_hours = 72
+
+[context]
+candidate_pool_limit = 50
+
+[logging]
+level = "info"
+
+[languages]
+rust = true
+python = true
+javascript = true
+typescript = true
+csharp = true
+go = true

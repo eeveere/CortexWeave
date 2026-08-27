@@ -1,0 +1,54 @@
+[server]
+mcp_transport = "stdio"
+
+[database]
+path = "C:/dev/CortexWeave/.cortexweave/cortexweave.db"
+
+[embedding]
+base_url = "http://127.0.0.1:8081"
+endpoint = "/v1/embeddings"
+model = "nomic-embed-text-v1.5"
+# Set this to make same-name embedding dimension changes trigger safe re-indexing.
+# dimension = 768
+batch_size = 1
+timeout_seconds = 60
+# Required retrieval instructions for nomic-embed-text-v1.5.
+document_prefix = "search_document: "
+query_prefix = "search_query: "
+
+[embedding.limits]
+max_input_tokens = 2048
+max_batch_tokens = 4096
+reserved_tokens = 32
+tokenizer = "conservative_bytes"
+
+[indexing]
+debounce_ms = 300
+max_file_bytes = 1048576
+max_concurrent_embedding_jobs = 2
+# Root-relative glob controls. Excludes take precedence over includes.
+# include_patterns = ["src/**", "README.md"]
+# exclude_patterns = ["src/generated/**"]
+
+[indexing.generic_chunks]
+target_chars = 900
+overlap_chars = 100
+
+[indexing.embedding_segments]
+overlap_tokens = 64
+
+[retrieval]
+default_k = 8
+semantic_weight = 0.70
+lexical_weight = 0.30
+
+[logging]
+level = "info"
+
+[languages]
+rust = false
+python = false
+javascript = false
+typescript = false
+csharp = false
+go = false
