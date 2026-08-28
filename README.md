@@ -1,3 +1,5 @@
+![CortexWeave-banner](https://github.com/eeveere/CortexWeave/blob/9c9fd34b5557527124bb3f1039d45dfc4a564553/CortexWeave-banner.JPG)
+
 # CortexWeave
 
 CortexWeave v0.1 is a local-first semantic code index and explicit memory store
