@@ -1,0 +1,18 @@
+/target/
+/.cortexweave/
+/.crushrc
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+.env.*
+!.env.example
+
+/CortexWeave v0.1 Revised Multi-Language Implementation Plan.md
+/CortexWeave v0.1.1 Indexing Hardening and Workspace Resolution Plan.md
+/CortexWeave v0.2 Context Orchestration Plan.md
+/CortexWeave v0.3 Native Agent Integration Plan.md
+/Small Models, Smart Systems_ A Roadmap Toward Frontier-Level Agentic Results.md

@@ -7,7 +7,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use cortexweave::{
     AppConfig, CortexError, CortexWeaveService, Result,
     adapters::mcp::{McpServer, WorkspaceHint},
-    domain::{MemoryKind, MemoryRecord},
+    domain::{
+        Checkpoint, ContextRequest, ContextSourceType, MemoryKind, MemoryRecord,
+        ResumeContextRequest,
+    },
     workspace::WorkspaceSelector,
 };
 use serde::Serialize;
@@ -32,6 +35,9 @@ enum Command {
     Status {
         workspace_id: Option<String>,
     },
+    Readiness {
+        workspace_id: Option<String>,
+    },
     Metrics {
         workspace_id: Option<String>,
     },
@@ -40,6 +46,15 @@ enum Command {
         command: WorkspaceCommand,
     },
     Search(SearchArgs),
+    Context(ContextArgs),
+    Resume(ResumeArgs),
+    WorkingSet(WorkingSetArgs),
+    ContextPin(ContextSourceArgs),
+    ContextUnpin(ContextSourceArgs),
+    Checkpoint {
+        #[command(subcommand)]
+        command: CheckpointCommand,
+    },
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
@@ -73,6 +88,101 @@ struct SearchArgs {
     mode: SearchMode,
     #[arg(long)]
     limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct ContextArgs {
+    workspace_id: String,
+    query: String,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long)]
+    task_id: Option<String>,
+    #[arg(long)]
+    token_budget: Option<usize>,
+    #[arg(long)]
+    no_code: bool,
+    #[arg(long)]
+    no_documents: bool,
+    #[arg(long)]
+    no_memories: bool,
+    #[arg(long)]
+    no_events: bool,
+    #[arg(long = "path-scope")]
+    path_scope: Vec<String>,
+    #[arg(long = "language-scope")]
+    language_scope: Vec<String>,
+    #[arg(long)]
+    explain: bool,
+}
+
+#[derive(Debug, Args)]
+struct ResumeArgs {
+    workspace_id: String,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long)]
+    task_id: Option<String>,
+    #[arg(long)]
+    token_budget: Option<usize>,
+    #[arg(long)]
+    explain: bool,
+}
+
+#[derive(Debug, Args)]
+struct WorkingSetArgs {
+    workspace_id: String,
+    session_id: String,
+    #[arg(long)]
+    task_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ContextSourceArgs {
+    workspace_id: String,
+    session_id: String,
+    source_id: String,
+    source_type: String,
+    #[arg(long)]
+    task_id: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum CheckpointCommand {
+    Create(CheckpointCreateArgs),
+    Latest(CheckpointLatestArgs),
+}
+
+#[derive(Debug, Args)]
+struct CheckpointCreateArgs {
+    workspace_id: String,
+    session_id: String,
+    content: String,
+    #[arg(long)]
+    task_id: Option<String>,
+    #[arg(long)]
+    objective: Option<String>,
+    #[arg(long)]
+    completed: Vec<String>,
+    #[arg(long)]
+    decision_id: Vec<String>,
+    #[arg(long)]
+    open_problem: Vec<String>,
+    #[arg(long)]
+    related_path: Vec<String>,
+    #[arg(long)]
+    related_symbol: Vec<String>,
+    #[arg(long)]
+    next_action: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CheckpointLatestArgs {
+    workspace_id: String,
+    #[arg(long, conflicts_with = "task_id")]
+    session_id: Option<String>,
+    #[arg(long)]
+    task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -209,6 +319,17 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
                 print_json(statuses)?;
             }
         }
+        Command::Readiness { workspace_id } => {
+            if let Some(workspace_id) = workspace_id {
+                print_json(service.workspace_readiness(&workspace_id).await?)?;
+            } else {
+                let mut reports = Vec::new();
+                for workspace in service.list_workspaces().await? {
+                    reports.push(service.workspace_readiness(&workspace.id).await?);
+                }
+                print_json(reports)?;
+            }
+        }
         Command::Metrics { workspace_id } => {
             print_json(service.instrumentation(workspace_id.as_deref()).await?)?;
         }
@@ -240,6 +361,100 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
             };
             print_json(results)?;
         }
+        Command::Context(args) => {
+            let mut request = ContextRequest::new(args.workspace_id);
+            request.query = Some(args.query);
+            request.session_id = args.session_id;
+            request.task_id = args.task_id;
+            request.token_budget = args.token_budget.unwrap_or(request.token_budget);
+            request.include_code = !args.no_code;
+            request.include_documents = !args.no_documents;
+            request.include_memories = !args.no_memories;
+            request.include_events = !args.no_events;
+            request.path_scope = args.path_scope;
+            request.language_scope = args.language_scope;
+            request.include_explanation = args.explain;
+            print_json(service.semantic_context(request).await?)?;
+        }
+        Command::Resume(args) => {
+            let mut request = ResumeContextRequest::new(args.workspace_id);
+            request.session_id = args.session_id;
+            request.task_id = args.task_id;
+            request.token_budget = args.token_budget.unwrap_or(request.token_budget);
+            request.include_explanation = args.explain;
+            print_json(service.resume_context(request).await?)?;
+        }
+        Command::WorkingSet(args) => {
+            print_json(
+                service
+                    .inspect_working_set(
+                        &args.workspace_id,
+                        &args.session_id,
+                        args.task_id.as_deref(),
+                    )
+                    .await?,
+            )?;
+        }
+        Command::ContextPin(args) => {
+            print_json(
+                service
+                    .pin_context(
+                        &args.workspace_id,
+                        &args.session_id,
+                        args.task_id.as_deref(),
+                        &args.source_id,
+                        ContextSourceType::from_storage(&args.source_type),
+                    )
+                    .await?,
+            )?;
+        }
+        Command::ContextUnpin(args) => {
+            print_json(
+                service
+                    .unpin_context(
+                        &args.workspace_id,
+                        &args.session_id,
+                        args.task_id.as_deref(),
+                        &args.source_id,
+                        ContextSourceType::from_storage(&args.source_type),
+                    )
+                    .await?,
+            )?;
+        }
+        Command::Checkpoint { command } => match command {
+            CheckpointCommand::Create(args) => {
+                let mut checkpoint =
+                    Checkpoint::new(args.workspace_id, args.session_id, args.content);
+                checkpoint.task_id = args.task_id;
+                checkpoint.objective = args.objective;
+                checkpoint.completed = args.completed;
+                checkpoint.decision_ids = args.decision_id;
+                checkpoint.open_problems = args.open_problem;
+                checkpoint.related_paths = args.related_path;
+                checkpoint.related_symbols = args.related_symbol;
+                checkpoint.next_action = args.next_action;
+                print_json(service.create_checkpoint(checkpoint).await?)?;
+            }
+            CheckpointCommand::Latest(args) => {
+                let checkpoint = match (args.session_id, args.task_id) {
+                    (Some(session_id), None) => {
+                        service
+                            .latest_checkpoint_for_session(&args.workspace_id, &session_id)
+                            .await?
+                    }
+                    (None, Some(task_id)) => {
+                        service
+                            .latest_checkpoint_for_task(&args.workspace_id, &task_id)
+                            .await?
+                    }
+                    (None, None) => service.latest_checkpoint(&args.workspace_id).await?,
+                    (Some(_), Some(_)) => {
+                        unreachable!("clap enforces conflicting checkpoint scopes")
+                    }
+                };
+                print_json(checkpoint)?;
+            }
+        },
         Command::Memory { command } => match command {
             MemoryCommand::Add(args) => {
                 let metadata: Value = args

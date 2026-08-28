@@ -256,6 +256,93 @@ impl MemoryKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryOrigin {
+    #[default]
+    HumanAuthorized,
+    Imported,
+}
+
+impl MemoryOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HumanAuthorized => "human_authorized",
+            Self::Imported => "imported",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Self {
+        match value {
+            "imported" => Self::Imported,
+            _ => Self::HumanAuthorized,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryTrust {
+    #[default]
+    Trusted,
+    Unreviewed,
+    Rejected,
+}
+
+impl MemoryTrust {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::Unreviewed => "unreviewed",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Self {
+        match value {
+            "unreviewed" => Self::Unreviewed,
+            "rejected" => Self::Rejected,
+            _ => Self::Trusted,
+        }
+    }
+
+    pub fn is_context_eligible(self) -> bool {
+        self == Self::Trusted
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSegment {
+    pub source: String,
+    pub start_byte: u64,
+    pub end_byte: u64,
+}
+
+impl SourceSegment {
+    pub fn new(source: impl Into<String>, start_byte: u64, end_byte: u64) -> Self {
+        Self {
+            source: source.into(),
+            start_byte,
+            end_byte,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryClaim {
+    pub key: String,
+    pub value: Value,
+}
+
+impl MemoryClaim {
+    pub fn new(key: impl Into<String>, value: Value) -> Self {
+        Self {
+            key: key.into(),
+            value,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRecord {
     pub id: String,
@@ -266,6 +353,14 @@ pub struct MemoryRecord {
     pub content: String,
     pub related_paths: Vec<String>,
     pub metadata: Value,
+    #[serde(default)]
+    pub origin: MemoryOrigin,
+    #[serde(default)]
+    pub trust: MemoryTrust,
+    #[serde(default)]
+    pub source_segments: Vec<SourceSegment>,
+    #[serde(default)]
+    pub claim: Option<MemoryClaim>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -284,8 +379,25 @@ impl MemoryRecord {
             content: content.into(),
             related_paths: Vec::new(),
             metadata: json!({}),
+            origin: MemoryOrigin::HumanAuthorized,
+            trust: MemoryTrust::Trusted,
+            source_segments: Vec::new(),
+            claim: None,
             created_at: Utc::now(),
         }
+    }
+
+    pub fn imported(
+        workspace_id: impl Into<String>,
+        kind: MemoryKind,
+        content: impl Into<String>,
+        source_segments: Vec<SourceSegment>,
+    ) -> Self {
+        let mut memory = Self::new(workspace_id, kind, content);
+        memory.origin = MemoryOrigin::Imported;
+        memory.trust = MemoryTrust::Unreviewed;
+        memory.source_segments = source_segments;
+        memory
     }
 
     pub fn metadata_for_storage(&self) -> Value {
@@ -311,6 +423,40 @@ impl MemoryRecord {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryTrustReview {
+    pub id: String,
+    pub workspace_id: String,
+    pub memory_id: String,
+    pub previous_trust: MemoryTrust,
+    pub new_trust: MemoryTrust,
+    pub reviewed_by: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl MemoryTrustReview {
+    pub fn new(
+        workspace_id: impl Into<String>,
+        memory_id: impl Into<String>,
+        previous_trust: MemoryTrust,
+        new_trust: MemoryTrust,
+        reviewed_by: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            workspace_id: workspace_id.into(),
+            memory_id: memory_id.into(),
+            previous_trust,
+            new_trust,
+            reviewed_by: reviewed_by.into(),
+            reason: reason.into(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
@@ -328,6 +474,7 @@ pub enum EventType {
     ExternalToolFinished,
     CompilerResult,
     TestResult,
+    ContextHydrationOverride,
     Other(String),
 }
 

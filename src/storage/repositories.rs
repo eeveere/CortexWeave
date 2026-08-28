@@ -6,8 +6,9 @@ use crate::{
     CortexError, Result,
     domain::{
         Checkpoint, ContextPin, ContextSourceType, CortexEvent, Document, EmbeddingRecord,
-        EventType, MemoryKind, MemoryRecord, MemorySupersession, Session, StoredChunk, SymbolKind,
-        Task, TaskStatus, TemporalBounds, WorkingSetEntry, Workspace,
+        EventType, MemoryClaim, MemoryKind, MemoryOrigin, MemoryRecord, MemorySupersession,
+        MemoryTrust, MemoryTrustReview, Session, SourceSegment, StoredChunk, SymbolKind, Task,
+        TaskStatus, TemporalBounds, WorkingSetEntry, Workspace,
     },
 };
 
@@ -26,6 +27,19 @@ pub(crate) struct CodeCandidate {
     pub chunk: StoredChunk,
     pub workspace_id: String,
     pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StructuralRelation {
+    Container,
+    Neighbor,
+    Related,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StructuralCodeCandidate {
+    pub candidate: TemporalCandidate,
+    pub relation: StructuralRelation,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +170,29 @@ impl SqliteStorage {
         row.map(TryInto::try_into).transpose()
     }
 
+    pub(crate) async fn latest_active_session(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<Session>> {
+        let row = sqlx::query_as::<_, SessionRow>(
+            "SELECT id, workspace_id, started_at, ended_at, metadata_json FROM sessions WHERE workspace_id = ? AND ended_at IS NULL ORDER BY started_at DESC, id DESC LIMIT 1",
+        )
+        .bind(workspace_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub(crate) async fn latest_ended_session(&self, workspace_id: &str) -> Result<Option<Session>> {
+        let row = sqlx::query_as::<_, SessionRow>(
+            "SELECT id, workspace_id, started_at, ended_at, metadata_json FROM sessions WHERE workspace_id = ? AND ended_at IS NOT NULL ORDER BY ended_at DESC, id DESC LIMIT 1",
+        )
+        .bind(workspace_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
     pub async fn insert_task(&self, task: &Task) -> Result<()> {
         sqlx::query(
             "INSERT INTO tasks(id, workspace_id, session_id, title, status, details_json, created_at, updated_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -206,6 +243,56 @@ impl SqliteStorage {
         .bind(task_id)
         .fetch_optional(self.pool())
         .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub(crate) async fn latest_active_task(
+        &self,
+        workspace_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<Option<Task>> {
+        self.latest_task_by_status(workspace_id, session_id, "status = 'active'")
+            .await
+    }
+
+    pub(crate) async fn latest_incomplete_task(
+        &self,
+        workspace_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<Option<Task>> {
+        self.latest_task_by_status(workspace_id, session_id, "status IN ('pending', 'active')")
+            .await
+    }
+
+    async fn latest_task_by_status(
+        &self,
+        workspace_id: &str,
+        session_id: Option<&str>,
+        status_predicate: &str,
+    ) -> Result<Option<Task>> {
+        let query = match session_id {
+            Some(_) => format!(
+                "SELECT id, workspace_id, session_id, title, status, details_json, created_at, updated_at, completed_at FROM tasks WHERE workspace_id = ? AND session_id = ? AND {status_predicate} ORDER BY updated_at DESC, id DESC LIMIT 1"
+            ),
+            None => format!(
+                "SELECT id, workspace_id, session_id, title, status, details_json, created_at, updated_at, completed_at FROM tasks WHERE workspace_id = ? AND {status_predicate} ORDER BY updated_at DESC, id DESC LIMIT 1"
+            ),
+        };
+        let row = match session_id {
+            Some(session_id) => {
+                sqlx::query_as::<_, TaskRow>(&query)
+                    .bind(workspace_id)
+                    .bind(session_id)
+                    .fetch_optional(self.pool())
+                    .await?
+            }
+            None => {
+                sqlx::query_as::<_, TaskRow>(&query)
+                    .bind(workspace_id)
+                    .fetch_optional(self.pool())
+                    .await?
+            }
+        };
         row.map(TryInto::try_into).transpose()
     }
 
@@ -275,6 +362,100 @@ impl SqliteStorage {
         .fetch_optional(self.pool())
         .await?;
         row.map(TryInto::try_into).transpose()
+    }
+
+    pub(crate) async fn structural_code_candidates(
+        &self,
+        workspace_id: &str,
+        chunk_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StructuralCodeCandidate>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(target) = self.code_candidate(workspace_id, chunk_id).await? else {
+            return Ok(Vec::new());
+        };
+        let chunks = self.list_chunks(&target.chunk.document_id).await?;
+        let Some(target_index) = chunks.iter().position(|chunk| chunk.id == target.chunk.id) else {
+            return Ok(Vec::new());
+        };
+        let target_chunk = &chunks[target_index];
+        let parent_key = parent_stable_key(target_chunk);
+        let parent = parent_key
+            .and_then(|key| {
+                chunks
+                    .iter()
+                    .filter(|chunk| logical_stable_key(chunk) == key)
+                    .min_by_key(|chunk| {
+                        let contains_target = chunk.start_byte <= target_chunk.start_byte
+                            && chunk.end_byte >= target_chunk.end_byte;
+                        (
+                            !contains_target,
+                            chunk.end_byte.saturating_sub(chunk.start_byte),
+                            chunk.start_byte,
+                            chunk.id.as_str(),
+                        )
+                    })
+            })
+            .or_else(|| enclosing_chunk(&chunks, target_chunk));
+
+        let mut related = Vec::new();
+        if let Some(parent) = parent {
+            push_structural_candidate(&mut related, &target, parent, StructuralRelation::Container);
+        }
+
+        let mut siblings: Vec<_> = chunks
+            .iter()
+            .filter(|chunk| chunk.id != target_chunk.id)
+            .filter(|chunk| parent_stable_key(chunk) == parent_key)
+            .collect();
+        siblings.sort_by(|left, right| {
+            structural_order(left)
+                .cmp(&structural_order(right))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let sibling_position = siblings.partition_point(|chunk| {
+            structural_order(chunk) < structural_order(target_chunk)
+                || (structural_order(chunk) == structural_order(target_chunk)
+                    && chunk.id < target_chunk.id)
+        });
+        if let Some(previous) = sibling_position
+            .checked_sub(1)
+            .and_then(|index| siblings.get(index))
+        {
+            push_structural_candidate(
+                &mut related,
+                &target,
+                previous,
+                StructuralRelation::Neighbor,
+            );
+        }
+        if let Some(next) = siblings.get(sibling_position) {
+            push_structural_candidate(&mut related, &target, next, StructuralRelation::Neighbor);
+        }
+
+        let mut children: Vec<_> = chunks
+            .iter()
+            .filter(|chunk| parent_stable_key(chunk) == Some(logical_stable_key(target_chunk)))
+            .collect();
+        children.sort_by(|left, right| {
+            structural_order(left)
+                .cmp(&structural_order(right))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        if let Some(child) = children.first() {
+            push_structural_candidate(&mut related, &target, child, StructuralRelation::Related);
+        } else if let Some(sibling) = siblings.iter().find(|sibling| {
+            !related.iter().any(|candidate: &StructuralCodeCandidate| {
+                candidate.candidate.source_id == sibling.id
+            })
+        }) {
+            push_structural_candidate(&mut related, &target, sibling, StructuralRelation::Related);
+        }
+
+        related.truncate(limit);
+        Ok(related)
     }
 
     pub async fn insert_embedding(&self, embedding: &EmbeddingRecord) -> Result<()> {
@@ -368,8 +549,14 @@ impl SqliteStorage {
     }
 
     pub async fn insert_memory(&self, memory: &MemoryRecord) -> Result<()> {
+        let claim_key = memory.claim.as_ref().map(|claim| claim.key.as_str());
+        let claim_value = memory
+            .claim
+            .as_ref()
+            .map(|claim| serde_json::to_string(&claim.value))
+            .transpose()?;
         sqlx::query(
-            "INSERT INTO memories(id, workspace_id, session_id, task_id, kind, content, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO memories(id, workspace_id, session_id, task_id, kind, content, metadata_json, origin, trust, source_segments_json, claim_key, claim_value_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&memory.id)
         .bind(&memory.workspace_id)
@@ -378,6 +565,11 @@ impl SqliteStorage {
         .bind(memory.kind.as_str())
         .bind(&memory.content)
         .bind(serde_json::to_string(&memory.metadata_for_storage())?)
+        .bind(memory.origin.as_str())
+        .bind(memory.trust.as_str())
+        .bind(serde_json::to_string(&memory.source_segments)?)
+        .bind(claim_key)
+        .bind(claim_value)
         .bind(memory.created_at)
         .execute(self.pool())
         .await?;
@@ -390,13 +582,68 @@ impl SqliteStorage {
         limit: usize,
     ) -> Result<Vec<MemoryRecord>> {
         let rows = sqlx::query_as::<_, MemoryRow>(
-            "SELECT id, workspace_id, session_id, task_id, kind, content, metadata_json, created_at FROM memories WHERE workspace_id = ? ORDER BY created_at DESC LIMIT ?",
+            "SELECT id, workspace_id, session_id, task_id, kind, content, metadata_json, origin, trust, source_segments_json, claim_key, claim_value_json, created_at FROM memories WHERE workspace_id = ? ORDER BY created_at DESC LIMIT ?",
         )
         .bind(workspace_id)
         .bind(memory_limit(limit)?)
         .fetch_all(self.pool())
         .await?;
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn memory(
+        &self,
+        workspace_id: &str,
+        memory_id: &str,
+    ) -> Result<Option<MemoryRecord>> {
+        let row = sqlx::query_as::<_, MemoryRow>(
+            "SELECT id, workspace_id, session_id, task_id, kind, content, metadata_json, origin, trust, source_segments_json, claim_key, claim_value_json, created_at FROM memories WHERE workspace_id = ? AND id = ?",
+        )
+        .bind(workspace_id)
+        .bind(memory_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub(crate) async fn resume_memories(
+        &self,
+        workspace_id: &str,
+        task_id: Option<&str>,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>> {
+        let Some((scope_column, scope_id)) = task_id
+            .map(|id| ("m.task_id", id))
+            .or_else(|| session_id.map(|id| ("m.session_id", id)))
+        else {
+            return Ok(Vec::new());
+        };
+        let query = format!(
+            "SELECT m.id, m.workspace_id, m.session_id, m.task_id, m.kind, m.content, m.metadata_json, m.origin, m.trust, m.source_segments_json, m.claim_key, m.claim_value_json, m.created_at FROM memories m LEFT JOIN memory_supersession ms ON ms.superseded_memory_id = m.id WHERE m.workspace_id = ? AND {scope_column} = ? AND m.kind IN ('decision', 'failure') AND m.trust = 'trusted' AND ms.superseded_memory_id IS NULL ORDER BY m.created_at DESC, m.id DESC LIMIT ?"
+        );
+        let rows = sqlx::query_as::<_, MemoryRow>(&query)
+            .bind(workspace_id)
+            .bind(scope_id)
+            .bind(memory_limit(limit)?)
+            .fetch_all(self.pool())
+            .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub(crate) async fn resume_memory(
+        &self,
+        workspace_id: &str,
+        memory_id: &str,
+    ) -> Result<Option<MemoryRecord>> {
+        let row = sqlx::query_as::<_, MemoryRow>(
+            "SELECT m.id, m.workspace_id, m.session_id, m.task_id, m.kind, m.content, m.metadata_json, m.origin, m.trust, m.source_segments_json, m.claim_key, m.claim_value_json, m.created_at FROM memories m LEFT JOIN memory_supersession ms ON ms.superseded_memory_id = m.id WHERE m.workspace_id = ? AND m.id = ? AND m.trust = 'trusted' AND ms.superseded_memory_id IS NULL",
+        )
+        .bind(workspace_id)
+        .bind(memory_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(TryInto::try_into).transpose()
     }
 
     pub async fn search_memories(
@@ -406,7 +653,7 @@ impl SqliteStorage {
         limit: usize,
     ) -> Result<Vec<MemoryRecord>> {
         let rows = sqlx::query_as::<_, MemoryRow>(
-            "SELECT m.id, m.workspace_id, m.session_id, m.task_id, m.kind, m.content, m.metadata_json, m.created_at FROM memory_fts JOIN memories m ON m.id = memory_fts.memory_id WHERE memory_fts MATCH ? AND m.workspace_id = ? ORDER BY bm25(memory_fts), m.id LIMIT ?",
+            "SELECT m.id, m.workspace_id, m.session_id, m.task_id, m.kind, m.content, m.metadata_json, m.origin, m.trust, m.source_segments_json, m.claim_key, m.claim_value_json, m.created_at FROM memory_fts JOIN memories m ON m.id = memory_fts.memory_id WHERE memory_fts MATCH ? AND m.workspace_id = ? ORDER BY bm25(memory_fts), m.id LIMIT ?",
         )
         .bind(match_query)
         .bind(workspace_id)
@@ -414,6 +661,54 @@ impl SqliteStorage {
         .fetch_all(self.pool())
         .await?;
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn review_memory_trust(&self, review: &MemoryTrustReview) -> Result<()> {
+        let mut transaction = self.pool().begin().await?;
+        let result = sqlx::query(
+            "UPDATE memories SET trust = ? WHERE id = ? AND workspace_id = ? AND origin = 'imported' AND trust = ?",
+        )
+        .bind(review.new_trust.as_str())
+        .bind(&review.memory_id)
+        .bind(&review.workspace_id)
+        .bind(review.previous_trust.as_str())
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(CortexError::Analysis(
+                "imported memory trust changed before the review was applied".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO memory_trust_reviews(id, workspace_id, memory_id, previous_trust, new_trust, reviewed_by, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&review.id)
+        .bind(&review.workspace_id)
+        .bind(&review.memory_id)
+        .bind(review.previous_trust.as_str())
+        .bind(review.new_trust.as_str())
+        .bind(&review.reviewed_by)
+        .bind(&review.reason)
+        .bind(review.created_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn memory_trust_reviews(
+        &self,
+        workspace_id: &str,
+        memory_id: &str,
+    ) -> Result<Vec<MemoryTrustReview>> {
+        let rows = sqlx::query_as::<_, MemoryTrustReviewRow>(
+            "SELECT id, workspace_id, memory_id, previous_trust, new_trust, reviewed_by, reason, created_at FROM memory_trust_reviews WHERE workspace_id = ? AND memory_id = ? ORDER BY created_at, id",
+        )
+        .bind(workspace_id)
+        .bind(memory_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     pub async fn insert_event(&self, event: &CortexEvent) -> Result<()> {
@@ -447,6 +742,30 @@ impl SqliteStorage {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    pub(crate) async fn resume_events(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        started_at: DateTime<Utc>,
+        ended_at: DateTime<Utc>,
+        task_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CortexEvent>> {
+        let rows = sqlx::query_as::<_, EventRow>(
+            "SELECT id, workspace_id, session_id, task_id, event_type, payload_json, created_at FROM events WHERE workspace_id = ? AND created_at >= ? AND created_at <= ? AND (session_id IS NULL OR session_id = ?) AND (? IS NULL OR task_id IS NULL OR task_id = ?) ORDER BY created_at ASC, id ASC LIMIT ?",
+        )
+        .bind(workspace_id)
+        .bind(started_at)
+        .bind(ended_at)
+        .bind(session_id)
+        .bind(task_id)
+        .bind(task_id)
+        .bind(memory_limit(limit)?)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     pub(crate) async fn temporal_candidates(
         &self,
         workspace_id: &str,
@@ -459,24 +778,25 @@ impl SqliteStorage {
             .map(ContextSourceType::storage_name)
             .collect();
         let mut query = sqlx::QueryBuilder::<Sqlite>::new(
-            r#"SELECT source_id, source_type, session_id, task_id, content, path, symbol, language, created_at, modified_at, is_superseded
+            r#"SELECT source_id, source_type, session_id, task_id, content, path, symbol, language, start_byte, end_byte, created_at, modified_at, is_superseded
                FROM (
-                   SELECT d.workspace_id, c.id AS source_id, 'code' AS source_type, NULL AS session_id, NULL AS task_id, c.content, d.relative_path AS path, COALESCE(c.qualified_symbol, c.symbol) AS symbol, c.language, c.created_at, c.updated_at AS modified_at, 0 AS is_superseded
+                   SELECT d.workspace_id, c.id AS source_id, 'code' AS source_type, NULL AS session_id, NULL AS task_id, c.content, d.relative_path AS path, COALESCE(c.qualified_symbol, c.symbol) AS symbol, c.language, c.start_byte, c.end_byte, c.created_at, c.updated_at AS modified_at, 0 AS is_superseded
                    FROM chunks c JOIN documents d ON d.id = c.document_id
                    UNION ALL
-                   SELECT d.workspace_id, d.id, 'document', NULL, NULL, d.relative_path, d.relative_path, NULL, d.language, d.indexed_at, d.indexed_at, 0
+                   SELECT d.workspace_id, d.id, 'document', NULL, NULL, d.relative_path, d.relative_path, NULL, d.language, NULL, NULL, d.indexed_at, d.indexed_at, 0
                    FROM documents d
                    UNION ALL
-                   SELECT m.workspace_id, m.id, 'memory', m.session_id, m.task_id, m.content, NULL, NULL, NULL, m.created_at, NULL, CASE WHEN ms.superseded_memory_id IS NULL THEN 0 ELSE 1 END
+                   SELECT m.workspace_id, m.id, 'memory', m.session_id, m.task_id, m.content, NULL, NULL, NULL, NULL, NULL, m.created_at, NULL, CASE WHEN ms.superseded_memory_id IS NULL THEN 0 ELSE 1 END
                    FROM memories m LEFT JOIN memory_supersession ms ON ms.superseded_memory_id = m.id
+                   WHERE m.trust = 'trusted'
                    UNION ALL
-                   SELECT e.workspace_id, e.id, 'event', e.session_id, e.task_id, e.payload_json, NULL, NULL, NULL, e.created_at, NULL, 0
+                   SELECT e.workspace_id, e.id, 'event', e.session_id, e.task_id, e.payload_json, NULL, NULL, NULL, NULL, NULL, e.created_at, NULL, 0
                    FROM events e
                    UNION ALL
-                   SELECT t.workspace_id, t.id, 'task_state', t.session_id, t.id, t.title, NULL, NULL, NULL, t.created_at, t.updated_at, 0
+                   SELECT t.workspace_id, t.id, 'task_state', t.session_id, t.id, t.title, NULL, NULL, NULL, NULL, NULL, t.created_at, t.updated_at, 0
                    FROM tasks t
                    UNION ALL
-                   SELECT s.workspace_id, s.id, 'session_state', s.id, NULL, s.metadata_json, NULL, NULL, NULL, s.started_at, s.ended_at, 0
+                   SELECT s.workspace_id, s.id, 'session_state', s.id, NULL, s.metadata_json, NULL, NULL, NULL, NULL, NULL, s.started_at, s.ended_at, 0
                    FROM sessions s
                ) temporal
                WHERE workspace_id = "#,
@@ -543,42 +863,42 @@ impl SqliteStorage {
     ) -> Result<Option<TemporalCandidate>> {
         let row = match source_type {
             ContextSourceType::Code => sqlx::query_as::<_, TemporalCandidateRow>(
-                "SELECT c.id AS source_id, 'code' AS source_type, NULL AS session_id, NULL AS task_id, c.content, d.relative_path AS path, COALESCE(c.qualified_symbol, c.symbol) AS symbol, c.language, c.created_at, c.updated_at AS modified_at, 0 AS is_superseded FROM chunks c JOIN documents d ON d.id = c.document_id WHERE c.id = ? AND d.workspace_id = ?",
+                "SELECT c.id AS source_id, 'code' AS source_type, NULL AS session_id, NULL AS task_id, c.content, d.relative_path AS path, COALESCE(c.qualified_symbol, c.symbol) AS symbol, c.language, c.start_byte, c.end_byte, c.created_at, c.updated_at AS modified_at, 0 AS is_superseded FROM chunks c JOIN documents d ON d.id = c.document_id WHERE c.id = ? AND d.workspace_id = ?",
             )
             .bind(source_id)
             .bind(workspace_id)
             .fetch_optional(self.pool())
             .await?,
             ContextSourceType::Document => sqlx::query_as::<_, TemporalCandidateRow>(
-                "SELECT id AS source_id, 'document' AS source_type, NULL AS session_id, NULL AS task_id, relative_path AS content, relative_path AS path, NULL AS symbol, language, indexed_at AS created_at, indexed_at AS modified_at, 0 AS is_superseded FROM documents WHERE id = ? AND workspace_id = ?",
+                "SELECT id AS source_id, 'document' AS source_type, NULL AS session_id, NULL AS task_id, relative_path AS content, relative_path AS path, NULL AS symbol, language, NULL AS start_byte, NULL AS end_byte, indexed_at AS created_at, indexed_at AS modified_at, 0 AS is_superseded FROM documents WHERE id = ? AND workspace_id = ?",
             )
             .bind(source_id)
             .bind(workspace_id)
             .fetch_optional(self.pool())
             .await?,
             ContextSourceType::Memory => sqlx::query_as::<_, TemporalCandidateRow>(
-                "SELECT m.id AS source_id, 'memory' AS source_type, m.session_id, m.task_id, m.content, NULL AS path, NULL AS symbol, NULL AS language, m.created_at, NULL AS modified_at, CASE WHEN ms.superseded_memory_id IS NULL THEN 0 ELSE 1 END AS is_superseded FROM memories m LEFT JOIN memory_supersession ms ON ms.superseded_memory_id = m.id WHERE m.id = ? AND m.workspace_id = ?",
+                "SELECT m.id AS source_id, 'memory' AS source_type, m.session_id, m.task_id, m.content, NULL AS path, NULL AS symbol, NULL AS language, NULL AS start_byte, NULL AS end_byte, m.created_at, NULL AS modified_at, CASE WHEN ms.superseded_memory_id IS NULL THEN 0 ELSE 1 END AS is_superseded FROM memories m LEFT JOIN memory_supersession ms ON ms.superseded_memory_id = m.id WHERE m.id = ? AND m.workspace_id = ? AND m.trust = 'trusted'",
             )
             .bind(source_id)
             .bind(workspace_id)
             .fetch_optional(self.pool())
             .await?,
             ContextSourceType::Event => sqlx::query_as::<_, TemporalCandidateRow>(
-                "SELECT id AS source_id, 'event' AS source_type, session_id, task_id, payload_json AS content, NULL AS path, NULL AS symbol, NULL AS language, created_at, NULL AS modified_at, 0 AS is_superseded FROM events WHERE id = ? AND workspace_id = ?",
+                "SELECT id AS source_id, 'event' AS source_type, session_id, task_id, payload_json AS content, NULL AS path, NULL AS symbol, NULL AS language, NULL AS start_byte, NULL AS end_byte, created_at, NULL AS modified_at, 0 AS is_superseded FROM events WHERE id = ? AND workspace_id = ?",
             )
             .bind(source_id)
             .bind(workspace_id)
             .fetch_optional(self.pool())
             .await?,
             ContextSourceType::TaskState => sqlx::query_as::<_, TemporalCandidateRow>(
-                "SELECT id AS source_id, 'task_state' AS source_type, session_id, id AS task_id, title AS content, NULL AS path, NULL AS symbol, NULL AS language, created_at, updated_at AS modified_at, 0 AS is_superseded FROM tasks WHERE id = ? AND workspace_id = ?",
+                "SELECT id AS source_id, 'task_state' AS source_type, session_id, id AS task_id, title AS content, NULL AS path, NULL AS symbol, NULL AS language, NULL AS start_byte, NULL AS end_byte, created_at, updated_at AS modified_at, 0 AS is_superseded FROM tasks WHERE id = ? AND workspace_id = ?",
             )
             .bind(source_id)
             .bind(workspace_id)
             .fetch_optional(self.pool())
             .await?,
             ContextSourceType::SessionState => sqlx::query_as::<_, TemporalCandidateRow>(
-                "SELECT id AS source_id, 'session_state' AS source_type, id AS session_id, NULL AS task_id, metadata_json AS content, NULL AS path, NULL AS symbol, NULL AS language, started_at AS created_at, ended_at AS modified_at, 0 AS is_superseded FROM sessions WHERE id = ? AND workspace_id = ?",
+                "SELECT id AS source_id, 'session_state' AS source_type, id AS session_id, NULL AS task_id, metadata_json AS content, NULL AS path, NULL AS symbol, NULL AS language, NULL AS start_byte, NULL AS end_byte, started_at AS created_at, ended_at AS modified_at, 0 AS is_superseded FROM sessions WHERE id = ? AND workspace_id = ?",
             )
             .bind(source_id)
             .bind(workspace_id)
@@ -800,7 +1120,7 @@ impl SqliteStorage {
             }
             ContextSourceType::Memory => {
                 sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ? AND workspace_id = ?)",
+                    "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ? AND workspace_id = ? AND trust = 'trusted')",
                 )
                 .bind(source_id)
                 .bind(workspace_id)
@@ -845,7 +1165,7 @@ impl SqliteStorage {
         memory_id: &str,
     ) -> Result<bool> {
         sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ? AND workspace_id = ? AND kind = 'decision')",
+            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ? AND workspace_id = ? AND kind = 'decision' AND trust = 'trusted')",
         )
         .bind(memory_id)
         .bind(workspace_id)
@@ -911,6 +1231,21 @@ impl SqliteStorage {
         row.map(TryInto::try_into).transpose()
     }
 
+    pub(crate) async fn latest_taskless_checkpoint_for_session(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<Option<Checkpoint>> {
+        let row = sqlx::query_as::<_, CheckpointRow>(
+            "SELECT id, workspace_id, session_id, task_id, content, objective, completed_json, decision_ids_json, open_problems_json, related_paths_json, related_symbols_json, next_action, created_at FROM checkpoints WHERE workspace_id = ? AND session_id = ? AND task_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(workspace_id)
+        .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
     pub async fn latest_checkpoint_for_task(
         &self,
         workspace_id: &str,
@@ -930,15 +1265,41 @@ impl SqliteStorage {
         &self,
         supersession: &MemorySupersession,
     ) -> Result<()> {
+        let mut transaction = self.pool().begin().await?;
+        let creates_cycle: i64 = sqlx::query_scalar(
+            "WITH RECURSIVE chain(id) AS (\
+                SELECT superseding_memory_id FROM memory_supersession \
+                WHERE workspace_id = ? AND superseded_memory_id = ? \
+                UNION \
+                SELECT relation.superseding_memory_id FROM memory_supersession relation \
+                JOIN chain ON relation.superseded_memory_id = chain.id \
+                WHERE relation.workspace_id = ?\
+            ) \
+            SELECT EXISTS(SELECT 1 FROM chain WHERE id = ?)",
+        )
+        .bind(&supersession.workspace_id)
+        .bind(&supersession.superseding_memory_id)
+        .bind(&supersession.workspace_id)
+        .bind(&supersession.superseded_memory_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if creates_cycle != 0 {
+            return Err(CortexError::Analysis(
+                "memory supersession cannot create a cycle".into(),
+            ));
+        }
         sqlx::query(
-            "INSERT INTO memory_supersession(workspace_id, superseded_memory_id, superseding_memory_id, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO memory_supersession(workspace_id, superseded_memory_id, superseding_memory_id, reviewed_by, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&supersession.workspace_id)
         .bind(&supersession.superseded_memory_id)
         .bind(&supersession.superseding_memory_id)
+        .bind(&supersession.reviewed_by)
+        .bind(&supersession.reason)
         .bind(supersession.created_at)
-        .execute(self.pool())
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -947,7 +1308,7 @@ impl SqliteStorage {
         superseded_memory_id: &str,
     ) -> Result<Option<MemorySupersession>> {
         let row = sqlx::query_as::<_, MemorySupersessionRow>(
-            "SELECT workspace_id, superseded_memory_id, superseding_memory_id, created_at FROM memory_supersession WHERE superseded_memory_id = ?",
+            "SELECT workspace_id, superseded_memory_id, superseding_memory_id, reviewed_by, reason, created_at FROM memory_supersession WHERE superseded_memory_id = ?",
         )
         .bind(superseded_memory_id)
         .fetch_optional(self.pool())
@@ -1059,6 +1420,89 @@ impl SqliteStorage {
         transaction.commit().await?;
         Ok(())
     }
+}
+
+fn parent_stable_key(chunk: &StoredChunk) -> Option<&str> {
+    chunk
+        .metadata
+        .get("parent_stable_key")
+        .and_then(|value| value.as_str())
+}
+
+fn logical_stable_key(chunk: &StoredChunk) -> &str {
+    chunk
+        .metadata
+        .get("parent_logical_stable_key")
+        .and_then(|value| value.as_str())
+        .unwrap_or(&chunk.stable_key)
+}
+
+fn structural_order(chunk: &StoredChunk) -> (bool, u64, i64) {
+    let ordinal = chunk
+        .metadata
+        .get("ordinal_in_container")
+        .and_then(|value| value.as_u64());
+    (
+        ordinal.is_none(),
+        ordinal.unwrap_or_default(),
+        chunk.start_byte,
+    )
+}
+
+fn enclosing_chunk<'a>(chunks: &'a [StoredChunk], target: &StoredChunk) -> Option<&'a StoredChunk> {
+    chunks
+        .iter()
+        .filter(|chunk| chunk.id != target.id)
+        .filter(|chunk| chunk.start_byte <= target.start_byte && chunk.end_byte >= target.end_byte)
+        .filter(|chunk| chunk.start_byte < target.start_byte || chunk.end_byte > target.end_byte)
+        .min_by_key(|chunk| chunk.end_byte.saturating_sub(chunk.start_byte))
+}
+
+fn push_structural_candidate(
+    candidates: &mut Vec<StructuralCodeCandidate>,
+    target: &CodeCandidate,
+    chunk: &StoredChunk,
+    relation: StructuralRelation,
+) {
+    if chunk.id == target.chunk.id
+        || candidates
+            .iter()
+            .any(|candidate| candidate.candidate.source_id == chunk.id)
+    {
+        return;
+    }
+    candidates.push(StructuralCodeCandidate {
+        candidate: TemporalCandidate {
+            source_id: chunk.id.clone(),
+            source_type: ContextSourceType::Code,
+            session_id: None,
+            task_id: None,
+            content: chunk.content.clone(),
+            path: Some(target.relative_path.clone()),
+            symbol: chunk
+                .qualified_symbol
+                .clone()
+                .or_else(|| chunk.symbol.clone()),
+            language: Some(chunk.language.clone()),
+            source_segments: stored_source_segment(
+                &target.relative_path,
+                chunk.start_byte,
+                chunk.end_byte,
+            )
+            .into_iter()
+            .collect(),
+            created_at: chunk.created_at,
+            modified_at: Some(chunk.updated_at),
+            superseded: false,
+        },
+        relation,
+    });
+}
+
+fn stored_source_segment(path: &str, start_byte: i64, end_byte: i64) -> Option<SourceSegment> {
+    let start_byte = u64::try_from(start_byte).ok()?;
+    let end_byte = u64::try_from(end_byte).ok()?;
+    (start_byte < end_byte).then(|| SourceSegment::new(path, start_byte, end_byte))
 }
 
 async fn insert_document<'e, E>(executor: E, document: &Document) -> Result<()>
@@ -1543,6 +1987,11 @@ struct MemoryRow {
     kind: String,
     content: String,
     metadata_json: String,
+    origin: String,
+    trust: String,
+    source_segments_json: String,
+    claim_key: Option<String>,
+    claim_value_json: Option<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -1550,6 +1999,19 @@ impl TryFrom<MemoryRow> for MemoryRecord {
     type Error = CortexError;
     fn try_from(row: MemoryRow) -> Result<Self> {
         let metadata: Value = serde_json::from_str(&row.metadata_json)?;
+        let source_segments: Vec<SourceSegment> = serde_json::from_str(&row.source_segments_json)?;
+        let claim = match (row.claim_key, row.claim_value_json) {
+            (Some(key), Some(value)) => Some(MemoryClaim {
+                key,
+                value: serde_json::from_str(&value)?,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(CortexError::Analysis(
+                    "stored memory claim is incomplete".into(),
+                ));
+            }
+        };
         Ok(Self {
             id: row.id,
             workspace_id: row.workspace_id,
@@ -1559,8 +2021,39 @@ impl TryFrom<MemoryRow> for MemoryRecord {
             content: row.content,
             related_paths: MemoryRecord::related_paths_from_metadata(&metadata),
             metadata,
+            origin: MemoryOrigin::from_storage(&row.origin),
+            trust: MemoryTrust::from_storage(&row.trust),
+            source_segments,
+            claim,
             created_at: row.created_at,
         })
+    }
+}
+
+#[derive(FromRow)]
+struct MemoryTrustReviewRow {
+    id: String,
+    workspace_id: String,
+    memory_id: String,
+    previous_trust: String,
+    new_trust: String,
+    reviewed_by: String,
+    reason: String,
+    created_at: DateTime<Utc>,
+}
+
+impl From<MemoryTrustReviewRow> for MemoryTrustReview {
+    fn from(row: MemoryTrustReviewRow) -> Self {
+        Self {
+            id: row.id,
+            workspace_id: row.workspace_id,
+            memory_id: row.memory_id,
+            previous_trust: MemoryTrust::from_storage(&row.previous_trust),
+            new_trust: MemoryTrust::from_storage(&row.new_trust),
+            reviewed_by: row.reviewed_by,
+            reason: row.reason,
+            created_at: row.created_at,
+        }
     }
 }
 
@@ -1688,6 +2181,8 @@ struct MemorySupersessionRow {
     workspace_id: String,
     superseded_memory_id: String,
     superseding_memory_id: String,
+    reviewed_by: Option<String>,
+    reason: Option<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -1697,6 +2192,8 @@ impl From<MemorySupersessionRow> for MemorySupersession {
             workspace_id: row.workspace_id,
             superseded_memory_id: row.superseded_memory_id,
             superseding_memory_id: row.superseding_memory_id,
+            reviewed_by: row.reviewed_by,
+            reason: row.reason,
             created_at: row.created_at,
         }
     }
@@ -1712,6 +2209,7 @@ pub(crate) struct TemporalCandidate {
     pub path: Option<String>,
     pub symbol: Option<String>,
     pub language: Option<String>,
+    pub source_segments: Vec<SourceSegment>,
     pub created_at: DateTime<Utc>,
     pub modified_at: Option<DateTime<Utc>>,
     pub superseded: bool,
@@ -1727,6 +2225,8 @@ struct TemporalCandidateRow {
     path: Option<String>,
     symbol: Option<String>,
     language: Option<String>,
+    start_byte: Option<i64>,
+    end_byte: Option<i64>,
     created_at: DateTime<Utc>,
     modified_at: Option<DateTime<Utc>>,
     is_superseded: bool,
@@ -1734,6 +2234,16 @@ struct TemporalCandidateRow {
 
 impl From<TemporalCandidateRow> for TemporalCandidate {
     fn from(row: TemporalCandidateRow) -> Self {
+        let source_segments = match (
+            row.path.as_deref(),
+            row.start_byte.and_then(|value| u64::try_from(value).ok()),
+            row.end_byte.and_then(|value| u64::try_from(value).ok()),
+        ) {
+            (Some(path), Some(start_byte), Some(end_byte)) if start_byte < end_byte => {
+                vec![SourceSegment::new(path, start_byte, end_byte)]
+            }
+            _ => Vec::new(),
+        };
         Self {
             source_id: row.source_id,
             source_type: ContextSourceType::from_storage(&row.source_type),
@@ -1743,6 +2253,7 @@ impl From<TemporalCandidateRow> for TemporalCandidate {
             path: row.path,
             symbol: row.symbol,
             language: row.language,
+            source_segments,
             created_at: row.created_at,
             modified_at: row.modified_at,
             superseded: row.is_superseded,
@@ -2046,5 +2557,34 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn memory_supersession_rejects_cycles() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let workspace = Workspace::new("C:/memory-cycles", "memory-cycles");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let older = MemoryRecord::new(&workspace.id, MemoryKind::Decision, "Older decision");
+        let newer = MemoryRecord::new(&workspace.id, MemoryKind::Decision, "Newer decision");
+        storage.insert_memory(&older).await.unwrap();
+        storage.insert_memory(&newer).await.unwrap();
+        storage
+            .insert_memory_supersession(&MemorySupersession::new(
+                &workspace.id,
+                &older.id,
+                &newer.id,
+            ))
+            .await
+            .unwrap();
+
+        let error = storage
+            .insert_memory_supersession(&MemorySupersession::new(
+                &workspace.id,
+                &newer.id,
+                &older.id,
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot create a cycle"));
     }
 }

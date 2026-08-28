@@ -92,6 +92,77 @@ mod tests {
     }
 
     #[test]
+    fn structural_metadata_links_methods_to_normalized_containers() {
+        let cases: Vec<(&dyn LanguageAnalyzer, &str, &str, &str)> = vec![
+            (
+                &RustAnalyzer,
+                "src/engine.rs",
+                "struct Engine; impl Engine { fn search(&self) {} }",
+                "search",
+            ),
+            (
+                &PythonAnalyzer,
+                "engine.py",
+                "class Engine:\n    def search(self):\n        pass\n",
+                "search",
+            ),
+            (
+                &TypeScriptAnalyzer,
+                "engine.ts",
+                "class Engine { search(): void {} }",
+                "search",
+            ),
+            (
+                &CSharpAnalyzer,
+                "Engine.cs",
+                "class Engine { void Search() {} }",
+                "Search",
+            ),
+        ];
+
+        for (analyzer, path, source, method) in cases {
+            let chunks = chunks(analyzer, path, source);
+            let method = chunks
+                .iter()
+                .find(|chunk| chunk.symbol.as_deref() == Some(method))
+                .unwrap_or_else(|| panic!("{path} did not produce method: {chunks:#?}"));
+            let parent_key = method
+                .metadata
+                .get("parent_stable_key")
+                .and_then(|value| value.as_str())
+                .unwrap_or_else(|| panic!("{path} did not link method to a parent: {method:#?}"));
+            assert_eq!(
+                chunks
+                    .iter()
+                    .find(|chunk| chunk.stable_key == parent_key)
+                    .and_then(|chunk| chunk.symbol.as_deref()),
+                Some("Engine"),
+            );
+            assert_eq!(
+                method
+                    .metadata
+                    .get("container_symbol")
+                    .and_then(|value| value.as_str()),
+                Some("Engine"),
+            );
+            assert_eq!(
+                method
+                    .metadata
+                    .get("structural_depth")
+                    .and_then(|value| value.as_u64()),
+                Some(1),
+            );
+            assert_eq!(
+                method
+                    .metadata
+                    .get("ordinal_in_container")
+                    .and_then(|value| value.as_u64()),
+                Some(0),
+            );
+        }
+    }
+
+    #[test]
     fn body_edits_insertions_and_formatting_preserve_logical_keys() {
         let rust_before =
             "impl Engine {\n    fn search(&self, q: &str) -> bool { q.is_empty() }\n}\n";
@@ -150,6 +221,33 @@ mod tests {
         let before_keys = keys(before);
         assert_eq!(before_keys.len(), 2);
         assert_eq!(before_keys, keys(after));
+    }
+
+    #[test]
+    fn duplicate_container_keys_keep_exact_child_links() {
+        let chunks = chunks(
+            &CSharpAnalyzer,
+            "Engine.cs",
+            "partial class Engine { void First() {} } partial class Engine { void Second() {} }",
+        );
+        let parent_keys: BTreeSet<_> = ["First", "Second"]
+            .into_iter()
+            .map(|method| {
+                let method = chunks
+                    .iter()
+                    .find(|chunk| chunk.symbol.as_deref() == Some(method))
+                    .unwrap();
+                let parent_key = method
+                    .metadata
+                    .get("parent_stable_key")
+                    .and_then(|value| value.as_str())
+                    .unwrap();
+                assert!(chunks.iter().any(|chunk| chunk.stable_key == parent_key));
+                parent_key.to_owned()
+            })
+            .collect();
+
+        assert_eq!(parent_keys.len(), 2);
     }
 
     #[test]

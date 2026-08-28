@@ -113,7 +113,43 @@ eligible until unpinned, even when their working-set activation has decayed.
 
 - `context.candidate_pool_limit`: positive maximum number of deduplicated
   source-aware candidates retained before later context ranking and token
-  selection.
+  selection, capped at `10000`.
+- `context.structural_expansion_limit`: positive maximum number of
+  language-neutral container, neighboring-symbol, and direct-child candidates
+  expanded from each relevant code chunk, capped at `64`.
+- `context.ranking.semantic_weight`, `lexical_weight`, `task_weight`,
+  `working_set_weight`, `recency_weight`, `provenance_weight`,
+  `freshness_weight`, and `structural_weight`: finite non-negative component
+  weights for deterministic candidate ranking. At least one must be positive;
+  the weighted score is divided by their total, so weights need not sum to one.
+
+Semantic and lexical retrieval scores are normalized before ranking. Working-set
+activation is normalized by `working_set.max_activation_score`; recency,
+provenance, freshness, and structural relationship scores remain in `[0, 1]`.
+Every normalized component and the resulting `final_score` is retained on the
+candidate for diagnostics and later context selection.
+
+## Context Budgeting
+
+- `context.budget.code_fraction`: soft allocation for direct code and document
+  sources.
+- `context.budget.structural_fraction`: soft allocation for code included by a
+  structural relationship.
+- `context.budget.memory_fraction`, `event_fraction`, and `state_fraction`:
+  soft allocations for their respective provenance domains.
+
+All fractions must be finite and non-negative, and together cannot exceed one.
+The defaults are 50% code, 20% structural code, 15% memory, 10% events, and 5%
+state. Category allocations guide the first selection pass; unused capacity is
+available to the highest-value remaining candidates in a second pass.
+
+Each context request supplies its total token budget, so the same configuration
+supports compact 2K and 4K packets as well as 8K and 16K packets. Production
+assembly uses the configured embedding provider's shared token counter, keeping
+context estimates in the same accounting space as embedding segmentation.
+Active-task references and pins are selected first and may be UTF-8-safely
+truncated to the remaining total budget. Other oversized candidates are skipped.
+No packet intentionally exceeds its requested total budget.
 
 ## Logging and Languages
 
@@ -122,3 +158,9 @@ eligible until unpinned, even when their working-set activation has decayed.
 - `languages.rust`, `python`, `javascript`, `typescript`, `csharp`, `go`: enable or
   disable each structural analyzer. Disabled and unsupported text formats use
   the deterministic generic analyzer.
+
+Run `cortexweave readiness [workspace-id]` before indexing a newly registered
+workspace or after changing language settings. The report distinguishes a
+disabled bundled analyzer from an unsupported text format and estimates the old
+chunks and embeddings that an explicit reindex will replace. Inspection does
+not rewrite these settings.

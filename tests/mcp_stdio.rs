@@ -13,10 +13,19 @@ fn serve_speaks_line_delimited_mcp_over_stdio() {
     let argument_root = directory.path().join("argument-workspace");
     std::fs::create_dir_all(&environment_root).unwrap();
     std::fs::create_dir_all(&argument_root).unwrap();
+    std::fs::write(
+        argument_root.join("main.py"),
+        "def run():\n    return True\n",
+    )
+    .unwrap();
     let database = directory.path().join("cortexweave.sqlite");
     let config = directory.path().join("cortexweave.toml");
     let database_path = database.to_string_lossy().replace('\\', "/");
-    std::fs::write(&config, format!("[database]\npath = \"{database_path}\"\n")).unwrap();
+    std::fs::write(
+        &config,
+        format!("[database]\npath = \"{database_path}\"\n[languages]\npython = false\n"),
+    )
+    .unwrap();
     register_workspace(&config, &environment_root, "environment");
     let argument_workspace = register_workspace(&config, &argument_root, "argument");
     let mut child = Command::new(env!("CARGO_BIN_EXE_cortexweave"))
@@ -46,10 +55,17 @@ fn serve_speaks_line_delimited_mcp_over_stdio() {
         "method": "tools/call",
         "params": { "name": "workspace_status", "arguments": {} },
     });
+    let readiness = json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": { "name": "workspace_readiness", "arguments": {} },
+    });
     let mut input = child.stdin.take().unwrap();
     writeln!(input, "{}", serde_json::to_string(&initialize).unwrap()).unwrap();
     writeln!(input, "{}", serde_json::to_string(&tools).unwrap()).unwrap();
     writeln!(input, "{}", serde_json::to_string(&status).unwrap()).unwrap();
+    writeln!(input, "{}", serde_json::to_string(&readiness).unwrap()).unwrap();
     drop(input);
 
     let mut output = String::new();
@@ -65,7 +81,7 @@ fn serve_speaks_line_delimited_mcp_over_stdio() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(responses.len(), 3);
+    assert_eq!(responses.len(), 4);
     assert_eq!(responses[0]["id"], 1);
     assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(responses[1]["id"], 2);
@@ -76,11 +92,24 @@ fn serve_speaks_line_delimited_mcp_over_stdio() {
             .iter()
             .any(|tool| tool["name"] == "workspace_reindex")
     );
+    assert!(
+        responses[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "workspace_readiness")
+    );
     assert_eq!(responses[2]["id"], 3);
     assert_eq!(responses[2]["result"]["isError"], false);
     assert_eq!(
         responses[2]["result"]["structuredContent"]["workspace"]["id"],
         argument_workspace["id"]
+    );
+    assert_eq!(responses[3]["id"], 4);
+    assert_eq!(responses[3]["result"]["isError"], false);
+    assert_eq!(
+        responses[3]["result"]["structuredContent"]["recommendations"][0]["config_key"],
+        "languages.python"
     );
 }
 

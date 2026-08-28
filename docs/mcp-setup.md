@@ -1,5 +1,9 @@
 # MCP Setup
 
+For a plain-language guide to registering multiple projects and making Crush
+select the right one automatically, see [Using CortexWeave with More Than One
+Crush Project](crush-workspaces.md).
+
 Build the release binary and register every workspace before starting an MCP
 client. Use absolute executable and configuration paths because clients commonly
 launch servers from an unrelated working directory.
@@ -46,10 +50,41 @@ there is no fuzzy matching.
 root, marks the root matched by the adapter hint, and includes any hint-resolution
 error. It remains available when ordinary tool calls cannot choose a workspace.
 
-Required tools are `semantic_search`, `semantic_get`, `memory_record`,
-`memory_search`, `memory_recent`, `workspace_list`, `workspace_status`, and
-`workspace_reindex`. Additional v0.1 tools are `session_start`, `session_end`,
-and `event_record`.
+Core tools are `semantic_search`, `semantic_context`, `resume_context`,
+`semantic_get`, `memory_record`, `memory_search`, `memory_recent`,
+`working_set`, `context_pin`, `context_unpin`, `checkpoint_create`,
+`checkpoint_latest`, `workspace_list`, `workspace_status`,
+`workspace_readiness`, and `workspace_reindex`. Session and event tools remain `session_start`,
+`session_end`, and `event_record`.
+
+`workspace_readiness` is read-only. It identifies supported languages currently
+using generic fallback and estimates the persisted chunks and embeddings that
+an explicit analyzer enablement and reindex would replace. It never edits the
+configuration or starts reconciliation.
+
+`semantic_context` requires `query` and returns a bounded `ContextPacket`. It
+accepts optional `session_id`, `task_id`, `token_budget`, `include_code`,
+`include_documents`, `include_memories`, `include_events`, `path_scope`, and
+`language_scope`. Source filters default to enabled. MCP accepts budgets from
+zero through 65,536 tokens to keep one stdio response bounded; the packet
+returns the requested budget and the actual selected-item estimate.
+
+Set `include_explanation` on `semantic_context` or `resume_context` to include
+the selected items' reasons, component scores, token estimates, and truncation
+status. This diagnostic is outside the prompt packet budget.
+
+Use `semantic_context` as the one-call retrieval operation when an agent needs
+bounded evidence to answer a question. `semantic_get` is different: it accepts
+only an exact chunk ID returned by a previous CortexWeave result, not a path,
+symbol name, or natural-language question.
+
+`resume_context` accepts optional `session_id`, `task_id`, and `token_budget`.
+It returns the selected interaction scope, evidence session, checkpoint,
+recent-change aggregates, working-set snapshots, and a bounded `ContextPacket`.
+The working-set and pin tools require `session_id`; pin tools also require a
+source ID and source type. `checkpoint_create` requires `session_id` and
+`content`, while `checkpoint_latest` optionally scopes the read by session or
+task.
 
 ## Crush
 
@@ -63,7 +98,9 @@ mcp add cortexweave \
   --args --config \
   --args C:/dev/CortexWeave/cortexweave.toml \
   --args serve \
-  --env CORTEXWEAVE_WORKSPACE_ROOT "$PWD"
+  --args --workspace-root \
+  --args "$PWD" \
+  --timeout 120
 ```
 
 For development through Cargo, use:
@@ -79,22 +116,23 @@ mcp add cortexweave \
   --args --config \
   --args C:/dev/CortexWeave/cortexweave.toml \
   --args serve \
-  --env CORTEXWEAVE_WORKSPACE_ROOT "$PWD"
+  --args --workspace-root \
+  --args "$PWD" \
+  --timeout 120
 ```
 
-In a project-local config, `$PWD` is the directory where Crush was launched. A
-repository root or a subdirectory both resolve to the registered root, including
-intentionally nested registrations. Crush uses the closest project config to its
-working directory, so this also works when a session starts below the repository
-root. Windows path identity accepts native, slash-normalized, verbatim, UNC, and
-Bash-style drive paths.
+In a project-local config, `$PWD` is the directory where Crush was launched and
+is passed to `serve --workspace-root`. A repository root or a subdirectory both
+resolve to the registered root, including intentionally nested registrations.
+Crush uses the closest project config to its working directory, so this also
+works when a session starts below the repository root. Windows path identity
+accepts native, slash-normalized, verbatim, UNC, and Bash-style drive paths.
 
-Do not put `--env CORTEXWEAVE_WORKSPACE_ROOT "$PWD"` in a global `crushrc`.
-There, `$PWD` can be Crush's global configuration directory rather than the
-repository. For a global configuration with one registered workspace, omit the
-environment line and rely on singleton resolution. With several workspaces, use
-a project-local override or have the agent supply an explicit `workspace`
-selector.
+Do not put `--args "$PWD"` in a global `crushrc`. There, `$PWD` can be Crush's
+global configuration directory rather than the repository. For a global
+configuration with one registered workspace, omit the workspace-root arguments
+and rely on singleton resolution. With several workspaces, use a project-local
+override or have the agent supply an explicit `workspace` selector.
 
 After MCP initialization, `serve` starts a watcher for every registered workspace
 and performs initial reconciliation in the background. A large first index does

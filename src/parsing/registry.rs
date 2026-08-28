@@ -12,6 +12,8 @@ use crate::config::{GenericChunkConfig, LanguageConfig};
 pub struct AnalyzerRegistry {
     by_extension: HashMap<String, Arc<dyn LanguageAnalyzer>>,
     by_language: HashMap<String, Arc<dyn LanguageAnalyzer>>,
+    available_by_extension: HashMap<String, Arc<dyn LanguageAnalyzer>>,
+    available_by_language: HashMap<String, Arc<dyn LanguageAnalyzer>>,
     fallback: Arc<dyn LanguageAnalyzer>,
 }
 
@@ -20,11 +22,29 @@ impl AnalyzerRegistry {
         Self {
             by_extension: HashMap::new(),
             by_language: HashMap::new(),
+            available_by_extension: HashMap::new(),
+            available_by_language: HashMap::new(),
             fallback,
         }
     }
 
     pub fn register(&mut self, analyzer: Arc<dyn LanguageAnalyzer>) {
+        self.register_available(Arc::clone(&analyzer));
+        self.enable(analyzer);
+    }
+
+    fn register_available(&mut self, analyzer: Arc<dyn LanguageAnalyzer>) {
+        self.available_by_language
+            .insert(analyzer.language_id().to_owned(), Arc::clone(&analyzer));
+        for extension in analyzer.extensions() {
+            self.available_by_extension.insert(
+                extension.trim_start_matches('.').to_ascii_lowercase(),
+                Arc::clone(&analyzer),
+            );
+        }
+    }
+
+    fn enable(&mut self, analyzer: Arc<dyn LanguageAnalyzer>) {
         self.by_language
             .insert(analyzer.language_id().to_owned(), Arc::clone(&analyzer));
         for extension in analyzer.extensions() {
@@ -40,23 +60,19 @@ impl AnalyzerRegistry {
             generic.target_chars,
             generic.overlap_chars,
         )));
-        if languages.rust {
-            registry.register(Arc::new(RustAnalyzer));
-        }
-        if languages.python {
-            registry.register(Arc::new(PythonAnalyzer));
-        }
-        if languages.javascript {
-            registry.register(Arc::new(JavaScriptAnalyzer));
-        }
-        if languages.typescript {
-            registry.register(Arc::new(TypeScriptAnalyzer));
-        }
-        if languages.csharp {
-            registry.register(Arc::new(CSharpAnalyzer));
-        }
-        if languages.go {
-            registry.register(Arc::new(GoAnalyzer));
+        let analyzers: [(bool, Arc<dyn LanguageAnalyzer>); 6] = [
+            (languages.rust, Arc::new(RustAnalyzer)),
+            (languages.python, Arc::new(PythonAnalyzer)),
+            (languages.javascript, Arc::new(JavaScriptAnalyzer)),
+            (languages.typescript, Arc::new(TypeScriptAnalyzer)),
+            (languages.csharp, Arc::new(CSharpAnalyzer)),
+            (languages.go, Arc::new(GoAnalyzer)),
+        ];
+        for (enabled, analyzer) in analyzers {
+            registry.register_available(Arc::clone(&analyzer));
+            if enabled {
+                registry.enable(analyzer);
+            }
         }
         registry
     }
@@ -72,6 +88,18 @@ impl AnalyzerRegistry {
 
     pub fn for_language(&self, language: &str) -> Option<Arc<dyn LanguageAnalyzer>> {
         self.by_language.get(language).cloned()
+    }
+
+    pub fn available_for_path(&self, path: &Path) -> Option<Arc<dyn LanguageAnalyzer>> {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .and_then(|extension| self.available_by_extension.get(&extension))
+            .cloned()
+    }
+
+    pub fn available_for_language(&self, language: &str) -> Option<Arc<dyn LanguageAnalyzer>> {
+        self.available_by_language.get(language).cloned()
     }
 
     pub fn registered_languages(&self) -> Vec<String> {
@@ -120,5 +148,28 @@ mod tests {
             assert!(analyzer.capabilities().structural_chunks);
             assert!(analyzer.capabilities().qualified_symbols);
         }
+    }
+
+    #[test]
+    fn configured_registry_retains_disabled_analyzer_availability() {
+        let languages = LanguageConfig {
+            python: false,
+            ..LanguageConfig::default()
+        };
+        let registry = AnalyzerRegistry::configured(&languages, &GenericChunkConfig::default());
+
+        assert_eq!(
+            registry.for_path(Path::new("main.py")).analyzer_id(),
+            "generic"
+        );
+        assert_eq!(
+            registry
+                .available_for_path(Path::new("main.py"))
+                .unwrap()
+                .analyzer_id(),
+            "tree-sitter-python"
+        );
+        assert!(registry.for_language("python").is_none());
+        assert!(registry.available_for_language("python").is_some());
     }
 }

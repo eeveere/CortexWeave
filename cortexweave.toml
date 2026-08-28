@@ -42,12 +42,33 @@ default_k = 8
 semantic_weight = 0.70
 lexical_weight = 0.30
 
+[context]
+candidate_pool_limit = 50
+structural_expansion_limit = 4
+
+[context.ranking]
+semantic_weight = 0.24
+lexical_weight = 0.16
+task_weight = 0.14
+working_set_weight = 0.14
+recency_weight = 0.10
+provenance_weight = 0.08
+freshness_weight = 0.08
+structural_weight = 0.06
+
+[context.budget]
+code_fraction = 0.50
+structural_fraction = 0.20
+memory_fraction = 0.15
+event_fraction = 0.10
+state_fraction = 0.05
+
 [logging]
 level = "info"
 
 [languages]
 rust = false
-python = false
+python = true
 javascript = false
 typescript = false
 csharp = false

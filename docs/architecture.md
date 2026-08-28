@@ -1,5 +1,7 @@
 # CortexWeave v0.1 Architecture
 
+For the v0.2 context-selection pipeline, see [Context Orchestration](context.md).
+
 ## Purpose
 
 CortexWeave is a local-first cognitive substrate for coding agents. Version 0.1
@@ -35,7 +37,9 @@ place another adapter over it without rewriting MCP behavior.
 `CortexWeaveService` is the public application facade. It owns references to
 small, independently testable services rather than a single mutable application
 state lock. Its operations cover workspace registration and status, indexing,
-retrieval, memories, sessions, tasks, and events.
+retrieval, memories, memory trust review and consolidation, sessions, tasks, and
+events. Memory analysis is transport-neutral and returns reviewable proposals;
+only a separate reviewed call changes trust or supersession state.
 
 Workspace selection is also an application concern. The facade resolves UUIDs,
 unique names, canonical roots, file URIs, nested paths, and adapter hints from a
@@ -102,6 +106,14 @@ only normalized chunks. A deterministic generic analyzer handles unsupported
 text files. Adding a language requires registering one analyzer, not modifying
 the indexer or schema.
 
+The registry retains a capability catalog for bundled analyzers even when one is
+disabled. `CortexWeaveService::workspace_readiness` compares that catalog with
+the configured selection, an ignore-aware workspace scan, and persisted
+document metadata. It reports generic fallback and replacement cost without
+changing configuration or invoking indexing. Unsupported text remains a valid
+deterministic fallback; a bundled but disabled analyzer makes the workspace not
+ready until the caller explicitly chooses whether to enable it.
+
 Stable keys are analyzer-produced path-relative identities such as
 `src/index.rs::impl:SemanticIndex::method:search`. A chunk content hash detects
 changes independently of identity. Analyzer ID and version are stored so an
@@ -158,6 +170,12 @@ domain and Serde types. MCP can be removed while CLI, tests, and a future
 harness continue to use the same core. Likewise, the indexing service consumes
 normalized analyzer output and contains no Rust, Python, TypeScript,
 JavaScript, C#, or Go syntax.
+
+The native harness contract adds typed preparation, caller-owned sufficiency
+policy, and policy-gated exact hydration around that facade. It does not execute
+tools or select workflow policy. Packet-selected hydration retains selection
+scores; an authorized out-of-packet hydration is explicitly marked unscored and
+records a durable reason plus source provenance before returning evidence.
 
 ## MCP Adapter
 

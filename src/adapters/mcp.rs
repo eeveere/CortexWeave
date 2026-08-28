@@ -14,7 +14,10 @@ use tokio::task::JoinHandle;
 
 use crate::{
     CortexWeaveService,
-    domain::{CortexEvent, EventType, MemoryKind, MemoryRecord},
+    domain::{
+        Checkpoint, ContextRequest, ContextSourceType, CortexEvent, EventType, MemoryKind,
+        MemoryRecord, ResumeContextRequest,
+    },
     indexing::{WorkspaceWatcher, WorkspaceWatcherHandle},
     workspace::WorkspaceSelector,
 };
@@ -22,6 +25,7 @@ use crate::{
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_MCP_FRAME_BYTES: usize = 1_048_576;
 const MAX_TOOL_LIMIT: usize = 100;
+const MAX_CONTEXT_TOKEN_BUDGET: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceHint {
@@ -208,12 +212,20 @@ impl McpServer {
         let arguments = object(&arguments).map_err(invalid_params)?;
         let result = match name {
             "semantic_search" => self.semantic_search(arguments).await,
+            "semantic_context" => self.semantic_context(arguments).await,
+            "resume_context" => self.resume_context(arguments).await,
+            "working_set" => self.working_set(arguments).await,
+            "context_pin" => self.context_pin(arguments).await,
+            "context_unpin" => self.context_unpin(arguments).await,
+            "checkpoint_create" => self.checkpoint_create(arguments).await,
+            "checkpoint_latest" => self.checkpoint_latest(arguments).await,
             "semantic_get" => self.semantic_get(arguments).await,
             "memory_record" => self.memory_record(arguments).await,
             "memory_search" => self.memory_search(arguments).await,
             "memory_recent" => self.memory_recent(arguments).await,
             "workspace_list" => self.workspace_list().await,
             "workspace_status" => self.workspace_status(arguments).await,
+            "workspace_readiness" => self.workspace_readiness(arguments).await,
             "workspace_reindex" => self.workspace_reindex(arguments).await,
             "session_start" => self.session_start(arguments).await,
             "session_end" => self.session_end(arguments).await,
@@ -235,6 +247,120 @@ impl McpServer {
                 .semantic_search(&workspace.id, query, limit)
                 .await,
         )
+    }
+
+    async fn semantic_context(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        let mut request = ContextRequest::new(&workspace.id);
+        request.query = Some(required_string(args, "query")?.to_owned());
+        request.session_id = optional_string(args, "session_id")?;
+        request.task_id = optional_string(args, "task_id")?;
+        request.token_budget = optional_context_budget(args, request.token_budget)?;
+        request.include_code = optional_bool(args, "include_code", request.include_code)?;
+        request.include_documents =
+            optional_bool(args, "include_documents", request.include_documents)?;
+        request.include_memories =
+            optional_bool(args, "include_memories", request.include_memories)?;
+        request.include_events = optional_bool(args, "include_events", request.include_events)?;
+        request.path_scope = optional_strings(args, "path_scope")?;
+        request.language_scope = optional_strings(args, "language_scope")?;
+        request.include_explanation = optional_bool(args, "include_explanation", false)?;
+        serialize_service(self.service.semantic_context(request).await)
+    }
+
+    async fn resume_context(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        let mut request = ResumeContextRequest::new(&workspace.id);
+        request.session_id = optional_string(args, "session_id")?;
+        request.task_id = optional_string(args, "task_id")?;
+        request.token_budget = optional_context_budget(args, request.token_budget)?;
+        request.include_explanation = optional_bool(args, "include_explanation", false)?;
+        serialize_service(self.service.resume_context(request).await)
+    }
+
+    async fn working_set(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(
+            self.service
+                .inspect_working_set(
+                    &workspace.id,
+                    required_string(args, "session_id")?,
+                    optional_string(args, "task_id")?.as_deref(),
+                )
+                .await,
+        )
+    }
+
+    async fn context_pin(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(
+            self.service
+                .pin_context(
+                    &workspace.id,
+                    required_string(args, "session_id")?,
+                    optional_string(args, "task_id")?.as_deref(),
+                    required_string(args, "source_id")?,
+                    ContextSourceType::from_storage(required_string(args, "source_type")?),
+                )
+                .await,
+        )
+    }
+
+    async fn context_unpin(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(
+            self.service
+                .unpin_context(
+                    &workspace.id,
+                    required_string(args, "session_id")?,
+                    optional_string(args, "task_id")?.as_deref(),
+                    required_string(args, "source_id")?,
+                    ContextSourceType::from_storage(required_string(args, "source_type")?),
+                )
+                .await,
+        )
+    }
+
+    async fn checkpoint_create(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        let mut checkpoint = Checkpoint::new(
+            &workspace.id,
+            required_string(args, "session_id")?,
+            required_string(args, "content")?,
+        );
+        checkpoint.task_id = optional_string(args, "task_id")?;
+        checkpoint.objective = optional_string(args, "objective")?;
+        checkpoint.completed = optional_strings(args, "completed")?;
+        checkpoint.decision_ids = optional_strings(args, "decision_ids")?;
+        checkpoint.open_problems = optional_strings(args, "open_problems")?;
+        checkpoint.related_paths = optional_strings(args, "related_paths")?;
+        checkpoint.related_symbols = optional_strings(args, "related_symbols")?;
+        checkpoint.next_action = optional_string(args, "next_action")?;
+        serialize_service(self.service.create_checkpoint(checkpoint).await)
+    }
+
+    async fn checkpoint_latest(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        let checkpoint = match (
+            optional_string(args, "session_id")?,
+            optional_string(args, "task_id")?,
+        ) {
+            (Some(_session_id), Some(_)) => {
+                return Err("checkpoint_latest accepts session_id or task_id, not both".into());
+            }
+            (Some(session_id), None) => {
+                self.service
+                    .latest_checkpoint_for_session(&workspace.id, &session_id)
+                    .await
+            }
+            (None, Some(task_id)) => {
+                self.service
+                    .latest_checkpoint_for_task(&workspace.id, &task_id)
+                    .await
+            }
+            (None, None) => self.service.latest_checkpoint(&workspace.id).await,
+        };
+        serialize_service(checkpoint)
     }
 
     async fn semantic_get(&self, args: &Map<String, Value>) -> ToolResult {
@@ -323,6 +449,11 @@ impl McpServer {
                 .unwrap_or_else(|| "not_started".into())
         );
         Ok(status)
+    }
+
+    async fn workspace_readiness(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(self.service.workspace_readiness(&workspace.id).await)
     }
 
     async fn workspace_reindex(&self, args: &Map<String, Value>) -> ToolResult {
@@ -438,8 +569,82 @@ fn tool_definitions() -> Vec<Value> {
             &["query"],
         ),
         tool(
+            "semantic_context",
+            "Assemble one bounded, task-aware context packet from current code, memories, events, and session state. Use this first when asked to gather context or to answer from a context packet; it performs retrieval and selection in one call.",
+            workspace_properties(json!({
+                "query": string_schema(),
+                "session_id": string_schema(),
+                "task_id": string_schema(),
+                "token_budget": context_budget_schema(),
+                "include_code": { "type": "boolean" },
+                "include_documents": { "type": "boolean" },
+                "include_memories": { "type": "boolean" },
+                "include_events": { "type": "boolean" },
+                "path_scope": { "type": "array", "items": string_schema() },
+                "language_scope": { "type": "array", "items": string_schema() }
+                ,"include_explanation": { "type": "boolean" }
+            })),
+            &["query"],
+        ),
+        tool(
+            "resume_context",
+            "Reconstruct bounded, transcript-free context for the current or selected task.",
+            workspace_properties(json!({
+                "session_id": string_schema(),
+                "task_id": string_schema(),
+                "token_budget": context_budget_schema(),
+                "include_explanation": { "type": "boolean" }
+            })),
+            &[],
+        ),
+        tool(
+            "working_set",
+            "Inspect the decayed working set and pins for a session.",
+            workspace_properties(
+                json!({ "session_id": string_schema(), "task_id": string_schema() }),
+            ),
+            &["session_id"],
+        ),
+        tool(
+            "context_pin",
+            "Pin a context source so it remains in the session working set.",
+            workspace_properties(
+                json!({ "session_id": string_schema(), "task_id": string_schema(), "source_id": string_schema(), "source_type": string_schema() }),
+            ),
+            &["session_id", "source_id", "source_type"],
+        ),
+        tool(
+            "context_unpin",
+            "Remove a context source pin from a session.",
+            workspace_properties(
+                json!({ "session_id": string_schema(), "task_id": string_schema(), "source_id": string_schema(), "source_type": string_schema() }),
+            ),
+            &["session_id", "source_id", "source_type"],
+        ),
+        tool(
+            "checkpoint_create",
+            "Persist explicit structured checkpoint state for an active session.",
+            workspace_properties(json!({
+                "session_id": string_schema(), "task_id": string_schema(), "content": string_schema(),
+                "objective": string_schema(), "completed": { "type": "array", "items": string_schema() },
+                "decision_ids": { "type": "array", "items": string_schema() },
+                "open_problems": { "type": "array", "items": string_schema() },
+                "related_paths": { "type": "array", "items": string_schema() },
+                "related_symbols": { "type": "array", "items": string_schema() }, "next_action": string_schema()
+            })),
+            &["session_id", "content"],
+        ),
+        tool(
+            "checkpoint_latest",
+            "Read the latest checkpoint in a workspace, session, or task scope.",
+            workspace_properties(
+                json!({ "session_id": string_schema(), "task_id": string_schema() }),
+            ),
+            &[],
+        ),
+        tool(
             "semantic_get",
-            "Get one indexed code item and its provenance from the resolved workspace.",
+            "Get one indexed code item and its provenance by an exact chunk UUID returned by a prior CortexWeave search or context result. Do not use this for a filename, symbol name, or natural-language query.",
             workspace_properties(json!({ "chunk_id": string_schema() })),
             &["chunk_id"],
         ),
@@ -472,6 +677,12 @@ fn tool_definitions() -> Vec<Value> {
         tool(
             "workspace_status",
             "Get indexing status for the resolved workspace.",
+            workspace_properties(json!({})),
+            &[],
+        ),
+        tool(
+            "workspace_readiness",
+            "Inspect analyzer coverage, generic fallback use, and explicit reindex cost for the resolved workspace without changing configuration or starting a reindex.",
             workspace_properties(json!({})),
             &[],
         ),
@@ -544,6 +755,10 @@ fn workspace_properties(mut properties: Value) -> Value {
 
 fn limit_schema() -> Value {
     json!({ "type": "integer", "minimum": 0, "maximum": MAX_TOOL_LIMIT })
+}
+
+fn context_budget_schema() -> Value {
+    json!({ "type": "integer", "minimum": 0, "maximum": MAX_CONTEXT_TOKEN_BUDGET })
 }
 
 fn tool_success(value: Value) -> Value {
@@ -654,6 +869,32 @@ fn optional_limit(args: &Map<String, Value>, default: usize) -> Result<usize, St
         })
 }
 
+fn optional_context_budget(args: &Map<String, Value>, default: usize) -> Result<usize, String> {
+    let Some(value) = args.get("token_budget") else {
+        return Ok(default);
+    };
+    value
+        .as_u64()
+        .ok_or_else(|| "token_budget must be a non-negative integer".into())
+        .and_then(|value| usize::try_from(value).map_err(|_| "token_budget is too large".into()))
+        .and_then(|value| {
+            (value <= MAX_CONTEXT_TOKEN_BUDGET)
+                .then_some(value)
+                .ok_or_else(|| format!("token_budget must be at most {MAX_CONTEXT_TOKEN_BUDGET}"))
+        })
+}
+
+fn optional_bool(args: &Map<String, Value>, name: &str, default: bool) -> Result<bool, String> {
+    args.get(name)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| format!("{name} must be a boolean when supplied"))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
+}
+
 fn parse_memory_kind(value: &str) -> Result<MemoryKind, String> {
     match value {
         "decision" => Ok(MemoryKind::Decision),
@@ -748,6 +989,13 @@ mod tests {
             .collect();
         for required in [
             "semantic_search",
+            "semantic_context",
+            "resume_context",
+            "working_set",
+            "context_pin",
+            "context_unpin",
+            "checkpoint_create",
+            "checkpoint_latest",
             "semantic_get",
             "memory_record",
             "memory_search",
@@ -798,10 +1046,38 @@ mod tests {
             searched["result"]["structuredContent"][0]["kind"],
             "decision"
         );
-        let invalid = server
+        let context = server
             .handle_json(json!({
                 "jsonrpc": "2.0",
                 "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "semantic_context",
+                    "arguments": {
+                        "workspace_id": workspace_id,
+                        "query": "Why BLAKE3?",
+                        "token_budget": 256,
+                        "include_code": false,
+                        "include_documents": false,
+                        "include_events": false,
+                    },
+                },
+            }))
+            .await
+            .unwrap();
+        assert_eq!(context["result"]["isError"], false);
+        assert_eq!(context["result"]["structuredContent"]["token_budget"], 256);
+        assert!(
+            context["result"]["structuredContent"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["source_type"] == "memory")
+        );
+        let invalid = server
+            .handle_json(json!({
+                "jsonrpc": "2.0",
+                "id": 6,
                 "method": "tools/call",
                 "params": { "name": "memory_record", "arguments": { "workspace_id": workspace_id } },
             }))
@@ -814,6 +1090,48 @@ mod tests {
         assert_eq!(
             singleton["structuredContent"]["workspace"]["id"],
             workspace_id
+        );
+    }
+
+    #[tokio::test]
+    async fn exposes_resume_and_checkpoint_tools_as_thin_service_calls() {
+        let (server, workspace_id) = server().await;
+        initialize(&server).await;
+        let session = call_tool(
+            &server,
+            "session_start",
+            json!({ "workspace_id": workspace_id }),
+        )
+        .await;
+        let session_id = session["structuredContent"]["id"].as_str().unwrap();
+        let checkpoint = call_tool(
+            &server,
+            "checkpoint_create",
+            json!({ "workspace_id": workspace_id, "session_id": session_id, "content": "Continue context exposure." }),
+        )
+        .await;
+        assert_eq!(checkpoint["isError"], false);
+        let resume = call_tool(
+            &server,
+            "resume_context",
+            json!({ "workspace_id": workspace_id, "token_budget": 256 }),
+        )
+        .await;
+        assert_eq!(resume["isError"], false);
+        assert_eq!(
+            resume["structuredContent"]["selected_session"]["id"],
+            session_id
+        );
+        let latest = call_tool(
+            &server,
+            "checkpoint_latest",
+            json!({ "workspace_id": workspace_id, "session_id": session_id }),
+        )
+        .await;
+        assert_eq!(latest["isError"], false);
+        assert_eq!(
+            latest["structuredContent"]["content"],
+            "Continue context exposure."
         );
     }
 

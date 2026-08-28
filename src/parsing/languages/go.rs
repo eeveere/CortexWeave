@@ -23,7 +23,7 @@ impl LanguageAnalyzer for GoAnalyzer {
     }
 
     fn analyzer_version(&self) -> String {
-        format!("{}-2", env!("CARGO_PKG_VERSION"))
+        format!("{}-3", env!("CARGO_PKG_VERSION"))
     }
 
     fn extensions(&self) -> &'static [&'static str] {

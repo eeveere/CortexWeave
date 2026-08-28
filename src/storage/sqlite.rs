@@ -159,7 +159,20 @@ mod tests {
         let mut memory = MemoryRecord::new(&workspace.id, MemoryKind::Decision, "Keep v0.1 data");
         memory.session_id = Some(session.id.clone());
         memory.task_id = Some(task.id.clone());
-        legacy.insert_memory(&memory).await.unwrap();
+        sqlx::query(
+            "INSERT INTO memories(id, workspace_id, session_id, task_id, kind, content, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&memory.id)
+        .bind(&memory.workspace_id)
+        .bind(&memory.session_id)
+        .bind(&memory.task_id)
+        .bind(memory.kind.as_str())
+        .bind(&memory.content)
+        .bind(serde_json::to_string(&memory.metadata_for_storage()).unwrap())
+        .bind(memory.created_at)
+        .execute(legacy.pool())
+        .await
+        .unwrap();
         let mut event = CortexEvent::new(
             &workspace.id,
             EventType::TaskStarted,

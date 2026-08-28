@@ -44,6 +44,9 @@ impl AppConfig {
     }
 }
 
+pub const MAX_CONTEXT_CANDIDATE_POOL_LIMIT: usize = 10_000;
+pub const MAX_CONTEXT_STRUCTURAL_EXPANSION_LIMIT: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -368,12 +371,18 @@ impl TemporalConfig {
 #[serde(default)]
 pub struct ContextConfig {
     pub candidate_pool_limit: usize,
+    pub structural_expansion_limit: usize,
+    pub ranking: ContextRankingConfig,
+    pub budget: ContextBudgetConfig,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             candidate_pool_limit: 50,
+            structural_expansion_limit: 4,
+            ranking: ContextRankingConfig::default(),
+            budget: ContextBudgetConfig::default(),
         }
     }
 }
@@ -385,7 +394,133 @@ impl ContextConfig {
                 "context.candidate_pool_limit must be greater than zero".into(),
             ));
         }
+        if self.candidate_pool_limit > MAX_CONTEXT_CANDIDATE_POOL_LIMIT {
+            return Err(CortexError::Configuration(format!(
+                "context.candidate_pool_limit must not exceed {MAX_CONTEXT_CANDIDATE_POOL_LIMIT}"
+            )));
+        }
+        if self.structural_expansion_limit == 0 {
+            return Err(CortexError::Configuration(
+                "context.structural_expansion_limit must be greater than zero".into(),
+            ));
+        }
+        if self.structural_expansion_limit > MAX_CONTEXT_STRUCTURAL_EXPANSION_LIMIT {
+            return Err(CortexError::Configuration(format!(
+                "context.structural_expansion_limit must not exceed {MAX_CONTEXT_STRUCTURAL_EXPANSION_LIMIT}"
+            )));
+        }
+        self.ranking.validate()?;
+        self.budget.validate()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextBudgetConfig {
+    pub code_fraction: f32,
+    pub structural_fraction: f32,
+    pub memory_fraction: f32,
+    pub event_fraction: f32,
+    pub state_fraction: f32,
+}
+
+impl Default for ContextBudgetConfig {
+    fn default() -> Self {
+        Self {
+            code_fraction: 0.50,
+            structural_fraction: 0.20,
+            memory_fraction: 0.15,
+            event_fraction: 0.10,
+            state_fraction: 0.05,
+        }
+    }
+}
+
+impl ContextBudgetConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let fractions = [
+            self.code_fraction,
+            self.structural_fraction,
+            self.memory_fraction,
+            self.event_fraction,
+            self.state_fraction,
+        ];
+        if fractions
+            .iter()
+            .any(|fraction| !fraction.is_finite() || *fraction < 0.0)
+            || fractions.iter().sum::<f32>() > 1.0
+        {
+            return Err(CortexError::Configuration(
+                "context budget fractions must be finite, non-negative, and sum to at most one"
+                    .into(),
+            ));
+        }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextRankingConfig {
+    pub semantic_weight: f32,
+    pub lexical_weight: f32,
+    pub task_weight: f32,
+    pub working_set_weight: f32,
+    pub recency_weight: f32,
+    pub provenance_weight: f32,
+    pub freshness_weight: f32,
+    pub structural_weight: f32,
+}
+
+impl Default for ContextRankingConfig {
+    fn default() -> Self {
+        Self {
+            semantic_weight: 0.24,
+            lexical_weight: 0.16,
+            task_weight: 0.14,
+            working_set_weight: 0.14,
+            recency_weight: 0.10,
+            provenance_weight: 0.08,
+            freshness_weight: 0.08,
+            structural_weight: 0.06,
+        }
+    }
+}
+
+impl ContextRankingConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let weights = [
+            self.semantic_weight,
+            self.lexical_weight,
+            self.task_weight,
+            self.working_set_weight,
+            self.recency_weight,
+            self.provenance_weight,
+            self.freshness_weight,
+            self.structural_weight,
+        ];
+        if weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight < 0.0)
+            || weights.iter().sum::<f32>() <= 0.0
+        {
+            return Err(CortexError::Configuration(
+                "context ranking weights must be finite, non-negative, and non-zero in total"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn total_weight(&self) -> f32 {
+        self.semantic_weight
+            + self.lexical_weight
+            + self.task_weight
+            + self.working_set_weight
+            + self.recency_weight
+            + self.provenance_weight
+            + self.freshness_weight
+            + self.structural_weight
     }
 }
 
@@ -439,6 +574,9 @@ mod tests {
         assert_eq!(config.working_set.max_items, 100);
         assert_eq!(config.temporal.recency_half_life_hours, 72.0);
         assert_eq!(config.context.candidate_pool_limit, 50);
+        assert_eq!(config.context.structural_expansion_limit, 4);
+        assert_eq!(config.context.ranking.semantic_weight, 0.24);
+        assert_eq!(config.context.budget.code_fraction, 0.50);
         assert!(config.languages.rust);
         assert_eq!(
             config.embedding.limits.tokenizer,
@@ -451,6 +589,9 @@ mod tests {
         let invalid: AppConfig =
             toml::from_str("[embedding.limits]\nmax_input_tokens = 32\nreserved_tokens = 32\n")
                 .unwrap();
+        assert!(invalid.validate().is_err());
+
+        let invalid: AppConfig = toml::from_str("[context.budget]\ncode_fraction = 1.1").unwrap();
         assert!(invalid.validate().is_err());
 
         let valid: AppConfig = toml::from_str(
@@ -505,6 +646,33 @@ mod tests {
     #[test]
     fn validates_candidate_pool_limit() {
         let invalid: AppConfig = toml::from_str("[context]\ncandidate_pool_limit = 0").unwrap();
+        assert!(invalid.validate().is_err());
+
+        let invalid: AppConfig =
+            toml::from_str("[context]\nstructural_expansion_limit = 0").unwrap();
+        assert!(invalid.validate().is_err());
+
+        let invalid: AppConfig = toml::from_str(&format!(
+            "[context]\ncandidate_pool_limit = {}",
+            MAX_CONTEXT_CANDIDATE_POOL_LIMIT + 1
+        ))
+        .unwrap();
+        assert!(invalid.validate().is_err());
+
+        let invalid: AppConfig = toml::from_str(&format!(
+            "[context]\nstructural_expansion_limit = {}",
+            MAX_CONTEXT_STRUCTURAL_EXPANSION_LIMIT + 1
+        ))
+        .unwrap();
+        assert!(invalid.validate().is_err());
+
+        let invalid: AppConfig = toml::from_str("[context.ranking]\nsemantic_weight = -1").unwrap();
+        assert!(invalid.validate().is_err());
+
+        let invalid: AppConfig = toml::from_str(
+            "[context.ranking]\nsemantic_weight = 0\nlexical_weight = 0\ntask_weight = 0\nworking_set_weight = 0\nrecency_weight = 0\nprovenance_weight = 0\nfreshness_weight = 0\nstructural_weight = 0",
+        )
+        .unwrap();
         assert!(invalid.validate().is_err());
     }
 }

@@ -62,10 +62,11 @@ pub(crate) fn analyze<S: StructureSpec>(
             start_line: 1,
             end_line: line_number(source, end),
             content: source.to_owned(),
-            metadata: json!({"node_kind": "source_file", "structural_fallback": true}),
+            metadata: structural_metadata("source_file", false, "", None, None, None, 0),
         });
     }
     disambiguate_duplicate_keys(&mut chunks);
+    assign_structural_ordinals(&mut chunks);
     Ok(chunks)
 }
 
@@ -74,14 +75,14 @@ fn walk<S: StructureSpec>(
     node: Node<'_>,
     source: &str,
     path: &str,
-    containers: &mut Vec<(String, String, SymbolKind)>,
+    containers: &mut Vec<Container>,
     chunks: &mut Vec<AnalyzedChunk>,
 ) {
     let descriptor = spec.classify(node, source).map(|mut descriptor| {
         if descriptor.kind == SymbolKind::Function
-            && containers.last().is_some_and(|(_, _, kind)| {
+            && containers.last().is_some_and(|container| {
                 matches!(
-                    kind,
+                    container.kind,
                     SymbolKind::Class
                         | SymbolKind::Struct
                         | SymbolKind::Trait
@@ -99,7 +100,7 @@ fn walk<S: StructureSpec>(
     let pushed = if let Some(descriptor) = descriptor {
         let mut segments: Vec<String> = containers
             .iter()
-            .map(|(key_kind, name, _)| format!("{key_kind}:{name}"))
+            .map(|container| format!("{}:{}", container.key_kind, container.name))
             .collect();
         let identity_name = descriptor
             .identity_name
@@ -109,7 +110,7 @@ fn walk<S: StructureSpec>(
         let stable_key = format!("{path}::{}", segments.join("::"));
         let qualified_symbol = containers
             .iter()
-            .map(|(_, name, _)| name.as_str())
+            .map(|container| container.name.as_str())
             .chain(std::iter::once(
                 descriptor
                     .qualified_name
@@ -132,6 +133,7 @@ fn walk<S: StructureSpec>(
             .map(normalize_identity_text)
             .collect::<Vec<_>>()
             .join("|");
+        let chunk_index = chunks.len();
         chunks.push(AnalyzedChunk {
             stable_key,
             language: spec.language_id().into(),
@@ -143,18 +145,30 @@ fn walk<S: StructureSpec>(
             start_line: line_number(source, content_start),
             end_line: line_number(source, content_end),
             content,
-            metadata: json!({
-                "node_kind": node.kind(),
-                "has_error": node.has_error(),
-                "identity_signature": identity_signature,
-            }),
+            metadata: structural_metadata(
+                node.kind(),
+                node.has_error(),
+                &identity_signature,
+                containers
+                    .last()
+                    .map(|container| container.stable_key.as_str()),
+                containers.last().map(|container| container.chunk_index),
+                containers.last().map(|container| container.name.as_str()),
+                containers.len(),
+            ),
         });
         if descriptor.is_container {
-            containers.push((
-                descriptor.key_kind.into(),
-                descriptor.identity_name.unwrap_or(descriptor.name),
-                descriptor.kind,
-            ));
+            containers.push(Container {
+                stable_key: chunks
+                    .last()
+                    .expect("chunk was just inserted")
+                    .stable_key
+                    .clone(),
+                chunk_index,
+                key_kind: descriptor.key_kind.into(),
+                name: descriptor.identity_name.unwrap_or(descriptor.name),
+                kind: descriptor.kind,
+            });
             true
         } else {
             false
@@ -170,6 +184,36 @@ fn walk<S: StructureSpec>(
     if pushed {
         containers.pop();
     }
+}
+
+#[derive(Debug, Clone)]
+struct Container {
+    stable_key: String,
+    chunk_index: usize,
+    key_kind: String,
+    name: String,
+    kind: SymbolKind,
+}
+
+fn structural_metadata(
+    node_kind: &str,
+    has_error: bool,
+    identity_signature: &str,
+    parent_stable_key: Option<&str>,
+    parent_chunk_index: Option<usize>,
+    container_symbol: Option<&str>,
+    structural_depth: usize,
+) -> serde_json::Value {
+    json!({
+        "node_kind": node_kind,
+        "has_error": has_error,
+        "identity_signature": identity_signature,
+        "parent_stable_key": parent_stable_key,
+        "_parent_chunk_index": parent_chunk_index,
+        "container_symbol": container_symbol,
+        "structural_depth": structural_depth,
+        "ordinal_in_container": null,
+    })
 }
 
 fn wrapped_node(mut node: Node<'_>) -> Node<'_> {
@@ -225,7 +269,8 @@ fn disambiguate_duplicate_keys(chunks: &mut [AnalyzedChunk]) {
     }
     let mut exact_counts: HashMap<String, usize> = HashMap::new();
     for chunk in chunks.iter_mut() {
-        if counts.get(&chunk.stable_key).copied().unwrap_or_default() < 2 {
+        let original_key = chunk.stable_key.clone();
+        if counts.get(&original_key).copied().unwrap_or_default() < 2 {
             continue;
         }
         let signature = chunk
@@ -234,13 +279,47 @@ fn disambiguate_duplicate_keys(chunks: &mut [AnalyzedChunk]) {
             .and_then(|value| value.as_str())
             .unwrap_or_default();
         let digest = blake3::hash(signature.as_bytes()).to_hex()[..10].to_owned();
-        let candidate = format!("{}#{digest}", chunk.stable_key);
+        let candidate = format!("{original_key}#{digest}");
         let ordinal = exact_counts.entry(candidate.clone()).or_default();
         chunk.stable_key = if *ordinal == 0 {
             candidate
         } else {
             format!("{candidate}~{ordinal}")
         };
+        *ordinal += 1;
+    }
+    let stable_keys: Vec<_> = chunks
+        .iter()
+        .map(|chunk| chunk.stable_key.clone())
+        .collect();
+    for chunk in chunks {
+        let Some(metadata) = chunk.metadata.as_object_mut() else {
+            continue;
+        };
+        let parent_index = metadata
+            .remove("_parent_chunk_index")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| usize::try_from(value).ok());
+        let parent_key = parent_index.and_then(|index| stable_keys.get(index));
+        metadata.insert(
+            "parent_stable_key".into(),
+            parent_key.map_or(serde_json::Value::Null, |value| json!(value)),
+        );
+    }
+}
+
+fn assign_structural_ordinals(chunks: &mut [AnalyzedChunk]) {
+    let mut ordinals: HashMap<Option<String>, usize> = HashMap::new();
+    for chunk in chunks {
+        let parent_key = chunk
+            .metadata
+            .get("parent_stable_key")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned);
+        let ordinal = ordinals.entry(parent_key).or_default();
+        if let Some(metadata) = chunk.metadata.as_object_mut() {
+            metadata.insert("ordinal_in_container".into(), (*ordinal).into());
+        }
         *ordinal += 1;
     }
 }

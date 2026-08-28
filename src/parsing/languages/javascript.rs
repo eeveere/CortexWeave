@@ -19,7 +19,7 @@ impl LanguageAnalyzer for JavaScriptAnalyzer {
         "tree-sitter-javascript"
     }
     fn analyzer_version(&self) -> String {
-        env!("CARGO_PKG_VERSION").into()
+        format!("{}-2", env!("CARGO_PKG_VERSION"))
     }
     fn extensions(&self) -> &'static [&'static str] {
         &["js", "jsx", "mjs", "cjs"]

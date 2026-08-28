@@ -43,6 +43,10 @@ target/release/cortexweave --config cortexweave.toml reindex <workspace-id>
    using `docs/mcp-setup.md`. The hint lets normal MCP calls omit the UUID; it
    never registers a workspace automatically.
 
+For multiple Crush projects, follow
+[Using CortexWeave with More Than One Crush Project](docs/crush-workspaces.md).
+Use [`.crushrc.example`](.crushrc.example) as the project-local Crush template.
+
 ## Documentation
 
 - `docs/architecture.md`: boundaries, data flow, and failure model
@@ -54,7 +58,9 @@ target/release/cortexweave --config cortexweave.toml reindex <workspace-id>
 - `docs/troubleshooting.md`: diagnosis and recovery
 - `docs/analyzers.md`: analyzer API and complete language-extension path
 - `docs/native-adapter.md`: future direct harness integration
+- `docs/v0.3-plan.md`: harness-controlled context roadmap
+- `docs/memory-integrity.md`: imported-memory trust and consolidation policy
 
-CortexWeave stores explicit memories only when a caller records them. It does
-not infer memories, invoke reasoning models, execute tools, or orchestrate agent
-loops.
+CortexWeave stores explicit memories only when a caller records or imports them.
+Imported memory is not eligible for automatic context until explicitly reviewed.
+It does not invoke reasoning models, execute tools, or orchestrate agent loops.

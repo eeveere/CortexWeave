@@ -19,7 +19,7 @@ impl LanguageAnalyzer for CSharpAnalyzer {
         "tree-sitter-c-sharp"
     }
     fn analyzer_version(&self) -> String {
-        env!("CARGO_PKG_VERSION").into()
+        format!("{}-2", env!("CARGO_PKG_VERSION"))
     }
     fn extensions(&self) -> &'static [&'static str] {
         &["cs"]

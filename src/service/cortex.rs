@@ -1,29 +1,59 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     AppConfig, CortexError, Result,
     domain::{
-        Checkpoint, ContextCandidatePool, ContextPin, ContextRequest, ContextSourceType,
-        CortexEvent, MemoryRecord, Session, Task, TaskStatus, TemporalContextItem, TemporalQuery,
-        WorkingSetEntry, WorkingSetSnapshot, Workspace,
+        Checkpoint, ContextCandidatePool, ContextPacket, ContextPin, ContextRequest,
+        ContextSourceType, CortexEvent, Document, EventType, MemoryOrigin, MemoryRecord,
+        MemorySupersession, MemoryTrust, MemoryTrustReview, ResumeContext, ResumeContextRequest,
+        Session, Task, TaskStatus, TemporalContextItem, TemporalQuery, WorkingSetEntry,
+        WorkingSetSnapshot, Workspace,
     },
     embedding::{
-        EmbeddingLimits, EmbeddingProvider, OpenAiCompatibleEmbeddingProvider, TokenCountAccuracy,
+        EmbeddingLimits, EmbeddingProvider, OpenAiCompatibleEmbeddingProvider, TokenCount,
+        TokenCountAccuracy, TokenCounter,
     },
     indexing::{IndexingService, WorkspaceReindexOutcome},
     instrumentation::{InstrumentationSnapshot, RuntimeMetrics, WorkspaceResolutionKind, snapshot},
     parsing::AnalyzerRegistry,
     retrieval::{RetrievalResult, RetrievalService},
-    service::ContextService,
+    service::{
+        ContextService, HarnessContext, HarnessContextRequest, HarnessHydrationRequest,
+        HarnessSelectedSource, HydratedContextSource, HydrationAuthorization,
+        HydrationScoreProvenance, MemoryConsolidationReport, MemoryConsolidationRequest,
+        MemorySupersessionReviewRequest, MemoryTrustReviewRequest,
+    },
     storage::SqliteStorage,
-    workspace::{PathIdentity, WorkspaceSelector},
+    workspace::{PathIdentity, WorkspaceScanner, WorkspaceSelector},
 };
 
 const MAX_COLLECTION_LIMIT: usize = 100;
+
+struct EmbeddingTokenCounter {
+    provider: Arc<dyn EmbeddingProvider>,
+}
+
+impl TokenCounter for EmbeddingTokenCounter {
+    fn count(&self, text: &str) -> TokenCount {
+        self.provider.count_tokens(text)
+    }
+
+    fn identity(&self) -> &str {
+        self.provider.token_counter_id()
+    }
+
+    fn accuracy(&self) -> TokenCountAccuracy {
+        self.provider.token_counter_accuracy()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceStatus {
@@ -43,6 +73,67 @@ pub struct WorkspaceCatalog {
     pub workspaces: Vec<Workspace>,
     pub default_hint_match: Option<Workspace>,
     pub default_hint_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebuildCost {
+    pub documents: usize,
+    pub chunks: usize,
+    pub embeddings: usize,
+}
+
+impl RebuildCost {
+    fn add(&mut self, other: Self) {
+        self.documents += other.documents;
+        self.chunks += other.chunks;
+        self.embeddings += other.embeddings;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanguageReadiness {
+    pub language: String,
+    pub extensions: Vec<String>,
+    pub files_discovered: usize,
+    pub indexed_documents: usize,
+    pub selected_analyzer_id: String,
+    pub selected_analyzer_version: String,
+    pub bundled_analyzer_available: bool,
+    pub bundled_analyzer_configured: bool,
+    pub using_generic_fallback: bool,
+    pub configured_rebuild: RebuildCost,
+    pub recommended_rebuild: RebuildCost,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalyzerRecommendation {
+    pub language: String,
+    pub config_key: String,
+    pub analyzer_id: String,
+    pub files_affected: usize,
+    pub rebuild: RebuildCost,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceReadiness {
+    pub workspace: Workspace,
+    pub ready: bool,
+    pub read_only: bool,
+    pub files_discovered: usize,
+    pub scan_failures: usize,
+    pub generic_fallback_files: usize,
+    pub supported_fallback_files: usize,
+    pub unsupported_fallback_files: usize,
+    pub languages: Vec<LanguageReadiness>,
+    pub recommendations: Vec<AnalyzerRecommendation>,
+    pub configured_rebuild: RebuildCost,
+    pub recommended_rebuild: RebuildCost,
+    pub replacement_policy: String,
+}
+
+struct LanguageReadinessAccumulator {
+    report: LanguageReadiness,
+    recommended_analyzer_id: Option<String>,
 }
 
 pub struct CortexWeaveService {
@@ -93,12 +184,15 @@ impl CortexWeaveService {
             config.retrieval.lexical_weight,
             Arc::clone(&metrics),
         )?);
-        let context = Arc::new(ContextService::new(
+        let context = Arc::new(ContextService::new_with_token_counter(
             Arc::clone(&storage),
             Arc::clone(&retrieval),
             config.working_set.clone(),
             config.temporal.clone(),
             config.context.clone(),
+            Arc::new(EmbeddingTokenCounter {
+                provider: Arc::clone(&embeddings),
+            }),
         )?);
         Ok(Self {
             config: Arc::new(config),
@@ -263,6 +357,155 @@ impl CortexWeaveService {
         })
     }
 
+    pub async fn workspace_readiness(&self, workspace_id: &str) -> Result<WorkspaceReadiness> {
+        let workspace = self.require_workspace(workspace_id).await?;
+        let scanner = WorkspaceScanner::with_patterns(
+            Arc::clone(&self.analyzers),
+            self.config.indexing.max_file_bytes,
+            self.config.indexing.include_patterns.clone(),
+            self.config.indexing.exclude_patterns.clone(),
+        );
+        let scan = scanner.scan(Path::new(&workspace.root_path))?;
+        let persisted: BTreeMap<_, _> = self
+            .storage
+            .list_documents(workspace_id)
+            .await?
+            .into_iter()
+            .map(|document| (document.relative_path.clone(), document))
+            .collect();
+        let mut by_language: BTreeMap<String, LanguageReadinessAccumulator> = BTreeMap::new();
+        let mut generic_fallback_files = 0;
+        let mut supported_fallback_files = 0;
+        let mut unsupported_fallback_files = 0;
+
+        for file in &scan.files {
+            let selected = self.analyzers.for_path(&file.relative_path);
+            let available = self.analyzers.available_for_path(&file.relative_path);
+            let language = available
+                .as_ref()
+                .map(|analyzer| analyzer.language_id())
+                .unwrap_or_else(|| selected.language_id())
+                .to_owned();
+            let using_generic_fallback = selected.analyzer_id() == "generic";
+            let bundled_analyzer_configured = available.as_ref().is_some_and(|analyzer| {
+                selected.analyzer_id() == analyzer.analyzer_id()
+                    && selected.analyzer_version() == analyzer.analyzer_version()
+            });
+            let recommendation = available
+                .as_ref()
+                .filter(|_| using_generic_fallback && !bundled_analyzer_configured);
+            if using_generic_fallback {
+                generic_fallback_files += 1;
+                if recommendation.is_some() {
+                    supported_fallback_files += 1;
+                } else {
+                    unsupported_fallback_files += 1;
+                }
+            }
+
+            let entry = by_language.entry(language.clone()).or_insert_with(|| {
+                LanguageReadinessAccumulator {
+                    report: LanguageReadiness {
+                        language: language.clone(),
+                        extensions: Vec::new(),
+                        files_discovered: 0,
+                        indexed_documents: 0,
+                        selected_analyzer_id: selected.analyzer_id().to_owned(),
+                        selected_analyzer_version: selected.analyzer_version(),
+                        bundled_analyzer_available: available.is_some(),
+                        bundled_analyzer_configured,
+                        using_generic_fallback,
+                        configured_rebuild: RebuildCost::default(),
+                        recommended_rebuild: RebuildCost::default(),
+                    },
+                    recommended_analyzer_id: recommendation
+                        .map(|analyzer| analyzer.analyzer_id().to_owned()),
+                }
+            });
+            entry.report.files_discovered += 1;
+            if let Some(extension) = file
+                .relative_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+            {
+                entry.report.extensions.push(extension.to_ascii_lowercase());
+            }
+
+            let relative_path = file.relative_path.to_string_lossy().replace('\\', "/");
+            let Some(document) = persisted.get(&relative_path) else {
+                continue;
+            };
+            entry.report.indexed_documents += 1;
+            let configured_mismatch = !document_matches_analyzer(document, selected.as_ref());
+            let recommended_mismatch = recommendation
+                .is_some_and(|analyzer| !document_matches_analyzer(document, analyzer.as_ref()));
+            if configured_mismatch || recommended_mismatch {
+                let cost = self.document_rebuild_cost(document).await?;
+                if configured_mismatch {
+                    entry.report.configured_rebuild.add(cost);
+                }
+                if recommended_mismatch {
+                    entry.report.recommended_rebuild.add(cost);
+                }
+            }
+        }
+
+        let mut configured_rebuild = RebuildCost::default();
+        let mut recommended_rebuild = RebuildCost::default();
+        let mut recommendations = Vec::new();
+        let languages = by_language
+            .into_values()
+            .map(|mut entry| {
+                entry.report.extensions.sort();
+                entry.report.extensions.dedup();
+                configured_rebuild.add(entry.report.configured_rebuild);
+                recommended_rebuild.add(entry.report.recommended_rebuild);
+                if let Some(analyzer_id) = entry.recommended_analyzer_id {
+                    recommendations.push(AnalyzerRecommendation {
+                        language: entry.report.language.clone(),
+                        config_key: format!("languages.{}", entry.report.language),
+                        analyzer_id,
+                        files_affected: entry.report.files_discovered,
+                        rebuild: entry.report.recommended_rebuild,
+                    });
+                }
+                entry.report
+            })
+            .collect();
+        let scan_failures = scan.failed_relative_paths.len();
+
+        Ok(WorkspaceReadiness {
+            workspace,
+            ready: scan_failures == 0
+                && supported_fallback_files == 0
+                && configured_rebuild.documents == 0,
+            read_only: true,
+            files_discovered: scan.files.len(),
+            scan_failures,
+            generic_fallback_files,
+            supported_fallback_files,
+            unsupported_fallback_files,
+            languages,
+            recommendations,
+            configured_rebuild,
+            recommended_rebuild,
+            replacement_policy: "A configured analyzer identity or version change requires explicit reindexing and replaces the affected document chunks and embeddings. Enabling a recommended analyzer has the same replacement cost. This report does not change configuration or start reindexing.".into(),
+        })
+    }
+
+    async fn document_rebuild_cost(&self, document: &Document) -> Result<RebuildCost> {
+        let chunks = self.storage.list_chunks(&document.id).await?;
+        let mut embeddings = 0;
+        for chunk in &chunks {
+            embeddings += usize::from(self.storage.get_embedding(&chunk.id).await?.is_some());
+        }
+        Ok(RebuildCost {
+            documents: 1,
+            chunks: chunks.len(),
+            embeddings,
+        })
+    }
+
     pub async fn instrumentation(
         &self,
         workspace_id: Option<&str>,
@@ -337,6 +580,230 @@ impl CortexWeaveService {
         request: ContextRequest,
     ) -> Result<ContextCandidatePool> {
         self.context.build_candidate_pool(request).await
+    }
+
+    pub async fn semantic_context(&self, request: ContextRequest) -> Result<ContextPacket> {
+        self.context.assemble_context_packet(request).await
+    }
+
+    pub async fn prepare_harness_context(
+        &self,
+        request: HarnessContextRequest,
+    ) -> Result<HarnessContext> {
+        if request.query.trim().is_empty() {
+            return Err(CortexError::Analysis(
+                "harness context query cannot be empty".into(),
+            ));
+        }
+        if request.token_budget == 0 {
+            return Err(CortexError::Analysis(
+                "harness context token budget must be greater than zero".into(),
+            ));
+        }
+        self.validate_provenance(
+            &request.workspace_id,
+            &Some(request.session_id.clone()),
+            &Some(request.task_id.clone()),
+        )
+        .await?;
+        let workspace = self.require_workspace(&request.workspace_id).await?;
+        let session = self
+            .storage
+            .get_session(&request.session_id)
+            .await?
+            .ok_or_else(|| CortexError::NotFound(format!("session {}", request.session_id)))?;
+        if session.ended_at.is_some() {
+            return Err(CortexError::Analysis(
+                "harness context requires an active session".into(),
+            ));
+        }
+        let task = self
+            .storage
+            .get_task(&request.task_id)
+            .await?
+            .ok_or_else(|| CortexError::NotFound(format!("task {}", request.task_id)))?;
+        if task.status != TaskStatus::Active {
+            return Err(CortexError::Analysis(
+                "harness context requires an active task".into(),
+            ));
+        }
+
+        let mut context_request = ContextRequest::new(&request.workspace_id);
+        context_request.session_id = Some(request.session_id);
+        context_request.task_id = Some(request.task_id);
+        context_request.query = Some(request.query);
+        context_request.token_budget = request.token_budget;
+        context_request.include_explanation = true;
+        let packet = self.semantic_context(context_request).await?;
+        let selected_sources = packet
+            .items
+            .iter()
+            .map(|item| HarnessSelectedSource {
+                workspace_id: packet.workspace_id.clone(),
+                source_id: item.source_id.clone(),
+                source_type: item.source_type.clone(),
+                path: item.path.clone(),
+                symbol: item.symbol.clone(),
+                source_segments: item.source_segments.clone(),
+                scores: item.scores.clone(),
+            })
+            .collect();
+        Ok(HarnessContext {
+            workspace,
+            session,
+            task,
+            packet,
+            selected_sources,
+        })
+    }
+
+    pub async fn hydrate_harness_context(
+        &self,
+        request: HarnessHydrationRequest,
+    ) -> Result<Vec<HydratedContextSource>> {
+        self.validate_provenance(
+            &request.workspace_id,
+            &Some(request.session_id.clone()),
+            &Some(request.task_id.clone()),
+        )
+        .await?;
+        let selected: BTreeMap<_, _> = request
+            .selected_sources
+            .iter()
+            .map(|source| (source.source_id.as_str(), source))
+            .collect();
+        if request
+            .selected_sources
+            .iter()
+            .any(|source| source.workspace_id != request.workspace_id)
+        {
+            return Err(CortexError::Analysis(
+                "selected source provenance belongs to a different workspace".into(),
+            ));
+        }
+        let mut unique = BTreeSet::new();
+        if request
+            .chunk_ids
+            .iter()
+            .any(|chunk_id| !unique.insert(chunk_id.as_str()))
+        {
+            return Err(CortexError::Analysis(
+                "harness hydration chunk IDs must be unique".into(),
+            ));
+        }
+        let out_of_packet: Vec<_> = request
+            .chunk_ids
+            .iter()
+            .filter(|chunk_id| !selected.contains_key(chunk_id.as_str()))
+            .cloned()
+            .collect();
+        let override_reason = if out_of_packet.is_empty() {
+            None
+        } else {
+            Some(
+                request
+                    .override_reason
+                    .as_deref()
+                    .filter(|reason| !reason.trim().is_empty())
+                    .ok_or_else(|| {
+                        CortexError::Analysis(format!(
+                            "out-of-packet hydration is not authorized for chunk IDs: {}",
+                            out_of_packet.join(", ")
+                        ))
+                    })?
+                    .to_owned(),
+            )
+        };
+
+        let mut hydrated = Vec::with_capacity(request.chunk_ids.len());
+        for chunk_id in &request.chunk_ids {
+            let source = self
+                .get_item(&request.workspace_id, chunk_id)
+                .await?
+                .ok_or_else(|| CortexError::NotFound(format!("code item {chunk_id}")))?;
+            if let Some(selected_source) = selected.get(chunk_id.as_str()) {
+                let hydrated_symbol = source
+                    .qualified_symbol
+                    .as_deref()
+                    .or(source.symbol.as_deref());
+                if selected_source.source_type != ContextSourceType::Code
+                    || selected_source.path.as_deref() != Some(source.path.as_str())
+                    || selected_source.symbol.as_deref() != hydrated_symbol
+                {
+                    return Err(CortexError::Analysis(format!(
+                        "selected source provenance no longer matches chunk {chunk_id}"
+                    )));
+                }
+            }
+            hydrated.push(source);
+        }
+
+        let audit_event = if let Some(reason) = &override_reason {
+            let sources = hydrated
+                .iter()
+                .filter(|source| !selected.contains_key(source.chunk_id.as_str()))
+                .map(|source| {
+                    json!({
+                        "chunk_id": source.chunk_id,
+                        "path": source.path,
+                        "symbol": source.qualified_symbol.as_ref().or(source.symbol.as_ref()),
+                        "score_provenance": "out_of_packet_not_scored",
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut event = CortexEvent::new(
+                &request.workspace_id,
+                EventType::ContextHydrationOverride,
+                json!({
+                    "reason": reason,
+                    "chunk_ids": out_of_packet,
+                    "sources": sources,
+                    "packet_source_ids": request
+                        .selected_sources
+                        .iter()
+                        .map(|source| source.source_id.as_str())
+                        .collect::<Vec<_>>(),
+                }),
+            );
+            event.session_id = Some(request.session_id.clone());
+            event.task_id = Some(request.task_id.clone());
+            Some(self.record_event(event).await?)
+        } else {
+            None
+        };
+
+        Ok(hydrated
+            .into_iter()
+            .map(|source| {
+                if let Some(selected_source) = selected.get(source.chunk_id.as_str()) {
+                    HydratedContextSource {
+                        source,
+                        authorization: HydrationAuthorization::PacketSelection,
+                        score_provenance: HydrationScoreProvenance::PacketSelection(
+                            selected_source.scores.clone(),
+                        ),
+                    }
+                } else {
+                    let event = audit_event
+                        .as_ref()
+                        .expect("out-of-packet hydration must have an audit event");
+                    HydratedContextSource {
+                        source,
+                        authorization: HydrationAuthorization::HarnessOverride {
+                            reason: override_reason
+                                .clone()
+                                .expect("out-of-packet hydration must have a reason"),
+                            audit_event_id: event.id.clone(),
+                        },
+                        score_provenance: HydrationScoreProvenance::OutOfPacketNotScored,
+                    }
+                }
+            })
+            .collect())
+    }
+
+    pub async fn resume_context(&self, request: ResumeContextRequest) -> Result<ResumeContext> {
+        self.context.resume_context(request).await
     }
 
     pub async fn activate_context_source(
@@ -536,11 +1003,7 @@ impl CortexWeaveService {
     }
 
     pub async fn record_memory(&self, mut memory: MemoryRecord) -> Result<MemoryRecord> {
-        if memory.content.trim().is_empty() {
-            return Err(CortexError::Analysis(
-                "memory content cannot be empty".into(),
-            ));
-        }
+        validate_memory_integrity(&memory)?;
         self.validate_provenance(&memory.workspace_id, &memory.session_id, &memory.task_id)
             .await?;
         memory.metadata = memory.metadata_for_storage();
@@ -576,6 +1039,126 @@ impl CortexWeaveService {
             return Ok(Vec::new());
         }
         self.storage.recent_memories(workspace_id, limit).await
+    }
+
+    pub async fn review_memory_trust(
+        &self,
+        request: MemoryTrustReviewRequest,
+    ) -> Result<MemoryTrustReview> {
+        validate_review_fields(&request.reviewed_by, &request.reason)?;
+        if request.new_trust == MemoryTrust::Unreviewed {
+            return Err(CortexError::Analysis(
+                "a memory trust review must resolve to trusted or rejected".into(),
+            ));
+        }
+        let memory = self
+            .storage
+            .memory(&request.workspace_id, &request.memory_id)
+            .await?
+            .ok_or_else(|| CortexError::NotFound(format!("memory {}", request.memory_id)))?;
+        if memory.origin != MemoryOrigin::Imported {
+            return Err(CortexError::Analysis(
+                "human-authorized memory does not use the imported-memory review flow".into(),
+            ));
+        }
+        if memory.trust == request.new_trust {
+            return Err(CortexError::Analysis(
+                "memory already has the requested trust state".into(),
+            ));
+        }
+        let review = MemoryTrustReview::new(
+            &request.workspace_id,
+            &request.memory_id,
+            memory.trust,
+            request.new_trust,
+            request.reviewed_by,
+            request.reason,
+        );
+        self.storage.review_memory_trust(&review).await?;
+        Ok(review)
+    }
+
+    pub async fn memory_trust_reviews(
+        &self,
+        workspace_id: &str,
+        memory_id: &str,
+    ) -> Result<Vec<MemoryTrustReview>> {
+        self.storage
+            .memory(workspace_id, memory_id)
+            .await?
+            .ok_or_else(|| CortexError::NotFound(format!("memory {memory_id}")))?;
+        self.storage
+            .memory_trust_reviews(workspace_id, memory_id)
+            .await
+    }
+
+    pub async fn consolidate_memories(
+        &self,
+        request: MemoryConsolidationRequest,
+    ) -> Result<MemoryConsolidationReport> {
+        self.require_workspace(&request.workspace_id).await?;
+        if !(2..=MAX_COLLECTION_LIMIT).contains(&request.memory_ids.len()) {
+            return Err(CortexError::Analysis(format!(
+                "memory consolidation requires between 2 and {MAX_COLLECTION_LIMIT} memory IDs"
+            )));
+        }
+        let unique_ids = request.memory_ids.iter().collect::<BTreeSet<_>>();
+        if unique_ids.len() != request.memory_ids.len() {
+            return Err(CortexError::Analysis(
+                "memory consolidation IDs must be unique".into(),
+            ));
+        }
+        let mut memories = Vec::with_capacity(request.memory_ids.len());
+        for memory_id in &request.memory_ids {
+            memories.push(
+                self.storage
+                    .memory(&request.workspace_id, memory_id)
+                    .await?
+                    .ok_or_else(|| CortexError::NotFound(format!("memory {memory_id}")))?,
+            );
+        }
+        Ok(super::memory::analyze_memory_consolidation(
+            &request.workspace_id,
+            memories,
+        ))
+    }
+
+    pub async fn apply_memory_supersession(
+        &self,
+        request: MemorySupersessionReviewRequest,
+    ) -> Result<MemorySupersession> {
+        validate_review_fields(&request.reviewed_by, &request.reason)?;
+        if request.superseded_memory_id == request.superseding_memory_id {
+            return Err(CortexError::Analysis(
+                "a memory cannot supersede itself".into(),
+            ));
+        }
+        for memory_id in [
+            &request.superseded_memory_id,
+            &request.superseding_memory_id,
+        ] {
+            let memory = self
+                .storage
+                .memory(&request.workspace_id, memory_id)
+                .await?
+                .ok_or_else(|| CortexError::NotFound(format!("memory {memory_id}")))?;
+            if !memory.trust.is_context_eligible() {
+                return Err(CortexError::Analysis(format!(
+                    "memory {memory_id} must be trusted before supersession"
+                )));
+            }
+        }
+        let mut supersession = MemorySupersession::new(
+            &request.workspace_id,
+            request.superseded_memory_id,
+            request.superseding_memory_id,
+        );
+        supersession.reviewed_by = Some(request.reviewed_by);
+        supersession.reason = Some(request.reason);
+        self.storage
+            .insert_memory_supersession(&supersession)
+            .await?;
+        Ok(supersession)
     }
 
     pub async fn record_event(&self, event: CortexEvent) -> Result<CortexEvent> {
@@ -649,6 +1232,71 @@ impl CortexWeaveService {
         }
         Ok(())
     }
+}
+
+fn validate_memory_integrity(memory: &MemoryRecord) -> Result<()> {
+    if memory.content.trim().is_empty() {
+        return Err(CortexError::Analysis(
+            "memory content cannot be empty".into(),
+        ));
+    }
+    match memory.origin {
+        MemoryOrigin::HumanAuthorized if memory.trust != MemoryTrust::Trusted => {
+            return Err(CortexError::Analysis(
+                "human-authorized memory must be trusted when recorded".into(),
+            ));
+        }
+        MemoryOrigin::Imported if memory.trust != MemoryTrust::Unreviewed => {
+            return Err(CortexError::Analysis(
+                "imported memory must be unreviewed when recorded".into(),
+            ));
+        }
+        MemoryOrigin::Imported if memory.source_segments.is_empty() => {
+            return Err(CortexError::Analysis(
+                "imported memory requires at least one source segment".into(),
+            ));
+        }
+        _ => {}
+    }
+    let mut segments_by_source = BTreeMap::<&str, Vec<(u64, u64)>>::new();
+    for segment in &memory.source_segments {
+        if segment.source.trim().is_empty() || segment.start_byte >= segment.end_byte {
+            return Err(CortexError::Analysis(
+                "memory source segments require a source and a non-empty byte range".into(),
+            ));
+        }
+        segments_by_source
+            .entry(segment.source.as_str())
+            .or_default()
+            .push((segment.start_byte, segment.end_byte));
+    }
+    for segments in segments_by_source.values_mut() {
+        segments.sort_unstable();
+        if segments.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(CortexError::Analysis(
+                "memory source segments cannot overlap within one source".into(),
+            ));
+        }
+    }
+    if memory
+        .claim
+        .as_ref()
+        .is_some_and(|claim| claim.key.trim().is_empty())
+    {
+        return Err(CortexError::Analysis(
+            "memory claim key cannot be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_review_fields(reviewed_by: &str, reason: &str) -> Result<()> {
+    if reviewed_by.trim().is_empty() || reason.trim().is_empty() {
+        return Err(CortexError::Analysis(
+            "memory reviews require a reviewer and reason".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn workspace_resolution_kind(
@@ -834,9 +1482,18 @@ fn memory_fts_query(query: &str) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(" OR "))
 }
 
+fn document_matches_analyzer(
+    document: &Document,
+    analyzer: &dyn crate::parsing::LanguageAnalyzer,
+) -> bool {
+    document.language == analyzer.language_id()
+        && document.analyzer_id == analyzer.analyzer_id()
+        && document.analyzer_version == analyzer.analyzer_version()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Arc};
+    use std::{collections::BTreeSet, fs, sync::Arc};
 
     use serde_json::json;
     use tempfile::tempdir;
@@ -868,6 +1525,130 @@ mod tests {
                 .analyzer_id(),
             "generic"
         );
+    }
+
+    #[tokio::test]
+    async fn readiness_guides_explicit_analyzer_enablement_and_rebuild() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("main.py"),
+            "def ensure_ready():\n    return 'ready'\n",
+        )
+        .unwrap();
+        fs::write(root.join("notes.md"), "# Operational notes\n").unwrap();
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let mut disabled_config = AppConfig::default();
+        disabled_config.languages.python = false;
+        let disabled = CortexWeaveService::from_parts_with_embeddings(
+            disabled_config,
+            storage.clone(),
+            Arc::new(MockEmbeddingProvider::new("readiness", 4)),
+        )
+        .unwrap();
+        let workspace = disabled
+            .register_workspace(root.to_string_lossy(), "readiness")
+            .await
+            .unwrap();
+
+        let before_index = disabled.workspace_readiness(&workspace.id).await.unwrap();
+        assert!(!before_index.ready);
+        assert!(before_index.read_only);
+        assert_eq!(before_index.files_discovered, 2);
+        assert_eq!(before_index.generic_fallback_files, 2);
+        assert_eq!(before_index.supported_fallback_files, 1);
+        assert_eq!(before_index.unsupported_fallback_files, 1);
+        assert_eq!(before_index.recommendations.len(), 1);
+        assert_eq!(before_index.recommendations[0].language, "python");
+        assert_eq!(
+            before_index.recommendations[0].config_key,
+            "languages.python"
+        );
+        assert_eq!(
+            before_index.recommendations[0].analyzer_id,
+            "tree-sitter-python"
+        );
+        assert_eq!(
+            before_index.recommendations[0].rebuild,
+            RebuildCost::default()
+        );
+        assert!(!disabled.config().languages.python);
+        assert!(
+            storage
+                .find_document(&workspace.id, "main.py")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        disabled.workspace_reindex(&workspace.id).await.unwrap();
+        let generic_document = storage
+            .find_document(&workspace.id, "main.py")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(generic_document.analyzer_id, "generic");
+        let generic_chunks = storage.list_chunks(&generic_document.id).await.unwrap();
+        let generic_chunk_ids: BTreeSet<_> = generic_chunks
+            .iter()
+            .map(|chunk| chunk.id.clone())
+            .collect();
+        let generic_readiness = disabled.workspace_readiness(&workspace.id).await.unwrap();
+        assert_eq!(generic_readiness.recommended_rebuild.documents, 1);
+        assert_eq!(
+            generic_readiness.recommended_rebuild.chunks,
+            generic_chunks.len()
+        );
+        assert_eq!(
+            generic_readiness.recommended_rebuild.embeddings,
+            generic_chunks.len()
+        );
+
+        let enabled = CortexWeaveService::from_parts_with_embeddings(
+            AppConfig::default(),
+            storage.clone(),
+            Arc::new(MockEmbeddingProvider::new("readiness", 4)),
+        )
+        .unwrap();
+        let pending = enabled.workspace_readiness(&workspace.id).await.unwrap();
+        assert!(!pending.ready);
+        assert!(pending.recommendations.is_empty());
+        assert_eq!(pending.configured_rebuild.documents, 1);
+        assert_eq!(pending.configured_rebuild.chunks, generic_chunks.len());
+        assert_eq!(pending.configured_rebuild.embeddings, generic_chunks.len());
+        assert_eq!(pending.recommended_rebuild, RebuildCost::default());
+
+        let rebuilt = enabled.workspace_reindex(&workspace.id).await.unwrap();
+        assert_eq!(rebuilt.files_updated, 1);
+        let structured_document = storage
+            .find_document(&workspace.id, "main.py")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(structured_document.language, "python");
+        assert_eq!(structured_document.analyzer_id, "tree-sitter-python");
+        let structured_chunks = storage.list_chunks(&structured_document.id).await.unwrap();
+        assert!(structured_chunks.iter().all(|chunk| chunk.symbol.is_some()));
+        assert!(
+            structured_chunks
+                .iter()
+                .all(|chunk| !generic_chunk_ids.contains(&chunk.id))
+        );
+
+        let second = enabled.workspace_reindex(&workspace.id).await.unwrap();
+        assert_eq!(second.files_updated, 0);
+        assert_eq!(second.chunks_embedded, 0);
+        assert_eq!(
+            storage.list_chunks(&structured_document.id).await.unwrap(),
+            structured_chunks
+        );
+        let ready = enabled.workspace_readiness(&workspace.id).await.unwrap();
+        assert!(ready.ready);
+        assert_eq!(ready.generic_fallback_files, 1);
+        assert_eq!(ready.unsupported_fallback_files, 1);
+        assert_eq!(ready.configured_rebuild, RebuildCost::default());
+        assert_eq!(ready.recommended_rebuild, RebuildCost::default());
     }
 
     #[tokio::test]
@@ -1366,6 +2147,33 @@ mod tests {
         assert_eq!(item.path, "src/lib.rs");
         assert_eq!(item.scores.semantic, None);
 
+        service
+            .activate_context_source(
+                &workspace.id,
+                &session.id,
+                Some(&task.id),
+                &item.chunk_id,
+                ContextSourceType::Code,
+            )
+            .await
+            .unwrap();
+        service
+            .pin_context(
+                &workspace.id,
+                &session.id,
+                Some(&task.id),
+                &item.chunk_id,
+                ContextSourceType::Code,
+            )
+            .await
+            .unwrap();
+        let working_set = service
+            .inspect_working_set(&workspace.id, &session.id, Some(&task.id))
+            .await
+            .unwrap();
+        assert_eq!(working_set.entries.len(), 1);
+        assert_eq!(working_set.pins.len(), 1);
+
         let mut memory = MemoryRecord::new(
             &workspace.id,
             MemoryKind::Observation,
@@ -1382,6 +2190,32 @@ mod tests {
                 .unwrap()[0]
                 .related_paths,
             ["src/lib.rs"]
+        );
+
+        let mut checkpoint = Checkpoint::new(
+            &workspace.id,
+            &session.id,
+            "The embedding interface was located and verified.",
+        );
+        checkpoint.task_id = Some(task.id.clone());
+        checkpoint.related_paths = vec!["src/lib.rs".into()];
+        checkpoint.next_action = Some("Resume from the verified interface.".into());
+        let checkpoint = service.create_checkpoint(checkpoint).await.unwrap();
+
+        let mut context_request = ContextRequest::new(&workspace.id);
+        context_request.query = Some("EmbeddingProvider".into());
+        context_request.session_id = Some(session.id.clone());
+        context_request.task_id = Some(task.id.clone());
+        context_request.token_budget = 1_024;
+        let packet = service.semantic_context(context_request).await.unwrap();
+        assert_eq!(packet.workspace_id, workspace.id);
+        assert!(packet.estimated_tokens <= packet.token_budget);
+        assert!(packet.items.iter().any(|item| item.source_id == task.id));
+        assert!(
+            packet
+                .items
+                .iter()
+                .any(|item| item.path.as_deref() == Some("src/lib.rs"))
         );
 
         let mut event = CortexEvent::new(
@@ -1411,6 +2245,17 @@ mod tests {
                 .ended_at
                 .is_some()
         );
+
+        let mut resume_request = ResumeContextRequest::new(&workspace.id);
+        resume_request.task_id = Some(task.id.clone());
+        resume_request.token_budget = 1_024;
+        let resume = service.resume_context(resume_request).await.unwrap();
+        assert_eq!(resume.selected_task.unwrap().id, task.id);
+        assert_eq!(resume.checkpoint.unwrap().id, checkpoint.id);
+        assert!(resume.packet.items.iter().any(|item| {
+            item.reasons
+                .contains(&crate::domain::ContextSelectionReason::CurrentCheckpoint)
+        }));
     }
 
     #[tokio::test]

@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::{Session, SourceSegment, Task};
+
 pub const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 6_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,10 +62,14 @@ pub enum ContextSelectionReason {
     ActiveWorkingSet,
     RecentDecision,
     RecentFailure,
+    ContainerOfRelevantSymbol,
     NeighborOfRelevantSymbol,
+    RelatedSymbol,
     RelatedFile,
     ExplicitPathScope,
     ResumeState,
+    CurrentCheckpoint,
+    RecentModification,
     Pinned,
 }
 
@@ -80,6 +86,7 @@ pub struct ContextRequest {
     pub include_events: bool,
     pub path_scope: Vec<String>,
     pub language_scope: Vec<String>,
+    pub include_explanation: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +156,8 @@ pub struct TemporalContextItem {
     pub path: Option<String>,
     pub symbol: Option<String>,
     pub language: Option<String>,
+    #[serde(default)]
+    pub source_segments: Vec<SourceSegment>,
     pub created_at: DateTime<Utc>,
     pub modified_at: Option<DateTime<Utc>>,
     pub freshness: ContextFreshness,
@@ -181,8 +190,77 @@ impl ContextRequest {
             include_events: true,
             path_scope: Vec::new(),
             language_scope: Vec::new(),
+            include_explanation: false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResumeContextRequest {
+    pub workspace_id: String,
+    pub session_id: Option<String>,
+    pub task_id: Option<String>,
+    pub token_budget: usize,
+    pub include_explanation: bool,
+}
+
+impl ResumeContextRequest {
+    pub fn new(workspace_id: impl Into<String>) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            session_id: None,
+            task_id: None,
+            token_budget: DEFAULT_CONTEXT_TOKEN_BUDGET,
+            include_explanation: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeSessionSelection {
+    Explicit,
+    TaskAssociation,
+    LatestActive,
+    LatestEnded,
+    NoneAvailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeTaskSelection {
+    Explicit,
+    SessionActive,
+    SessionIncomplete,
+    WorkspaceActive,
+    WorkspaceIncomplete,
+    NoneAvailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecentChange {
+    pub path: String,
+    pub change_count: usize,
+    pub session_scoped_count: usize,
+    pub unscoped_count: usize,
+    pub change_kinds: Vec<String>,
+    pub first_changed_at: DateTime<Utc>,
+    pub last_changed_at: DateTime<Utc>,
+    pub currently_present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResumeContext {
+    pub workspace_id: String,
+    pub selected_session: Option<Session>,
+    pub session_selection: ResumeSessionSelection,
+    pub selected_task: Option<Task>,
+    pub task_selection: ResumeTaskSelection,
+    pub evidence_session_id: Option<String>,
+    pub checkpoint: Option<Checkpoint>,
+    pub recent_changes: Vec<RecentChange>,
+    pub working_sets: Vec<WorkingSetSnapshot>,
+    pub packet: ContextPacket,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -193,6 +271,8 @@ pub struct ContextScores {
     pub working_set: f32,
     pub task: f32,
     pub provenance: f32,
+    pub freshness: f32,
+    pub structural: f32,
     pub final_score: f32,
 }
 
@@ -204,10 +284,13 @@ pub struct ContextItem {
     pub path: Option<String>,
     pub symbol: Option<String>,
     pub language: Option<String>,
+    #[serde(default)]
+    pub source_segments: Vec<SourceSegment>,
     pub freshness: ContextFreshness,
     pub scores: ContextScores,
     pub reasons: Vec<ContextSelectionReason>,
     pub estimated_tokens: usize,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -218,6 +301,8 @@ pub struct ContextCandidate {
     pub path: Option<String>,
     pub symbol: Option<String>,
     pub language: Option<String>,
+    #[serde(default)]
+    pub source_segments: Vec<SourceSegment>,
     pub freshness: ContextFreshness,
     pub scores: ContextScores,
     pub reasons: Vec<ContextSelectionReason>,
@@ -242,6 +327,24 @@ pub struct ContextPacket {
     pub token_budget: usize,
     pub estimated_tokens: usize,
     pub generated_at: DateTime<Utc>,
+    pub explanation: Option<ContextExplanation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextExplanation {
+    pub selected: Vec<ContextSelectionExplanation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextSelectionExplanation {
+    pub source_id: String,
+    pub source_type: ContextSourceType,
+    pub path: Option<String>,
+    pub symbol: Option<String>,
+    pub reasons: Vec<ContextSelectionReason>,
+    pub scores: ContextScores,
+    pub estimated_tokens: usize,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -366,6 +469,10 @@ pub struct MemorySupersession {
     pub workspace_id: String,
     pub superseded_memory_id: String,
     pub superseding_memory_id: String,
+    #[serde(default)]
+    pub reviewed_by: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -379,6 +486,8 @@ impl MemorySupersession {
             workspace_id: workspace_id.into(),
             superseded_memory_id: superseded_memory_id.into(),
             superseding_memory_id: superseding_memory_id.into(),
+            reviewed_by: None,
+            reason: None,
             created_at: Utc::now(),
         }
     }
