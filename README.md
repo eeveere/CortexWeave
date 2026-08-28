@@ -2,10 +2,29 @@
 
 # CortexWeave
 
-CortexWeave v0.1 is a local-first semantic code index and explicit memory store
-for coding agents. It watches registered workspaces, analyzes Rust, Python,
-JavaScript, TypeScript, C#, and Go with tree-sitter, and exposes retrieval and memory
-operations through a CLI, an application facade, and MCP over stdio.
+CortexWeave v0.3 is a local-first context substrate for coding agents and
+harnesses. It indexes registered workspaces, keeps explicit memory with durable
+provenance, and returns bounded, explainable context packets through a CLI and
+MCP over stdio.
+
+It is not an agent harness. CortexWeave does not invoke reasoning models,
+execute tools, or orchestrate agent loops. A harness such as Crush decides when
+to call it and owns any subsequent tool use.
+
+## What It Provides
+
+- Semantic, lexical, and hybrid retrieval over code and documents.
+- Token-bounded context packets assembled from code, documents, trusted
+  memories, events, and task or session state.
+- Working sets, pins, checkpoints, and resume context for long-running work.
+- Context explanations with selection reasons, scores, token estimates, and
+  truncation status.
+- Analyzer readiness reporting that identifies generic fallback use and estimates
+  the cost of explicitly enabling an available analyzer and reindexing.
+- Imported-memory trust review, source-range provenance, duplicate accounting,
+  and explicit, audited supersession.
+- Pluggable language analyzers that produce normalized chunks; unsupported text
+  formats use deterministic generic chunking.
 
 ## Quick Start
 
@@ -23,7 +42,7 @@ Copy-Item cortexweave.example.toml cortexweave.toml
 
 ```text
 cargo build --release
-cargo test --all-targets
+cargo test --all-targets --all-features
 target/release/cortexweave --config cortexweave.toml doctor
 ```
 
@@ -39,8 +58,19 @@ target/release/cortexweave --config cortexweave.toml reindex <workspace-id>
    supported, but MCP clients may instead select an unambiguous workspace by
    name, absolute root or subdirectory path, or `file://` URI.
 
-5. Add the `serve` command and an explicit project-root hint to an MCP client
-   using `docs/mcp-setup.md`. The hint lets normal MCP calls omit the UUID; it
+5. Check analyzer readiness whenever a workspace contains supported languages
+   that are currently using generic fallback:
+
+```text
+target/release/cortexweave --config cortexweave.toml readiness <workspace-id>
+```
+
+   `readiness` is read-only. It reports the exact `languages.<name>` settings
+   to enable and the expected rebuild cost; configuration and reindexing remain
+   explicit actions.
+
+6. Add the `serve` command and an explicit project-root hint to an MCP client
+   using `docs/mcp-setup.md`. The hint lets ordinary MCP calls omit the UUID; it
    never registers a workspace automatically.
 
 For multiple Crush projects, follow
@@ -57,10 +87,21 @@ Use [`.crushrc.example`](.crushrc.example) as the project-local Crush template.
 - `docs/development.md`: local development and verification
 - `docs/troubleshooting.md`: diagnosis and recovery
 - `docs/analyzers.md`: analyzer API and complete language-extension path
-- `docs/native-adapter.md`: future direct harness integration
-- `docs/v0.3-plan.md`: harness-controlled context roadmap
+- `docs/context.md`: context packets, ranking, evaluation, and native harness contract
+- `docs/resume-context-design.md`: checkpoint and cross-session resume behavior
+- `docs/crush-workspaces.md`: project-local Crush configuration
 - `docs/memory-integrity.md`: imported-memory trust and consolidation policy
+- `docs/v0.3-plan.md`: completed v0.3 delivery plan
+- `docs/native-adapter.md`: direct-harness compatibility constraints
 
-CortexWeave stores explicit memories only when a caller records or imports them.
-Imported memory is not eligible for automatic context until explicitly reviewed.
-It does not invoke reasoning models, execute tools, or orchestrate agent loops.
+## Context and Memory Boundaries
+
+`semantic_context` is the primary one-call MCP retrieval operation. It produces
+a bounded evidence packet; an agent may still choose ordinary file tools after
+receiving it. The packet and explanation are the CortexWeave result to inspect
+when evaluating retrieval quality.
+
+CortexWeave stores memories only when a caller records or imports them.
+Human-authorized memories are trusted when recorded. Imported memories require
+source segments and remain outside automatic context until an explicit trust
+review accepts them.
