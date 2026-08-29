@@ -38,6 +38,7 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         self.embedding.validate()?;
         self.indexing.validate()?;
+        self.retrieval.validate()?;
         self.working_set.validate()?;
         self.temporal.validate()?;
         self.context.validate()
@@ -272,15 +273,99 @@ pub struct RetrievalConfig {
     pub default_k: usize,
     pub semantic_weight: f32,
     pub lexical_weight: f32,
+    pub structural: StructuralRetrievalConfig,
 }
 
 impl Default for RetrievalConfig {
     fn default() -> Self {
         Self {
             default_k: 8,
-            semantic_weight: 0.70,
-            lexical_weight: 0.30,
+            semantic_weight: 0.55,
+            lexical_weight: 0.25,
+            structural: StructuralRetrievalConfig::default(),
         }
+    }
+}
+
+impl RetrievalConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.default_k == 0
+            || !self.semantic_weight.is_finite()
+            || self.semantic_weight < 0.0
+            || !self.lexical_weight.is_finite()
+            || self.lexical_weight < 0.0
+            || self.semantic_weight + self.lexical_weight <= 0.0
+        {
+            return Err(CortexError::Configuration(
+                "retrieval limits and weights must be finite, non-negative, and non-zero in total"
+                    .into(),
+            ));
+        }
+        self.structural.validate()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StructuralRetrievalConfig {
+    pub enabled: bool,
+    pub weight: f32,
+    pub max_depth: usize,
+    pub candidate_limit: usize,
+    pub distance_decay: f32,
+    pub calls_weight: f32,
+    pub references_weight: f32,
+    pub implementations_weight: f32,
+    pub tests_weight: f32,
+    pub dependencies_weight: f32,
+    pub other_weight: f32,
+}
+
+impl Default for StructuralRetrievalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            weight: 0.20,
+            max_depth: 3,
+            candidate_limit: 32,
+            distance_decay: 0.65,
+            calls_weight: 1.0,
+            references_weight: 0.8,
+            implementations_weight: 1.0,
+            tests_weight: 1.0,
+            dependencies_weight: 0.8,
+            other_weight: 0.6,
+        }
+    }
+}
+
+impl StructuralRetrievalConfig {
+    fn validate(&self) -> Result<()> {
+        let weights = [
+            self.weight,
+            self.calls_weight,
+            self.references_weight,
+            self.implementations_weight,
+            self.tests_weight,
+            self.dependencies_weight,
+            self.other_weight,
+        ];
+        if weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight < 0.0)
+            || !self.distance_decay.is_finite()
+            || !(0.0..=1.0).contains(&self.distance_decay)
+            || self.max_depth == 0
+            || self.max_depth > crate::domain::MAX_STRUCTURAL_DEPTH
+            || self.candidate_limit == 0
+            || self.candidate_limit > crate::domain::MAX_STRUCTURAL_NODES
+        {
+            return Err(CortexError::Configuration(
+                "retrieval.structural requires finite non-negative weights, distance_decay in 0..=1, and bounded depth/candidate limits"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -571,6 +656,9 @@ mod tests {
         let config: AppConfig = toml::from_str("[logging]\nlevel = 'debug'\n").unwrap();
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.retrieval.default_k, 8);
+        assert!(config.retrieval.structural.enabled);
+        assert_eq!(config.retrieval.structural.weight, 0.20);
+        assert_eq!(config.retrieval.structural.max_depth, 3);
         assert_eq!(config.working_set.max_items, 100);
         assert_eq!(config.temporal.recency_half_life_hours, 72.0);
         assert_eq!(config.context.candidate_pool_limit, 50);
@@ -674,5 +762,28 @@ mod tests {
         )
         .unwrap();
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn validates_structural_retrieval_bounds_and_weights() {
+        let no_baseline: AppConfig = toml::from_str(
+            "[retrieval]\nsemantic_weight = 0\nlexical_weight = 0\n[retrieval.structural]\nweight = 1",
+        )
+        .unwrap();
+        assert!(no_baseline.validate().is_err());
+
+        let invalid_depth: AppConfig =
+            toml::from_str("[retrieval.structural]\nmax_depth = 0").unwrap();
+        assert!(invalid_depth.validate().is_err());
+
+        let invalid_decay: AppConfig =
+            toml::from_str("[retrieval.structural]\ndistance_decay = 1.1").unwrap();
+        assert!(invalid_decay.validate().is_err());
+
+        let valid: AppConfig = toml::from_str(
+            "[retrieval.structural]\nenabled = false\nweight = 0\nmax_depth = 1\ncandidate_limit = 1",
+        )
+        .unwrap();
+        valid.validate().unwrap();
     }
 }

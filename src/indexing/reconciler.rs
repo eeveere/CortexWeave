@@ -13,8 +13,9 @@ use uuid::Uuid;
 use crate::{
     CortexError, Result,
     config::IndexingConfig,
-    domain::{Document, EmbeddingRecord, StoredChunk, Workspace},
+    domain::{Document, EmbeddingRecord, GraphAnalysisExpectation, StoredChunk, Workspace},
     embedding::EmbeddingProvider,
+    graph::GraphIndexer,
     instrumentation::RuntimeMetrics,
     parsing::AnalyzerRegistry,
     storage::SqliteStorage,
@@ -69,6 +70,7 @@ impl ReconcileOutcome {
 
 pub struct IndexingService {
     storage: Arc<SqliteStorage>,
+    graph: GraphIndexer,
     embeddings: Arc<dyn EmbeddingProvider>,
     analyzers: Arc<AnalyzerRegistry>,
     permits: Semaphore,
@@ -121,8 +123,10 @@ impl IndexingService {
         config: &IndexingConfig,
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
+        let graph = GraphIndexer::new(Arc::clone(&storage));
         Self {
             storage,
+            graph,
             embeddings,
             analyzers,
             permits: Semaphore::new(config.max_concurrent_embedding_jobs.max(1)),
@@ -212,6 +216,7 @@ impl IndexingService {
         };
         let content_hash = blake3::hash(&bytes).to_hex().to_string();
         let analyzer = self.analyzers.for_path(relative_path);
+        let structure_version = analyzer.structure_version();
         let previous = self
             .storage
             .find_document(&workspace.id, &relative_path_string)
@@ -249,9 +254,25 @@ impl IndexingService {
             }
             _ => false,
         };
+        let graph_compatible = match &previous {
+            Some(document) => self
+                .storage
+                .graph_analysis_state(&document.id)
+                .await?
+                .is_some_and(|state| {
+                    state.workspace_id == document.workspace_id
+                        && state.content_revision == document.content_revision
+                        && state.analyzer_id == analyzer.analyzer_id()
+                        && state.analyzer_version == analyzer.analyzer_version()
+                        && state.structure_version == structure_version
+                        && state.last_error.is_none()
+                }),
+            None => false,
+        };
 
         if initial_tree_compatible
             && initial_embedding_space_compatible
+            && graph_compatible
             && previous
                 .as_ref()
                 .is_some_and(|document| document.content_hash == content_hash)
@@ -282,7 +303,7 @@ impl IndexingService {
             unchanged,
         ) = loop {
             let segmented = segment_chunks(
-                &analyzed,
+                &analyzed.chunks,
                 self.embeddings.as_ref(),
                 self.segment_overlap_tokens,
                 effective_max_input_tokens,
@@ -424,7 +445,7 @@ impl IndexingService {
                 )
             })
             .collect();
-        let document = Document {
+        let mut document = Document {
             id: document_id,
             workspace_id: workspace.id.clone(),
             relative_path: relative_path_string,
@@ -432,6 +453,10 @@ impl IndexingService {
             analyzer_id: analyzer.analyzer_id().into(),
             analyzer_version: analyzer.analyzer_version(),
             segmentation_id,
+            content_revision: previous
+                .as_ref()
+                .map(|document| document.content_revision)
+                .unwrap_or_default(),
             content_hash,
             size_bytes: checked_i64(metadata.len(), "size_bytes")?,
             modified_at_ns: metadata
@@ -454,14 +479,25 @@ impl IndexingService {
                 absolute_path.display()
             )));
         }
-        self.storage
+        let content_index_changed = previous.as_ref().is_none()
+            || !tree_compatible
+            || previous
+                .as_ref()
+                .is_some_and(|previous| previous.content_hash != document.content_hash);
+        document.content_revision = self
+            .storage
             .apply_document_reconciliation(
                 &document,
                 &chunks,
                 &embedding_records,
                 &removed_ids,
                 previous.is_some() && !tree_compatible,
+                content_index_changed,
             )
+            .await?;
+        let expected_analysis = self.graph_analysis_expectations(workspace, None).await?;
+        self.graph
+            .reconcile_document(&document, &structure_version, &analyzed, &expected_analysis)
             .await?;
 
         Ok(ReconcileOutcome {
@@ -526,12 +562,17 @@ impl IndexingService {
                 && !current_scan
                     .failed_relative_paths
                     .contains(&document.relative_path)
-                && self
-                    .storage
-                    .delete_document(&workspace.id, &document.relative_path)
-                    .await?
             {
-                outcome.files_removed += 1;
+                let expected_analysis = self
+                    .graph_analysis_expectations(workspace, Some(&document.relative_path))
+                    .await?;
+                if self
+                    .graph
+                    .delete_document(&workspace.id, &document.relative_path, &expected_analysis)
+                    .await?
+                {
+                    outcome.files_removed += 1;
+                }
             }
         }
         Ok(outcome)
@@ -542,9 +583,12 @@ impl IndexingService {
         workspace: &Workspace,
         relative_path: &str,
     ) -> Result<ReconcileOutcome> {
+        let expected_analysis = self
+            .graph_analysis_expectations(workspace, Some(relative_path))
+            .await?;
         let removed = self
-            .storage
-            .delete_document(&workspace.id, relative_path)
+            .graph
+            .delete_document(&workspace.id, relative_path, &expected_analysis)
             .await?;
         Ok(ReconcileOutcome {
             status: if removed {
@@ -558,6 +602,28 @@ impl IndexingService {
             unchanged: 0,
             embedded: 0,
         })
+    }
+
+    async fn graph_analysis_expectations(
+        &self,
+        workspace: &Workspace,
+        excluded_relative_path: Option<&str>,
+    ) -> Result<Vec<GraphAnalysisExpectation>> {
+        let mut expectations = Vec::new();
+        for document in self.storage.list_documents(&workspace.id).await? {
+            if excluded_relative_path == Some(document.relative_path.as_str()) {
+                continue;
+            }
+            let analyzer = self.analyzers.for_path(Path::new(&document.relative_path));
+            expectations.push(GraphAnalysisExpectation {
+                document_id: document.id,
+                analyzer_id: analyzer.analyzer_id().into(),
+                analyzer_version: analyzer.analyzer_version(),
+                structure_version: analyzer.structure_version(),
+            });
+        }
+        expectations.sort_by(|left, right| left.document_id.cmp(&right.document_id));
+        Ok(expectations)
     }
 
     pub(crate) fn record_filesystem_events(&self, raw: usize, coalesced: usize) {
@@ -710,7 +776,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{GenericChunkConfig, IndexingConfig, LanguageConfig},
-        domain::{AnalyzedChunk, AnalyzerCapabilities},
+        domain::{AnalysisResult, AnalyzerCapabilities},
         embedding::provider::MockEmbeddingProvider,
         embedding::{EmbeddingFailure, EmbeddingFailureKind, EmbeddingLimits},
         parsing::LanguageAnalyzer,
@@ -1004,6 +1070,10 @@ mod tests {
             env!("CARGO_PKG_VERSION").into()
         }
 
+        fn structure_version(&self) -> String {
+            "failing-rust-structure:v1".into()
+        }
+
         fn extensions(&self) -> &'static [&'static str] {
             &["rs"]
         }
@@ -1012,7 +1082,7 @@ mod tests {
             AnalyzerCapabilities::default()
         }
 
-        fn analyze(&self, _path: &Path, _source: &str) -> Result<Vec<AnalyzedChunk>> {
+        fn analyze(&self, _path: &Path, _source: &str) -> Result<AnalysisResult> {
             Err(CortexError::Analysis("parser unavailable".into()))
         }
     }

@@ -2,11 +2,12 @@ mod context;
 mod cortex;
 mod harness;
 mod memory;
+mod structural;
 
 pub use context::ContextService;
 pub use cortex::{
-    AnalyzerRecommendation, CortexWeaveService, LanguageReadiness, RebuildCost, WorkspaceCatalog,
-    WorkspaceReadiness, WorkspaceStatus,
+    AnalyzerRecommendation, CortexWeaveService, GraphLanguageStatus, LanguageReadiness,
+    RebuildCost, WorkspaceCatalog, WorkspaceGraphStatus, WorkspaceReadiness, WorkspaceStatus,
 };
 pub use harness::{
     ContextSufficiencyAssessment, HarnessContext, HarnessContextPolicy, HarnessContextRequest,
@@ -18,3 +19,4 @@ pub use memory::{
     MemoryContradiction, MemorySupersessionReviewRequest, MemoryTrustReviewRequest,
     ProposedMemorySupersession,
 };
+pub use structural::StructuralService;

@@ -84,8 +84,23 @@ silently truncated.
 - `retrieval.default_k`: default CLI result count.
 - `retrieval.semantic_weight`: semantic component weight for hybrid search.
 - `retrieval.lexical_weight`: FTS component weight for hybrid search.
+- `retrieval.structural.enabled`: enables current-graph structural expansion in
+  hybrid search. If the graph is stale or in error, hybrid search deterministically
+  continues without structural evidence.
+- `retrieval.structural.weight`: structural component weight in the hybrid score.
+- `retrieval.structural.max_depth`: traversal depth, capped by the structural
+  service maximum.
+- `retrieval.structural.candidate_limit`: maximum graph-seeded candidates.
+- `retrieval.structural.distance_decay`: multiplier applied for each hop after
+  the first, in `[0, 1]`.
+- `retrieval.structural.calls_weight`, `references_weight`,
+  `implementations_weight`, `tests_weight`, `dependencies_weight`, and
+  `other_weight`: finite non-negative relation-type multipliers.
 
-Weights must be finite, non-negative, and not both zero.
+Semantic and lexical weights must be finite, non-negative, and non-zero in
+total. Structural limits are validated against hard service ceilings. Every
+structural retrieval result retains its relationship path, graph revision,
+applied limits, and truncation state.
 
 ## Working Set
 

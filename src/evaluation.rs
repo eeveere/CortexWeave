@@ -344,6 +344,7 @@ mod tests {
             freshness: ContextFreshness::Current,
             scores: ContextScores::default(),
             reasons: Vec::new(),
+            structural_evidence: Vec::new(),
             estimated_tokens: tokens,
             truncated: false,
         }

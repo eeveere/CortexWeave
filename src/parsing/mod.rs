@@ -1,5 +1,6 @@
 mod analyzer;
 mod generic;
+mod language_relationships;
 pub mod languages;
 mod registry;
 mod tree_sitter_support;

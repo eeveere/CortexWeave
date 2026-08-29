@@ -14,7 +14,7 @@ use crate::{
         Checkpoint, ContextCandidate, ContextCandidatePool, ContextExplanation, ContextFreshness,
         ContextItem, ContextPacket, ContextPin, ContextRequest, ContextScores,
         ContextSelectionExplanation, ContextSelectionReason, ContextSourceType, CortexEvent,
-        EventType, MemoryKind, RecentChange, ResumeContext, ResumeContextRequest,
+        EventType, GraphEdgeType, MemoryKind, RecentChange, ResumeContext, ResumeContextRequest,
         ResumeSessionSelection, ResumeTaskSelection, SourceSegment, StoredChunk, Task,
         TemporalBounds, TemporalContextItem, TemporalQuery, TemporalSessionScope, WorkingSetEntry,
         WorkingSetSnapshot,
@@ -1583,7 +1583,31 @@ fn retain_bounded_candidates(candidates: &mut Vec<ContextCandidate>, limit: usiz
             .cmp(&required_priority(right).unwrap_or(u8::MAX))
             .then_with(|| candidate_order(left, right))
     });
-    candidates.truncate(limit);
+    let selected_has_structural = candidates
+        .get(..limit)
+        .unwrap_or(candidates)
+        .iter()
+        .any(|candidate| !candidate.structural_evidence.is_empty());
+    if !selected_has_structural
+        && let Some(structural_index) =
+            candidates
+                .iter()
+                .enumerate()
+                .skip(limit)
+                .find_map(|(index, candidate)| {
+                    (!candidate.structural_evidence.is_empty()).then_some(index)
+                })
+        && let Some(replacement_index) = (0..limit.min(candidates.len()))
+            .rev()
+            .find(|index| required_priority(&candidates[*index]).is_none())
+    {
+        let structural = candidates.remove(structural_index);
+        candidates.remove(replacement_index);
+        candidates.truncate(limit.saturating_sub(1));
+        candidates.push(structural);
+    } else {
+        candidates.truncate(limit);
+    }
     candidates.sort_by(candidate_order);
 }
 
@@ -1645,6 +1669,7 @@ fn context_item_for_budget(
         freshness: candidate.freshness,
         scores: candidate.scores.clone(),
         reasons: candidate.reasons.clone(),
+        structural_evidence: candidate.structural_evidence.clone(),
         estimated_tokens,
         truncated,
     })
@@ -1817,6 +1842,7 @@ fn candidate_from_temporal(item: TemporalContextItem) -> ContextCandidate {
             ..ContextScores::default()
         },
         reasons: Vec::new(),
+        structural_evidence: Vec::new(),
     }
 }
 
@@ -1879,6 +1905,7 @@ fn resume_task_candidate(
             ..ContextScores::default()
         },
         reasons: vec![ContextSelectionReason::ActiveTaskReference],
+        structural_evidence: Vec::new(),
     }
 }
 
@@ -1904,6 +1931,7 @@ fn resume_checkpoint_candidate(
             ..ContextScores::default()
         },
         reasons: vec![ContextSelectionReason::CurrentCheckpoint],
+        structural_evidence: Vec::new(),
     }
 }
 
@@ -2009,6 +2037,7 @@ fn resume_change_candidate(
             ..ContextScores::default()
         },
         reasons: vec![ContextSelectionReason::RecentModification],
+        structural_evidence: Vec::new(),
     }
 }
 
@@ -2030,6 +2059,12 @@ fn candidate_from_retrieval(result: RetrievalResult) -> ContextCandidate {
     if result.scores.lexical.is_some() {
         reasons.push(ContextSelectionReason::DirectLexicalMatch);
     }
+    for evidence in &result.structural_evidence {
+        let reason = structural_evidence_reason(evidence);
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
     let source_segments = source_segment(&result.path, result.start_byte, result.end_byte)
         .into_iter()
         .collect();
@@ -2045,11 +2080,48 @@ fn candidate_from_retrieval(result: RetrievalResult) -> ContextCandidate {
         scores: ContextScores {
             semantic: result.scores.semantic,
             lexical: result.scores.lexical,
+            structural: result.scores.structural.unwrap_or_default(),
             provenance: provenance_score(&ContextSourceType::Code),
             freshness: freshness_score(ContextFreshness::Current),
             ..ContextScores::default()
         },
         reasons,
+        structural_evidence: result.structural_evidence,
+    }
+}
+
+fn structural_evidence_reason(
+    evidence: &crate::retrieval::StructuralRetrievalEvidence,
+) -> ContextSelectionReason {
+    if evidence.path.distance() > 1 {
+        return ContextSelectionReason::ImpactedByRelevantSymbol;
+    }
+    let Some(edge) = evidence.path.edges.last() else {
+        return ContextSelectionReason::RelatedSymbol;
+    };
+    match edge.edge_type {
+        GraphEdgeType::Calls => {
+            if edge.from_node == evidence.node_id {
+                ContextSelectionReason::CallerOfRelevantSymbol
+            } else {
+                ContextSelectionReason::CalleeOfRelevantSymbol
+            }
+        }
+        GraphEdgeType::References | GraphEdgeType::UsesType | GraphEdgeType::Constructs => {
+            ContextSelectionReason::ReferenceToRelevantSymbol
+        }
+        GraphEdgeType::Implements | GraphEdgeType::Extends | GraphEdgeType::Overrides => {
+            ContextSelectionReason::ImplementationOfRelevantSymbol
+        }
+        GraphEdgeType::Tests => ContextSelectionReason::LikelyTestAssociationWithRelevantSymbol,
+        GraphEdgeType::Imports | GraphEdgeType::DependsOn => {
+            if edge.from_node == evidence.node_id {
+                ContextSelectionReason::DependentOnRelevantSymbol
+            } else {
+                ContextSelectionReason::DependencyOfRelevantSymbol
+            }
+        }
+        _ => ContextSelectionReason::RelatedSymbol,
     }
 }
 
@@ -2101,6 +2173,15 @@ fn merge_candidate(existing: &mut ContextCandidate, incoming: ContextCandidate) 
     for reason in incoming.reasons {
         if !existing.reasons.contains(&reason) {
             existing.reasons.push(reason);
+        }
+    }
+    for evidence in incoming.structural_evidence {
+        if !existing.structural_evidence.iter().any(|current| {
+            current.node_id == evidence.node_id
+                && current.path.node_ids == evidence.path.node_ids
+                && current.snapshot == evidence.snapshot
+        }) {
+            existing.structural_evidence.push(evidence);
         }
     }
 }
@@ -2177,7 +2258,10 @@ fn rank_candidate(
     candidate.scores.task = normalized_score(candidate.scores.task);
     candidate.scores.provenance = provenance_score(&candidate.source_type);
     candidate.scores.freshness = freshness_score(candidate.freshness);
-    candidate.scores.structural = structural_score(&candidate.reasons);
+    candidate.scores.structural = candidate
+        .scores
+        .structural
+        .max(structural_score(&candidate.reasons));
 
     candidate.scores.final_score = (candidate.scores.semantic.unwrap_or_default()
         * config.semantic_weight
@@ -2224,6 +2308,14 @@ fn structural_score(reasons: &[ContextSelectionReason]) -> f32 {
             ContextSelectionReason::ContainerOfRelevantSymbol => 1.0,
             ContextSelectionReason::NeighborOfRelevantSymbol => 0.8,
             ContextSelectionReason::RelatedSymbol | ContextSelectionReason::RelatedFile => 0.6,
+            ContextSelectionReason::CallerOfRelevantSymbol
+            | ContextSelectionReason::CalleeOfRelevantSymbol
+            | ContextSelectionReason::ImplementationOfRelevantSymbol
+            | ContextSelectionReason::LikelyTestAssociationWithRelevantSymbol => 1.0,
+            ContextSelectionReason::ReferenceToRelevantSymbol
+            | ContextSelectionReason::DependencyOfRelevantSymbol
+            | ContextSelectionReason::DependentOnRelevantSymbol => 0.8,
+            ContextSelectionReason::ImpactedByRelevantSymbol => 0.7,
             _ => 0.0,
         })
     })
@@ -2278,8 +2370,10 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        AnalyzedChunk, Checkpoint, CortexEvent, Document, EventType, MemoryKind, MemoryRecord,
-        MemorySupersession, Session, StoredChunk, Task, TemporalFilter, TemporalQuery, Workspace,
+        AnalyzedChunk, Checkpoint, CortexEvent, Document, EventType, GraphState, MemoryKind,
+        MemoryRecord, MemorySupersession, Session, StoredChunk, StructuralEvidence, StructuralPath,
+        StructuralReadOptions, Task, TemporalFilter, TemporalQuery, Workspace,
+        WorkspaceGraphRevision,
     };
     use crate::embedding::{TokenCount, TokenCountAccuracy, provider::MockEmbeddingProvider};
     use crate::parsing::{
@@ -2342,6 +2436,7 @@ mod tests {
             freshness,
             scores: ContextScores::default(),
             reasons: Vec::new(),
+            structural_evidence: Vec::new(),
         }
     }
 
@@ -2365,6 +2460,31 @@ mod tests {
         candidate.content = content.into();
         candidate.scores.final_score = final_score;
         candidate
+    }
+
+    fn structural_evidence(source_id: &str) -> StructuralEvidence {
+        StructuralEvidence {
+            seed_node_id: "seed".into(),
+            node_id: source_id.into(),
+            path: StructuralPath {
+                node_ids: vec!["seed".into(), source_id.into()],
+                edges: Vec::new(),
+                confidence: 0.7,
+            },
+            snapshot: WorkspaceGraphRevision {
+                workspace_id: "budget-workspace".into(),
+                content_revision: 1,
+                graph_content_revision: 1,
+                graph_schema_version: 1,
+                graph_state: GraphState::Current,
+                graph_update_started_at: None,
+                failed_graph_target_revision: None,
+                last_graph_error: None,
+                updated_at: Utc::now(),
+            },
+            limits: StructuralReadOptions::default(),
+            truncated: false,
+        }
     }
 
     struct OverheadTokenCounter;
@@ -3782,6 +3902,7 @@ mod tests {
             let chunks: Vec<_> = analyzer
                 .analyze(std::path::Path::new(path), source)
                 .unwrap()
+                .chunks
                 .into_iter()
                 .map(|chunk| stored_chunk(&document.id, chunk))
                 .collect();
@@ -4051,6 +4172,33 @@ mod tests {
 
         retain_bounded_candidates(&mut candidates, 1);
         assert_eq!(candidates[0].source_id, "active-task");
+    }
+
+    #[test]
+    fn bounded_candidate_retention_keeps_structural_evidence_without_displacing_required_items() {
+        let mut task = budget_candidate("active-task", ContextSourceType::TaskState, "task", 0.01);
+        task.reasons
+            .push(ContextSelectionReason::ActiveTaskReference);
+        let ordinary = budget_candidate("ordinary", ContextSourceType::Code, "ordinary", 1.0);
+        let mut structural = budget_candidate("structural", ContextSourceType::Code, "linked", 0.1);
+        structural
+            .structural_evidence
+            .push(structural_evidence(&structural.source_id));
+        let mut candidates = vec![task, ordinary, structural];
+
+        retain_bounded_candidates(&mut candidates, 2);
+
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.source_id == "active-task")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| !candidate.structural_evidence.is_empty())
+        );
     }
 
     #[test]

@@ -109,6 +109,37 @@ fn workspace_and_memory_commands_use_the_service_facade() {
     assert_eq!(resume["packet"]["token_budget"], 256);
 }
 
+#[test]
+fn graph_command_exposes_bounded_structural_subcommands() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cortexweave"))
+        .args(["graph", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    for command in [
+        "status",
+        "find",
+        "neighbors",
+        "callers",
+        "implementations",
+        "impact-symbol",
+        "impact-path",
+    ] {
+        assert!(help.contains(command), "missing graph command {command}");
+    }
+
+    let detail = Command::new(env!("CARGO_BIN_EXE_cortexweave"))
+        .args(["graph", "impact-symbol", "--help"])
+        .output()
+        .unwrap();
+    assert!(detail.status.success());
+    let detail = String::from_utf8(detail.stdout).unwrap();
+    for option in ["--allow-stale", "--max-nodes", "--max-edges", "--max-depth"] {
+        assert!(detail.contains(option), "missing graph option {option}");
+    }
+}
+
 fn run(config: &std::path::Path, arguments: &[&str]) -> std::process::Output {
     let output = Command::new(env!("CARGO_BIN_EXE_cortexweave"))
         .arg("--config")

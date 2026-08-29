@@ -146,9 +146,20 @@ safe. Queue saturation is observable and converges through a workspace rescan.
 ## Retrieval
 
 Lexical retrieval uses SQLite FTS5. Semantic retrieval embeds the query and
-computes cosine similarity against compatible vectors. Hybrid retrieval
-normalizes component scores, merges and deduplicates records, applies configured
-weights, and returns both component scores with provenance.
+computes cosine similarity against compatible vectors. Structural retrieval
+seeds exact graph symbols or baseline code chunks, chooses a deterministic
+relation traversal from query intent, and scores typed paths by relation weight,
+distance decay, and edge confidence. Hybrid retrieval normalizes component
+scores, merges and deduplicates records, applies configured weights, and returns
+all component scores with graph provenance when used.
+
+`StructuralService` is the application boundary for symbol lookup, bounded
+neighbors, callers, callees, references, implementations, tests, dependencies,
+dependents, and reverse-impact traversal from a symbol or file. It reads only a
+current workspace graph unless stale evidence is explicitly authorized. Every
+result carries the graph revision, applied limits, paths, confidence, and
+truncation state; a concurrent graph revision change makes the read retryable
+instead of mixing snapshots.
 
 ## Concurrency and Failure Model
 

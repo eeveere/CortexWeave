@@ -16,7 +16,7 @@ use crate::{
     CortexWeaveService,
     domain::{
         Checkpoint, ContextRequest, ContextSourceType, CortexEvent, EventType, MemoryKind,
-        MemoryRecord, ResumeContextRequest,
+        MemoryRecord, ResumeContextRequest, StructuralReadOptions,
     },
     indexing::{WorkspaceWatcher, WorkspaceWatcherHandle},
     workspace::WorkspaceSelector,
@@ -26,6 +26,9 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_MCP_FRAME_BYTES: usize = 1_048_576;
 const MAX_TOOL_LIMIT: usize = 100;
 const MAX_CONTEXT_TOKEN_BUDGET: usize = 65_536;
+const MAX_MCP_GRAPH_NODES: usize = 100;
+const MAX_MCP_GRAPH_EDGES: usize = 500;
+const MAX_MCP_GRAPH_DEPTH: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceHint {
@@ -220,6 +223,42 @@ impl McpServer {
             "checkpoint_create" => self.checkpoint_create(arguments).await,
             "checkpoint_latest" => self.checkpoint_latest(arguments).await,
             "semantic_get" => self.semantic_get(arguments).await,
+            "graph_find" => self.graph_find(arguments).await,
+            "graph_status" => self.graph_status(arguments).await,
+            "graph_neighbors" => {
+                self.graph_node_query(arguments, GraphNodeQuery::Neighbors)
+                    .await
+            }
+            "graph_callers" => {
+                self.graph_node_query(arguments, GraphNodeQuery::Callers)
+                    .await
+            }
+            "graph_callees" => {
+                self.graph_node_query(arguments, GraphNodeQuery::Callees)
+                    .await
+            }
+            "graph_references" => {
+                self.graph_node_query(arguments, GraphNodeQuery::References)
+                    .await
+            }
+            "graph_implementations" => {
+                self.graph_node_query(arguments, GraphNodeQuery::Implementations)
+                    .await
+            }
+            "graph_tests" => {
+                self.graph_node_query(arguments, GraphNodeQuery::Tests)
+                    .await
+            }
+            "graph_dependencies" => {
+                self.graph_node_query(arguments, GraphNodeQuery::Dependencies)
+                    .await
+            }
+            "graph_dependents" => {
+                self.graph_node_query(arguments, GraphNodeQuery::Dependents)
+                    .await
+            }
+            "graph_impact_symbol" => self.graph_impact_symbol(arguments).await,
+            "graph_impact_path" => self.graph_impact_path(arguments).await,
             "memory_record" => self.memory_record(arguments).await,
             "memory_search" => self.memory_search(arguments).await,
             "memory_recent" => self.memory_recent(arguments).await,
@@ -373,6 +412,98 @@ impl McpServer {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("code item not found: {chunk_id}"))?;
         json_value(item)
+    }
+
+    async fn graph_find(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        let options = graph_read_options(args)?;
+        serialize_service(
+            self.service
+                .graph_find_symbol(
+                    &workspace.id,
+                    required_string(args, "symbol_or_path")?,
+                    &options,
+                )
+                .await,
+        )
+    }
+
+    async fn graph_status(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(self.service.workspace_graph_status(&workspace.id).await)
+    }
+
+    async fn graph_node_query(
+        &self,
+        args: &Map<String, Value>,
+        query: GraphNodeQuery,
+    ) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        let options = graph_read_options(args)?;
+        let node_id = required_string(args, "node_id")?;
+        let result = match query {
+            GraphNodeQuery::Neighbors => {
+                self.service
+                    .graph_neighbors(&workspace.id, node_id, &options)
+                    .await
+            }
+            GraphNodeQuery::Callers => {
+                self.service
+                    .graph_callers(&workspace.id, node_id, &options)
+                    .await
+            }
+            GraphNodeQuery::Callees => {
+                self.service
+                    .graph_callees(&workspace.id, node_id, &options)
+                    .await
+            }
+            GraphNodeQuery::References => {
+                self.service
+                    .graph_references(&workspace.id, node_id, &options)
+                    .await
+            }
+            GraphNodeQuery::Implementations => {
+                self.service
+                    .graph_implementations(&workspace.id, node_id, &options)
+                    .await
+            }
+            GraphNodeQuery::Tests => {
+                self.service
+                    .graph_tests(&workspace.id, node_id, &options)
+                    .await
+            }
+            GraphNodeQuery::Dependencies => {
+                self.service
+                    .graph_dependencies(&workspace.id, node_id, &options)
+                    .await
+            }
+            GraphNodeQuery::Dependents => {
+                self.service
+                    .graph_dependents(&workspace.id, node_id, &options)
+                    .await
+            }
+        };
+        serialize_service(result)
+    }
+
+    async fn graph_impact_symbol(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        let options = graph_read_options(args)?;
+        serialize_service(
+            self.service
+                .graph_impact_symbol(&workspace.id, required_string(args, "symbol")?, &options)
+                .await,
+        )
+    }
+
+    async fn graph_impact_path(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        let options = graph_read_options(args)?;
+        serialize_service(
+            self.service
+                .graph_impact_path(&workspace.id, required_string(args, "path")?, &options)
+                .await,
+        )
     }
 
     async fn memory_record(&self, args: &Map<String, Value>) -> ToolResult {
@@ -552,6 +683,18 @@ async fn read_mcp_frame(
 
 type ToolResult = std::result::Result<Value, String>;
 
+#[derive(Clone, Copy)]
+enum GraphNodeQuery {
+    Neighbors,
+    Callers,
+    Callees,
+    References,
+    Implementations,
+    Tests,
+    Dependencies,
+    Dependents,
+}
+
 fn initialize_result(_params: &Value) -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
@@ -647,6 +790,78 @@ fn tool_definitions() -> Vec<Value> {
             "Get one indexed code item and its provenance by an exact chunk UUID returned by a prior CortexWeave search or context result. Do not use this for a filename, symbol name, or natural-language query.",
             workspace_properties(json!({ "chunk_id": string_schema() })),
             &["chunk_id"],
+        ),
+        tool(
+            "graph_status",
+            "Get graph revision, staleness, counts, unresolved relationships, and active analyzer capabilities for the resolved workspace.",
+            workspace_properties(json!({})),
+            &[],
+        ),
+        tool(
+            "graph_find",
+            "Find exact graph symbols or a source path. Use returned node IDs with graph relation tools. Reads require a current graph unless allow_stale is explicitly true.",
+            graph_properties(json!({ "symbol_or_path": string_schema() })),
+            &["symbol_or_path"],
+        ),
+        tool(
+            "graph_neighbors",
+            "Return bounded incoming and outgoing graph neighbors for one exact graph node ID.",
+            graph_properties(json!({ "node_id": string_schema() })),
+            &["node_id"],
+        ),
+        tool(
+            "graph_callers",
+            "Return bounded direct callers for one exact graph node ID.",
+            graph_properties(json!({ "node_id": string_schema() })),
+            &["node_id"],
+        ),
+        tool(
+            "graph_callees",
+            "Return bounded direct callees for one exact graph node ID.",
+            graph_properties(json!({ "node_id": string_schema() })),
+            &["node_id"],
+        ),
+        tool(
+            "graph_references",
+            "Return bounded direct references to one exact graph node ID.",
+            graph_properties(json!({ "node_id": string_schema() })),
+            &["node_id"],
+        ),
+        tool(
+            "graph_implementations",
+            "Return bounded implementations, inheritance, and overrides for one exact graph node ID.",
+            graph_properties(json!({ "node_id": string_schema() })),
+            &["node_id"],
+        ),
+        tool(
+            "graph_tests",
+            "Return bounded explicit tests directly associated with one exact graph node ID; these are likely direct-call associations, not proven coverage.",
+            graph_properties(json!({ "node_id": string_schema() })),
+            &["node_id"],
+        ),
+        tool(
+            "graph_dependencies",
+            "Return bounded direct import and dependency targets for one exact graph node ID.",
+            graph_properties(json!({ "node_id": string_schema() })),
+            &["node_id"],
+        ),
+        tool(
+            "graph_dependents",
+            "Return bounded direct import and dependency sources for one exact graph node ID.",
+            graph_properties(json!({ "node_id": string_schema() })),
+            &["node_id"],
+        ),
+        tool(
+            "graph_impact_symbol",
+            "Return a bounded reverse-dependency impact report for an exact symbol, including typed paths and confidence. This is graph reachability, not a git-diff prediction.",
+            graph_properties(json!({ "symbol": string_schema() })),
+            &["symbol"],
+        ),
+        tool(
+            "graph_impact_path",
+            "Return a bounded reverse-dependency impact report for declarations in one indexed relative path, including typed paths and confidence.",
+            graph_properties(json!({ "path": string_schema() })),
+            &["path"],
         ),
         tool(
             "memory_record",
@@ -751,6 +966,27 @@ fn workspace_properties(mut properties: Value) -> Value {
         }),
     );
     Value::Object(properties.clone())
+}
+
+fn graph_properties(properties: Value) -> Value {
+    let mut properties = workspace_properties(properties);
+    let properties = properties
+        .as_object_mut()
+        .expect("graph tool properties must be an object");
+    properties.insert("allow_stale".into(), json!({ "type": "boolean" }));
+    properties.insert(
+        "max_nodes".into(),
+        json!({ "type": "integer", "minimum": 1, "maximum": MAX_MCP_GRAPH_NODES }),
+    );
+    properties.insert(
+        "max_edges".into(),
+        json!({ "type": "integer", "minimum": 1, "maximum": MAX_MCP_GRAPH_EDGES }),
+    );
+    properties.insert(
+        "max_depth".into(),
+        json!({ "type": "integer", "minimum": 1, "maximum": MAX_MCP_GRAPH_DEPTH }),
+    );
+    properties.clone().into()
 }
 
 fn limit_schema() -> Value {
@@ -884,6 +1120,52 @@ fn optional_context_budget(args: &Map<String, Value>, default: usize) -> Result<
         })
 }
 
+fn graph_read_options(args: &Map<String, Value>) -> Result<StructuralReadOptions, String> {
+    let defaults = StructuralReadOptions::default();
+    Ok(StructuralReadOptions {
+        allow_stale: optional_bool(args, "allow_stale", false)?,
+        max_nodes: optional_bounded_positive(
+            args,
+            "max_nodes",
+            defaults.max_nodes,
+            MAX_MCP_GRAPH_NODES,
+        )?,
+        max_edges: optional_bounded_positive(
+            args,
+            "max_edges",
+            defaults.max_edges,
+            MAX_MCP_GRAPH_EDGES,
+        )?,
+        max_depth: optional_bounded_positive(
+            args,
+            "max_depth",
+            defaults.max_depth,
+            MAX_MCP_GRAPH_DEPTH,
+        )?,
+    })
+}
+
+fn optional_bounded_positive(
+    args: &Map<String, Value>,
+    name: &str,
+    default: usize,
+    maximum: usize,
+) -> Result<usize, String> {
+    let Some(value) = args.get(name) else {
+        return Ok(default);
+    };
+    value
+        .as_u64()
+        .ok_or_else(|| format!("{name} must be a positive integer"))
+        .and_then(|value| usize::try_from(value).map_err(|_| format!("{name} is too large")))
+        .and_then(|value| {
+            (1..=maximum)
+                .contains(&value)
+                .then_some(value)
+                .ok_or_else(|| format!("{name} must be between 1 and {maximum}"))
+        })
+}
+
 fn optional_bool(args: &Map<String, Value>, name: &str, default: bool) -> Result<bool, String> {
     args.get(name)
         .map(|value| {
@@ -927,6 +1209,7 @@ mod tests {
     use std::{fs, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
+    use chrono::Utc;
     use serde_json::json;
     use tempfile::tempdir;
     use tokio::time::sleep;
@@ -1003,6 +1286,11 @@ mod tests {
             "workspace_list",
             "workspace_status",
             "workspace_reindex",
+            "graph_status",
+            "graph_find",
+            "graph_callers",
+            "graph_implementations",
+            "graph_impact_symbol",
         ] {
             assert!(names.contains(&required));
         }
@@ -1413,6 +1701,144 @@ mod tests {
         for watcher in watchers {
             watcher.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn graph_tools_are_bounded_current_by_default_and_explainable() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("architecture.test.ts"),
+            "export interface Interface { execute(): void; }\n\
+             export class ImplA implements Interface { execute(): void {} }\n\
+             export class ImplB implements Interface { execute(): void {} }\n\
+             export function service() { ImplA(); }\n\
+             test('test_a', () => { ImplA(); });\n",
+        )
+        .unwrap();
+        let service = Arc::new(
+            CortexWeaveService::from_parts_with_embeddings(
+                AppConfig::default(),
+                SqliteStorage::in_memory().await.unwrap(),
+                Arc::new(FixtureProvider),
+            )
+            .unwrap(),
+        );
+        let workspace = service
+            .register_workspace(root.to_string_lossy(), "graph")
+            .await
+            .unwrap();
+        service.workspace_reindex(&workspace.id).await.unwrap();
+        let server = McpServer::new(Arc::clone(&service));
+        initialize(&server).await;
+
+        let graph_status = call_tool(
+            &server,
+            "graph_status",
+            json!({ "workspace_id": workspace.id }),
+        )
+        .await;
+        assert_eq!(graph_status["isError"], false);
+        assert_eq!(graph_status["structuredContent"]["is_current"], true);
+        assert!(graph_status["structuredContent"]["nodes"].as_u64().unwrap() >= 1);
+
+        let found = call_tool(
+            &server,
+            "graph_find",
+            json!({ "workspace_id": workspace.id, "symbol_or_path": "Interface" }),
+        )
+        .await;
+        assert_eq!(found["isError"], false);
+        assert_eq!(found["structuredContent"]["limits"]["max_nodes"], 50);
+        let interface_id = found["structuredContent"]["seeds"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let implementations = call_tool(
+            &server,
+            "graph_implementations",
+            json!({ "workspace_id": workspace.id, "node_id": interface_id, "max_nodes": 2 }),
+        )
+        .await;
+        assert_eq!(implementations["isError"], false);
+        assert_eq!(
+            implementations["structuredContent"]["limits"]["max_nodes"],
+            2
+        );
+        assert!(
+            implementations["structuredContent"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["name"] == "ImplA")
+        );
+
+        let impact = call_tool(
+            &server,
+            "graph_impact_symbol",
+            json!({ "workspace_id": workspace.id, "symbol": "Interface", "max_depth": 3 }),
+        )
+        .await;
+        assert_eq!(impact["isError"], false);
+        assert_eq!(impact["structuredContent"]["limits"]["max_depth"], 3);
+        assert!(
+            impact["structuredContent"]["impacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["node"]["name"] == "service")
+        );
+
+        let invalid_bound = call_tool(
+            &server,
+            "graph_find",
+            json!({ "workspace_id": workspace.id, "symbol_or_path": "Interface", "max_nodes": 101 }),
+        )
+        .await;
+        assert_eq!(invalid_bound["isError"], true);
+        assert!(
+            invalid_bound["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("max_nodes must be between 1 and 100")
+        );
+
+        let revision = service
+            .storage()
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        service
+            .storage()
+            .mark_graph_error(
+                &workspace.id,
+                revision.content_revision,
+                "simulated graph failure",
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let current_only = call_tool(
+            &server,
+            "graph_find",
+            json!({ "workspace_id": workspace.id, "symbol_or_path": "Interface" }),
+        )
+        .await;
+        assert_eq!(current_only["isError"], true);
+        let stale = call_tool(
+            &server,
+            "graph_find",
+            json!({ "workspace_id": workspace.id, "symbol_or_path": "Interface", "allow_stale": true }),
+        )
+        .await;
+        assert_eq!(stale["isError"], false);
+        assert_eq!(
+            stale["structuredContent"]["snapshot"]["graph_state"],
+            "error"
+        );
     }
 
     async fn call_tool(server: &McpServer, name: &str, arguments: Value) -> Value {

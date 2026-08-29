@@ -1,11 +1,17 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 use serde_json::json;
 use tree_sitter::{Language, Node, Parser};
 
 use crate::{
     CortexError, Result,
-    domain::{AnalyzedChunk, SymbolKind},
+    domain::{
+        AnalysisResult, AnalyzedChunk, AnalyzedRelationship, AnalyzedSymbol, GraphEdgeType,
+        RelationshipTarget, SymbolKind,
+    },
 };
 
 pub(crate) struct SymbolDescriptor {
@@ -21,15 +27,61 @@ pub(crate) trait StructureSpec {
     fn language(&self, path: &Path) -> Language;
     fn language_id(&self) -> &'static str;
     fn classify(&self, node: Node<'_>, source: &str) -> Option<SymbolDescriptor>;
+    fn relationship_drafts(
+        &self,
+        _root: Node<'_>,
+        _source: &str,
+        _normalized_path: &str,
+        _symbols: &mut Vec<AnalyzedSymbol>,
+    ) -> Vec<RelationshipDraft> {
+        Vec::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RelationshipDraft {
+    pub from_key: String,
+    pub target: RelationshipTarget,
+    pub relationship: GraphEdgeType,
+    pub confidence: f32,
+    pub start_byte: Option<usize>,
+    pub end_byte: Option<usize>,
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
+    pub metadata: serde_json::Value,
+}
+
+impl RelationshipDraft {
+    pub(crate) fn new(
+        from_key: impl Into<String>,
+        target: RelationshipTarget,
+        relationship: GraphEdgeType,
+        confidence: f32,
+        start_byte: usize,
+        end_byte: usize,
+        source: &str,
+    ) -> Self {
+        Self {
+            from_key: from_key.into(),
+            target,
+            relationship,
+            confidence,
+            start_byte: Some(start_byte),
+            end_byte: Some(end_byte),
+            start_line: Some(line_number(source, start_byte)),
+            end_line: Some(line_number(source, end_byte)),
+            metadata: json!({}),
+        }
+    }
 }
 
 pub(crate) fn analyze<S: StructureSpec>(
     spec: &S,
     path: &Path,
     source: &str,
-) -> Result<Vec<AnalyzedChunk>> {
+) -> Result<AnalysisResult> {
     if source.is_empty() {
-        return Ok(Vec::new());
+        return Ok(AnalysisResult::default());
     }
     let mut parser = Parser::new();
     parser
@@ -67,7 +119,103 @@ pub(crate) fn analyze<S: StructureSpec>(
     }
     disambiguate_duplicate_keys(&mut chunks);
     assign_structural_ordinals(&mut chunks);
-    Ok(chunks)
+    let mut result = AnalysisResult::structured_chunks(chunks);
+    let mut drafts = spec.relationship_drafts(
+        tree.root_node(),
+        source,
+        &normalized_path,
+        &mut result.symbols,
+    );
+    drafts.extend(containment_drafts(
+        &result.symbols,
+        &normalized_path,
+        source,
+    ));
+    result.relationships = finalize_relationship_drafts(drafts);
+    Ok(result)
+}
+
+pub(crate) fn file_node_key(normalized_path: &str) -> String {
+    format!("file:{normalized_path}")
+}
+
+pub(crate) fn finalize_relationship_drafts(
+    mut drafts: Vec<RelationshipDraft>,
+) -> Vec<AnalyzedRelationship> {
+    drafts.sort_by_key(relationship_sort_key);
+    let mut ordinals = BTreeMap::<String, usize>::new();
+    drafts
+        .into_iter()
+        .map(|draft| {
+            let identity = format!(
+                "{}|{}|{}|{}",
+                draft.from_key,
+                draft.relationship.storage_name(),
+                draft.target.kind().storage_name(),
+                draft.target.value(),
+            );
+            let ordinal = ordinals.entry(identity.clone()).or_default();
+            let relationship_key = format!(
+                "relationship:{}:{}",
+                blake3::hash(identity.as_bytes()).to_hex(),
+                *ordinal
+            );
+            *ordinal += 1;
+            AnalyzedRelationship {
+                relationship_key,
+                from_key: draft.from_key,
+                target: draft.target,
+                relationship: draft.relationship,
+                confidence: draft.confidence,
+                start_byte: draft.start_byte,
+                end_byte: draft.end_byte,
+                start_line: draft.start_line,
+                end_line: draft.end_line,
+                metadata: draft.metadata,
+            }
+        })
+        .collect()
+}
+
+fn relationship_sort_key(draft: &RelationshipDraft) -> (String, String, String, String, usize) {
+    (
+        draft.from_key.clone(),
+        draft.relationship.storage_name(),
+        draft.target.kind().storage_name(),
+        draft.target.value().to_owned(),
+        draft.start_byte.unwrap_or_default(),
+    )
+}
+
+fn containment_drafts(
+    symbols: &[AnalyzedSymbol],
+    normalized_path: &str,
+    source: &str,
+) -> Vec<RelationshipDraft> {
+    let file_key = file_node_key(normalized_path);
+    let mut drafts = Vec::with_capacity(symbols.len() * 2);
+    for symbol in symbols {
+        let parent_key = symbol.parent_key.as_deref().unwrap_or(&file_key);
+        drafts.push(RelationshipDraft::new(
+            parent_key,
+            RelationshipTarget::LocalStableKey(symbol.stable_key.clone()),
+            GraphEdgeType::Contains,
+            1.0,
+            symbol.start_byte,
+            symbol.end_byte,
+            source,
+        ));
+        drafts.push(RelationshipDraft::new(
+            &symbol.stable_key,
+            RelationshipTarget::LocalStableKey(file_key.clone()),
+            GraphEdgeType::DeclaredIn,
+            1.0,
+            symbol.start_byte,
+            symbol.end_byte,
+            source,
+        ));
+    }
+    drafts
 }
 
 fn walk<S: StructureSpec>(
@@ -254,7 +402,7 @@ fn normalize_identity_text(text: &str) -> String {
         .collect()
 }
 
-fn line_number(source: &str, byte: usize) -> usize {
+pub(crate) fn line_number(source: &str, byte: usize) -> usize {
     source[..byte.min(source.len())]
         .bytes()
         .filter(|value| *value == b'\n')

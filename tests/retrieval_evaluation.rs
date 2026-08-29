@@ -251,6 +251,7 @@ async fn insert_fixture(storage: &SqliteStorage, workspace: &Workspace, fixture:
         analyzer_id: "evaluation".into(),
         analyzer_version: "1".into(),
         segmentation_id: "evaluation-v1".into(),
+        content_revision: 0,
         content_hash: blake3::hash(fixture.content.as_bytes())
             .to_hex()
             .to_string(),

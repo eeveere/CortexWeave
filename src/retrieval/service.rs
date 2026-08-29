@@ -4,9 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CortexError, Result,
-    domain::SymbolKind,
+    config::StructuralRetrievalConfig,
+    domain::{
+        GraphEdgeType, StructuralDirection, StructuralEvidence, StructuralPath,
+        StructuralReadOptions, SymbolKind,
+    },
     embedding::EmbeddingProvider,
     instrumentation::RuntimeMetrics,
+    service::StructuralService,
     storage::{CodeCandidate, LexicalCandidate, SemanticCandidate, SqliteStorage},
 };
 
@@ -22,8 +27,11 @@ pub enum RetrievalSource {
 pub struct RetrievalScores {
     pub semantic: Option<f32>,
     pub lexical: Option<f32>,
+    pub structural: Option<f32>,
     pub hybrid: Option<f32>,
 }
+
+pub type StructuralRetrievalEvidence = StructuralEvidence;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalResult {
@@ -41,6 +49,8 @@ pub struct RetrievalResult {
     pub end_line: i64,
     pub content: String,
     pub scores: RetrievalScores,
+    #[serde(default)]
+    pub structural_evidence: Vec<StructuralRetrievalEvidence>,
 }
 
 pub struct RetrievalService {
@@ -48,6 +58,8 @@ pub struct RetrievalService {
     embeddings: Arc<dyn EmbeddingProvider>,
     semantic_weight: f32,
     lexical_weight: f32,
+    structural: Option<Arc<StructuralService>>,
+    structural_config: StructuralRetrievalConfig,
     metrics: Arc<RuntimeMetrics>,
 }
 
@@ -89,8 +101,35 @@ impl RetrievalService {
             embeddings,
             semantic_weight,
             lexical_weight,
+            structural: None,
+            structural_config: StructuralRetrievalConfig {
+                enabled: false,
+                weight: 0.0,
+                ..Default::default()
+            },
             metrics,
         })
+    }
+
+    pub(crate) fn with_structural_metrics(
+        storage: Arc<SqliteStorage>,
+        embeddings: Arc<dyn EmbeddingProvider>,
+        semantic_weight: f32,
+        lexical_weight: f32,
+        structural_config: StructuralRetrievalConfig,
+        structural: Arc<StructuralService>,
+        metrics: Arc<RuntimeMetrics>,
+    ) -> Result<Self> {
+        let mut service = Self::with_metrics(
+            storage,
+            embeddings,
+            semantic_weight,
+            lexical_weight,
+            metrics,
+        )?;
+        service.structural = structural_config.enabled.then_some(structural);
+        service.structural_config = structural_config;
+        Ok(service)
     }
 
     pub async fn semantic_search(
@@ -230,35 +269,155 @@ impl RetrievalService {
                 .lexical
                 .map(|score| (result.chunk_id.clone(), score))
         }));
+        let baseline_chunk_ids: Vec<_> = semantic
+            .iter()
+            .chain(&lexical)
+            .map(|result| result.chunk_id.clone())
+            .collect();
+        let structural = self
+            .structural_search(workspace_id, query, &baseline_chunk_ids)
+            .await?;
         let mut merged: HashMap<String, RetrievalResult> = HashMap::new();
         for result in semantic.into_iter().chain(lexical) {
             merged.entry(result.chunk_id.clone()).or_insert(result);
         }
-        let total_weight = self.semantic_weight + self.lexical_weight;
+        for (mut result, score, evidence) in structural {
+            let entry = merged.entry(result.chunk_id.clone()).or_insert_with(|| {
+                result.scores.structural = Some(score);
+                result
+            });
+            entry.scores.structural = Some(entry.scores.structural.unwrap_or_default().max(score));
+            if !entry.structural_evidence.iter().any(|existing| {
+                existing.node_id == evidence.node_id
+                    && existing.path.node_ids == evidence.path.node_ids
+            }) {
+                entry.structural_evidence.push(evidence);
+            }
+        }
+        let structural_weight = self
+            .structural
+            .as_ref()
+            .map_or(0.0, |_| self.structural_config.weight);
+        let total_weight = self.semantic_weight + self.lexical_weight + structural_weight;
         let mut results: Vec<_> = merged
             .into_values()
             .map(|mut result| {
                 let semantic = semantic_scores.get(&result.chunk_id).copied();
                 let lexical = lexical_scores.get(&result.chunk_id).copied();
+                let structural = result.scores.structural;
                 let hybrid = (semantic.unwrap_or_default() * self.semantic_weight
-                    + lexical.unwrap_or_default() * self.lexical_weight)
+                    + lexical.unwrap_or_default() * self.lexical_weight
+                    + structural.unwrap_or_default() * structural_weight)
                     / total_weight;
                 result.scores.semantic = semantic;
                 result.scores.lexical = lexical;
+                result.scores.structural = structural;
                 result.scores.hybrid = Some(hybrid);
                 result
             })
             .collect();
-        results.sort_by(|left, right| {
-            right
-                .scores
-                .hybrid
-                .unwrap_or(f32::NEG_INFINITY)
-                .total_cmp(&left.scores.hybrid.unwrap_or(f32::NEG_INFINITY))
-                .then_with(|| left.chunk_id.cmp(&right.chunk_id))
-        });
-        results.truncate(limit);
+        sort_hybrid_results(&mut results);
+        retain_structural_result(&mut results, limit);
         Ok(results)
+    }
+
+    async fn structural_search(
+        &self,
+        workspace_id: &str,
+        query: &str,
+        baseline_chunk_ids: &[String],
+    ) -> Result<Vec<(RetrievalResult, f32, StructuralRetrievalEvidence)>> {
+        let Some(structural) = &self.structural else {
+            return Ok(Vec::new());
+        };
+        let intent = StructuralQueryIntent::classify(query);
+        let mut options = StructuralReadOptions {
+            allow_stale: false,
+            max_nodes: self.structural_config.candidate_limit.min(16),
+            max_edges: self
+                .structural_config
+                .candidate_limit
+                .saturating_mul(8)
+                .min(crate::domain::MAX_STRUCTURAL_EDGES),
+            max_depth: self.structural_config.max_depth,
+        };
+        let seeds = match structural
+            .seed_query(workspace_id, query, baseline_chunk_ids, &options)
+            .await
+        {
+            Ok(seeds) => seeds,
+            Err(CortexError::Analysis(message))
+                if message.starts_with("structural graph for workspace") =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
+        };
+        if seeds.seeds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let seed_ids: Vec<_> = seeds.seeds.iter().map(|node| node.id.clone()).collect();
+        let (nodes, paths, snapshot, truncated) = if intent == StructuralQueryIntent::Impact {
+            let report = structural
+                .impact_from_nodes(workspace_id, &seed_ids, &options)
+                .await?;
+            (
+                report
+                    .impacts
+                    .iter()
+                    .map(|impact| impact.node.clone())
+                    .collect::<Vec<_>>(),
+                report
+                    .impacts
+                    .iter()
+                    .map(|impact| impact.path.clone())
+                    .collect::<Vec<_>>(),
+                report.snapshot,
+                report.truncated,
+            )
+        } else {
+            let (direction, edge_types, depth) = intent.traversal();
+            options.max_depth = depth.min(options.max_depth).max(1);
+            let result = structural
+                .traverse(workspace_id, &seed_ids, direction, &edge_types, &options)
+                .await?;
+            (
+                result.nodes,
+                result.paths,
+                result.snapshot,
+                result.truncated,
+            )
+        };
+        let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+        let mut candidates = Vec::new();
+        for path in paths {
+            let Some(node_id) = path.node_ids.last() else {
+                continue;
+            };
+            if !node_by_id.contains_key(node_id.as_str()) {
+                continue;
+            }
+            let score = structural_score(&path, &self.structural_config);
+            let seed_node_id = path.node_ids.first().cloned().unwrap_or_default();
+            let evidence = StructuralRetrievalEvidence {
+                seed_node_id,
+                node_id: node_id.clone(),
+                path: path.clone(),
+                snapshot: snapshot.clone(),
+                limits: options.clone(),
+                truncated,
+            };
+            for candidate in structural
+                .code_candidates_for_node(workspace_id, node_id, 4)
+                .await?
+            {
+                candidates.push((code_result(candidate), score, evidence.clone()));
+                if candidates.len() == self.structural_config.candidate_limit {
+                    return Ok(candidates);
+                }
+            }
+        }
+        Ok(candidates)
     }
 
     async fn query_vector(&self, query: &str) -> Result<Vec<f32>> {
@@ -321,6 +480,7 @@ fn code_result(candidate: CodeCandidate) -> RetrievalResult {
         RetrievalScores {
             semantic: None,
             lexical: None,
+            structural: None,
             hybrid: None,
         },
     )
@@ -334,6 +494,7 @@ fn semantic_result(candidate: SemanticCandidate, score: f32) -> RetrievalResult 
         RetrievalScores {
             semantic: Some(score),
             lexical: None,
+            structural: None,
             hybrid: None,
         },
     )
@@ -347,6 +508,7 @@ fn lexical_result(candidate: LexicalCandidate) -> RetrievalResult {
         RetrievalScores {
             semantic: None,
             lexical: Some(candidate.score),
+            structural: None,
             hybrid: None,
         },
     )
@@ -373,7 +535,169 @@ fn result_from_chunk(
         end_line: chunk.end_line,
         content: chunk.content,
         scores,
+        structural_evidence: Vec::new(),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuralQueryIntent {
+    General,
+    Callers,
+    Callees,
+    Implementations,
+    Tests,
+    Dependencies,
+    Dependents,
+    Impact,
+}
+
+impl StructuralQueryIntent {
+    fn classify(query: &str) -> Self {
+        let query = query.to_ascii_lowercase();
+        if query.contains("could break")
+            || query.contains("changes if")
+            || query.contains("change if")
+            || query.contains("what changes")
+            || query.contains("impact")
+            || query.contains("blast radius")
+        {
+            Self::Impact
+        } else if query.contains("implement") || query.contains("implementation") {
+            Self::Implementations
+        } else if query.contains("test") && (query.contains("cover") || query.contains("which")) {
+            Self::Tests
+        } else if query.contains("dependents") || query.contains("depends on this") {
+            Self::Dependents
+        } else if query.contains("dependencies") || query.contains("depends on") {
+            Self::Dependencies
+        } else if query.contains("what calls")
+            || query.contains("callers")
+            || query.contains("uses")
+        {
+            Self::Callers
+        } else if query.contains("callees") || query.contains("does it call") {
+            Self::Callees
+        } else {
+            Self::General
+        }
+    }
+
+    fn traversal(self) -> (StructuralDirection, Vec<GraphEdgeType>, usize) {
+        match self {
+            Self::Callers => (
+                StructuralDirection::Incoming,
+                vec![
+                    GraphEdgeType::Calls,
+                    GraphEdgeType::References,
+                    GraphEdgeType::UsesType,
+                    GraphEdgeType::Constructs,
+                ],
+                1,
+            ),
+            Self::Callees => (StructuralDirection::Outgoing, vec![GraphEdgeType::Calls], 1),
+            Self::Implementations => (
+                StructuralDirection::Incoming,
+                vec![
+                    GraphEdgeType::Implements,
+                    GraphEdgeType::Extends,
+                    GraphEdgeType::Overrides,
+                ],
+                1,
+            ),
+            Self::Tests => (StructuralDirection::Incoming, vec![GraphEdgeType::Tests], 1),
+            Self::Dependencies => (
+                StructuralDirection::Outgoing,
+                vec![GraphEdgeType::Imports, GraphEdgeType::DependsOn],
+                1,
+            ),
+            Self::Dependents => (
+                StructuralDirection::Incoming,
+                vec![GraphEdgeType::Imports, GraphEdgeType::DependsOn],
+                1,
+            ),
+            Self::General => (
+                StructuralDirection::Both,
+                vec![
+                    GraphEdgeType::Calls,
+                    GraphEdgeType::References,
+                    GraphEdgeType::UsesType,
+                    GraphEdgeType::Constructs,
+                    GraphEdgeType::Implements,
+                    GraphEdgeType::Extends,
+                    GraphEdgeType::Tests,
+                    GraphEdgeType::Imports,
+                    GraphEdgeType::DependsOn,
+                ],
+                1,
+            ),
+            Self::Impact => unreachable!("impact uses the impact service"),
+        }
+    }
+}
+
+fn structural_score(path: &StructuralPath, config: &StructuralRetrievalConfig) -> f32 {
+    if path.edges.is_empty() {
+        return 0.0;
+    }
+    let relationship_weight = path
+        .edges
+        .iter()
+        .map(|edge| relationship_weight(&edge.edge_type, config))
+        .reduce(f32::min)
+        .unwrap_or_default();
+    let distance_factor = config
+        .distance_decay
+        .powi(i32::try_from(path.distance().saturating_sub(1)).unwrap_or(i32::MAX));
+    (path.confidence * relationship_weight * distance_factor).clamp(0.0, 1.0)
+}
+
+fn relationship_weight(edge_type: &GraphEdgeType, config: &StructuralRetrievalConfig) -> f32 {
+    match edge_type {
+        GraphEdgeType::Calls => config.calls_weight,
+        GraphEdgeType::References | GraphEdgeType::UsesType | GraphEdgeType::Constructs => {
+            config.references_weight
+        }
+        GraphEdgeType::Implements | GraphEdgeType::Extends | GraphEdgeType::Overrides => {
+            config.implementations_weight
+        }
+        GraphEdgeType::Tests => config.tests_weight,
+        GraphEdgeType::Imports | GraphEdgeType::DependsOn => config.dependencies_weight,
+        _ => config.other_weight,
+    }
+}
+
+fn sort_hybrid_results(results: &mut [RetrievalResult]) {
+    results.sort_by(|left, right| {
+        right
+            .scores
+            .hybrid
+            .unwrap_or(f32::NEG_INFINITY)
+            .total_cmp(&left.scores.hybrid.unwrap_or(f32::NEG_INFINITY))
+            .then_with(|| left.chunk_id.cmp(&right.chunk_id))
+    });
+}
+
+fn retain_structural_result(results: &mut Vec<RetrievalResult>, limit: usize) {
+    if results.len() <= limit {
+        return;
+    }
+    let selected_has_structural = results[..limit]
+        .iter()
+        .any(|result| !result.structural_evidence.is_empty());
+    if !selected_has_structural
+        && let Some(index) = results
+            .iter()
+            .enumerate()
+            .skip(limit)
+            .find_map(|(index, result)| (!result.structural_evidence.is_empty()).then_some(index))
+    {
+        let structural = results.remove(index);
+        results.truncate(limit.saturating_sub(1));
+        results.push(structural);
+        sort_hybrid_results(results);
+        return;
+    }
+    results.truncate(limit);
 }
 
 fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
@@ -442,10 +766,80 @@ mod tests {
 
     use super::*;
     use crate::{
-        domain::{Document, EmbeddingRecord, StoredChunk, Workspace},
+        domain::{
+            Document, EmbeddingRecord, GraphState, StoredChunk, StructuralPath,
+            StructuralReadOptions, Workspace, WorkspaceGraphRevision,
+        },
         embedding::EmbeddingLimits,
         storage::SqliteStorage,
     };
+
+    fn ranked_result(chunk_id: &str, score: f32, structural: bool) -> RetrievalResult {
+        RetrievalResult {
+            source: RetrievalSource::Code,
+            workspace_id: "workspace".into(),
+            chunk_id: chunk_id.into(),
+            language: "rust".into(),
+            path: format!("src/{chunk_id}.rs"),
+            symbol: None,
+            qualified_symbol: None,
+            symbol_kind: None,
+            start_byte: 0,
+            end_byte: 0,
+            start_line: 0,
+            end_line: 0,
+            content: chunk_id.into(),
+            scores: RetrievalScores {
+                semantic: None,
+                lexical: None,
+                structural: structural.then_some(0.7),
+                hybrid: Some(score),
+            },
+            structural_evidence: structural
+                .then(|| StructuralEvidence {
+                    seed_node_id: "seed".into(),
+                    node_id: format!("node-{chunk_id}"),
+                    path: StructuralPath {
+                        node_ids: vec!["seed".into(), format!("node-{chunk_id}")],
+                        edges: Vec::new(),
+                        confidence: 0.7,
+                    },
+                    snapshot: WorkspaceGraphRevision {
+                        workspace_id: "workspace".into(),
+                        content_revision: 1,
+                        graph_content_revision: 1,
+                        graph_schema_version: 1,
+                        graph_state: GraphState::Current,
+                        graph_update_started_at: None,
+                        failed_graph_target_revision: None,
+                        last_graph_error: None,
+                        updated_at: Utc::now(),
+                    },
+                    limits: StructuralReadOptions::default(),
+                    truncated: false,
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn bounded_hybrid_results_retain_available_structural_evidence() {
+        let mut results = vec![
+            ranked_result("highest", 1.0, false),
+            ranked_result("second", 0.9, false),
+            ranked_result("structural", 0.1, true),
+        ];
+
+        retain_structural_result(&mut results, 2);
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .any(|result| !result.structural_evidence.is_empty())
+        );
+    }
 
     struct LookupProvider;
 
@@ -490,6 +884,7 @@ mod tests {
             analyzer_id: "test".into(),
             analyzer_version: "1".into(),
             segmentation_id: "test-segmentation".into(),
+            content_revision: 0,
             content_hash: "hash".into(),
             size_bytes: 1,
             modified_at_ns: None,
@@ -598,6 +993,7 @@ mod tests {
             analyzer_id: "test".into(),
             analyzer_version: "1".into(),
             segmentation_id: "test-segmentation".into(),
+            content_revision: 0,
             content_hash: "old-hash".into(),
             size_bytes: 1,
             modified_at_ns: None,

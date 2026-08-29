@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{Session, SourceSegment, Task};
+use super::{Session, SourceSegment, StructuralEvidence, Task};
 
 pub const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 6_000;
 
@@ -66,6 +66,14 @@ pub enum ContextSelectionReason {
     NeighborOfRelevantSymbol,
     RelatedSymbol,
     RelatedFile,
+    CallerOfRelevantSymbol,
+    CalleeOfRelevantSymbol,
+    ReferenceToRelevantSymbol,
+    ImplementationOfRelevantSymbol,
+    LikelyTestAssociationWithRelevantSymbol,
+    DependencyOfRelevantSymbol,
+    DependentOnRelevantSymbol,
+    ImpactedByRelevantSymbol,
     ExplicitPathScope,
     ResumeState,
     CurrentCheckpoint,
@@ -289,6 +297,8 @@ pub struct ContextItem {
     pub freshness: ContextFreshness,
     pub scores: ContextScores,
     pub reasons: Vec<ContextSelectionReason>,
+    #[serde(default)]
+    pub structural_evidence: Vec<StructuralEvidence>,
     pub estimated_tokens: usize,
     pub truncated: bool,
 }
@@ -306,6 +316,8 @@ pub struct ContextCandidate {
     pub freshness: ContextFreshness,
     pub scores: ContextScores,
     pub reasons: Vec<ContextSelectionReason>,
+    #[serde(default)]
+    pub structural_evidence: Vec<StructuralEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

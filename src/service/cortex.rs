@@ -12,10 +12,10 @@ use crate::{
     AppConfig, CortexError, Result,
     domain::{
         Checkpoint, ContextCandidatePool, ContextPacket, ContextPin, ContextRequest,
-        ContextSourceType, CortexEvent, Document, EventType, MemoryOrigin, MemoryRecord,
-        MemorySupersession, MemoryTrust, MemoryTrustReview, ResumeContext, ResumeContextRequest,
-        Session, Task, TaskStatus, TemporalContextItem, TemporalQuery, WorkingSetEntry,
-        WorkingSetSnapshot, Workspace,
+        ContextSourceType, CortexEvent, Document, EventType, ImpactReport, MemoryOrigin,
+        MemoryRecord, MemorySupersession, MemoryTrust, MemoryTrustReview, ResumeContext,
+        ResumeContextRequest, Session, StructuralReadOptions, StructuralResult, Task, TaskStatus,
+        TemporalContextItem, TemporalQuery, WorkingSetEntry, WorkingSetSnapshot, Workspace,
     },
     embedding::{
         EmbeddingLimits, EmbeddingProvider, OpenAiCompatibleEmbeddingProvider, TokenCount,
@@ -29,7 +29,7 @@ use crate::{
         ContextService, HarnessContext, HarnessContextRequest, HarnessHydrationRequest,
         HarnessSelectedSource, HydratedContextSource, HydrationAuthorization,
         HydrationScoreProvenance, MemoryConsolidationReport, MemoryConsolidationRequest,
-        MemorySupersessionReviewRequest, MemoryTrustReviewRequest,
+        MemorySupersessionReviewRequest, MemoryTrustReviewRequest, StructuralService,
     },
     storage::SqliteStorage,
     workspace::{PathIdentity, WorkspaceScanner, WorkspaceSelector},
@@ -66,6 +66,33 @@ pub struct WorkspaceStatus {
     pub embedding_limits: EmbeddingLimits,
     pub token_counter: String,
     pub token_counter_accuracy: TokenCountAccuracy,
+    pub graph: WorkspaceGraphStatus,
+}
+
+/// A deterministic summary of the graph projection for one workspace. It is
+/// deliberately separate from retrieval results so callers can decide whether
+/// a stale graph is acceptable before issuing a structural read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceGraphStatus {
+    pub revision: Option<crate::domain::WorkspaceGraphRevision>,
+    pub is_current: bool,
+    pub nodes: usize,
+    pub edges: usize,
+    pub unresolved_relationships: usize,
+    pub languages: Vec<GraphLanguageStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphLanguageStatus {
+    pub language: String,
+    pub documents: usize,
+    pub nodes: usize,
+    pub edges: usize,
+    pub unresolved_relationships: usize,
+    pub analyzer_id: String,
+    pub analyzer_version: String,
+    pub using_generic_fallback: bool,
+    pub capabilities: crate::domain::AnalyzerCapabilities,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -143,6 +170,7 @@ pub struct CortexWeaveService {
     embeddings: Arc<dyn EmbeddingProvider>,
     indexing: Arc<IndexingService>,
     retrieval: Arc<RetrievalService>,
+    structural: Arc<StructuralService>,
     context: Arc<ContextService>,
     metrics: Arc<RuntimeMetrics>,
 }
@@ -177,11 +205,17 @@ impl CortexWeaveService {
             &config.indexing,
             Arc::clone(&metrics),
         ));
-        let retrieval = Arc::new(RetrievalService::with_metrics(
+        let structural = Arc::new(StructuralService::new(
+            Arc::clone(&storage),
+            Arc::clone(&analyzers),
+        ));
+        let retrieval = Arc::new(RetrievalService::with_structural_metrics(
             Arc::clone(&storage),
             Arc::clone(&embeddings),
             config.retrieval.semantic_weight,
             config.retrieval.lexical_weight,
+            config.retrieval.structural.clone(),
+            Arc::clone(&structural),
             Arc::clone(&metrics),
         )?);
         let context = Arc::new(ContextService::new_with_token_counter(
@@ -201,6 +235,7 @@ impl CortexWeaveService {
             embeddings,
             indexing,
             retrieval,
+            structural,
             context,
             metrics,
         })
@@ -232,6 +267,10 @@ impl CortexWeaveService {
 
     pub fn retrieval(&self) -> &RetrievalService {
         &self.retrieval
+    }
+
+    pub fn structural(&self) -> &StructuralService {
+        &self.structural
     }
 
     pub fn context(&self) -> &ContextService {
@@ -340,10 +379,7 @@ impl CortexWeaveService {
     pub async fn workspace_status(&self, workspace_id: &str) -> Result<WorkspaceStatus> {
         let workspace = self.require_workspace(workspace_id).await?;
         let documents = self.storage.list_documents(workspace_id).await?;
-        let mut chunks_indexed = 0;
-        for document in &documents {
-            chunks_indexed += self.storage.list_chunks(&document.id).await?.len();
-        }
+        let chunks_indexed = self.storage.workspace_chunk_count(workspace_id).await?;
         Ok(WorkspaceStatus {
             workspace,
             documents_indexed: documents.len(),
@@ -354,6 +390,73 @@ impl CortexWeaveService {
             embedding_limits: self.embeddings.limits(),
             token_counter: self.embeddings.token_counter_id().to_owned(),
             token_counter_accuracy: self.embeddings.token_counter_accuracy(),
+            graph: self
+                .workspace_graph_status_from_documents(workspace_id, &documents)
+                .await?,
+        })
+    }
+
+    pub async fn workspace_graph_status(&self, workspace_id: &str) -> Result<WorkspaceGraphStatus> {
+        self.require_workspace(workspace_id).await?;
+        let documents = self.storage.list_documents(workspace_id).await?;
+        self.workspace_graph_status_from_documents(workspace_id, &documents)
+            .await
+    }
+
+    async fn workspace_graph_status_from_documents(
+        &self,
+        workspace_id: &str,
+        documents: &[Document],
+    ) -> Result<WorkspaceGraphStatus> {
+        let revision = match self.storage.workspace_graph_revision(workspace_id).await? {
+            Some(_) => Some(self.structural.graph_snapshot(workspace_id, true).await?),
+            None => None,
+        };
+        let (nodes, edges, unresolved_relationships) =
+            self.storage.workspace_graph_counts(workspace_id).await?;
+        let language_counts: BTreeMap<_, _> = self
+            .storage
+            .workspace_graph_counts_by_language(workspace_id)
+            .await?
+            .into_iter()
+            .map(|(language, nodes, edges, unresolved)| (language, (nodes, edges, unresolved)))
+            .collect();
+        let mut languages: BTreeMap<String, GraphLanguageStatus> = BTreeMap::new();
+
+        for document in documents {
+            let analyzer = self.analyzers.for_path(Path::new(&document.relative_path));
+            let entry = languages
+                .entry(document.language.clone())
+                .or_insert_with(|| GraphLanguageStatus {
+                    language: document.language.clone(),
+                    documents: 0,
+                    nodes: 0,
+                    edges: 0,
+                    unresolved_relationships: 0,
+                    analyzer_id: analyzer.analyzer_id().to_owned(),
+                    analyzer_version: analyzer.analyzer_version(),
+                    using_generic_fallback: analyzer.analyzer_id() == "generic",
+                    capabilities: analyzer.capabilities(),
+                });
+            entry.documents += 1;
+        }
+        for (language, entry) in &mut languages {
+            if let Some((nodes, edges, unresolved)) = language_counts.get(language) {
+                entry.nodes = *nodes;
+                entry.edges = *edges;
+                entry.unresolved_relationships = *unresolved;
+            }
+        }
+
+        Ok(WorkspaceGraphStatus {
+            is_current: revision
+                .as_ref()
+                .is_some_and(|revision| revision.is_current()),
+            revision,
+            nodes,
+            edges,
+            unresolved_relationships,
+            languages: languages.into_values().collect(),
         })
     }
 
@@ -557,6 +660,125 @@ impl CortexWeaveService {
     ) -> Result<Vec<RetrievalResult>> {
         self.retrieval
             .hybrid_search(workspace_id, query, limit)
+            .await
+    }
+
+    pub async fn graph_find_symbol(
+        &self,
+        workspace_id: &str,
+        symbol_or_path: &str,
+        options: &StructuralReadOptions,
+    ) -> Result<StructuralResult> {
+        self.structural
+            .find_symbol(workspace_id, symbol_or_path, options)
+            .await
+    }
+
+    pub async fn graph_neighbors(
+        &self,
+        workspace_id: &str,
+        node_id: &str,
+        options: &StructuralReadOptions,
+    ) -> Result<StructuralResult> {
+        self.structural
+            .neighbors(workspace_id, node_id, options)
+            .await
+    }
+
+    pub async fn graph_callers(
+        &self,
+        workspace_id: &str,
+        node_id: &str,
+        options: &StructuralReadOptions,
+    ) -> Result<StructuralResult> {
+        self.structural
+            .callers(workspace_id, node_id, options)
+            .await
+    }
+
+    pub async fn graph_callees(
+        &self,
+        workspace_id: &str,
+        node_id: &str,
+        options: &StructuralReadOptions,
+    ) -> Result<StructuralResult> {
+        self.structural
+            .callees(workspace_id, node_id, options)
+            .await
+    }
+
+    pub async fn graph_references(
+        &self,
+        workspace_id: &str,
+        node_id: &str,
+        options: &StructuralReadOptions,
+    ) -> Result<StructuralResult> {
+        self.structural
+            .references(workspace_id, node_id, options)
+            .await
+    }
+
+    pub async fn graph_implementations(
+        &self,
+        workspace_id: &str,
+        node_id: &str,
+        options: &StructuralReadOptions,
+    ) -> Result<StructuralResult> {
+        self.structural
+            .implementations(workspace_id, node_id, options)
+            .await
+    }
+
+    pub async fn graph_tests(
+        &self,
+        workspace_id: &str,
+        node_id: &str,
+        options: &StructuralReadOptions,
+    ) -> Result<StructuralResult> {
+        self.structural.tests(workspace_id, node_id, options).await
+    }
+
+    pub async fn graph_dependencies(
+        &self,
+        workspace_id: &str,
+        node_id: &str,
+        options: &StructuralReadOptions,
+    ) -> Result<StructuralResult> {
+        self.structural
+            .dependencies(workspace_id, node_id, options)
+            .await
+    }
+
+    pub async fn graph_dependents(
+        &self,
+        workspace_id: &str,
+        node_id: &str,
+        options: &StructuralReadOptions,
+    ) -> Result<StructuralResult> {
+        self.structural
+            .dependents(workspace_id, node_id, options)
+            .await
+    }
+
+    pub async fn graph_impact_symbol(
+        &self,
+        workspace_id: &str,
+        symbol: &str,
+        options: &StructuralReadOptions,
+    ) -> Result<ImpactReport> {
+        self.structural
+            .impact_from_symbol(workspace_id, symbol, options)
+            .await
+    }
+
+    pub async fn graph_impact_path(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        options: &StructuralReadOptions,
+    ) -> Result<ImpactReport> {
+        self.structural
+            .impact_from_path(workspace_id, path, options)
             .await
     }
 
@@ -2129,6 +2351,10 @@ mod tests {
         assert_eq!(status.documents_indexed, 1);
         assert!(status.chunks_indexed >= 1);
         assert_eq!(status.embedding_model, "harness-test");
+        assert!(status.graph.is_current);
+        assert!(status.graph.nodes >= 2);
+        assert_eq!(status.graph.languages[0].language, "rust");
+        assert!(status.graph.languages[0].capabilities.calls);
 
         let semantic = service
             .semantic_search(&workspace.id, "embedding interface", 5)

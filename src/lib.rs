@@ -4,6 +4,7 @@ pub mod domain;
 pub mod embedding;
 pub mod error;
 pub mod evaluation;
+pub mod graph;
 pub mod indexing;
 pub mod instrumentation;
 pub mod parsing;
@@ -16,9 +17,10 @@ pub use config::AppConfig;
 pub use error::{CortexError, Result};
 pub use service::{
     AnalyzerRecommendation, ContextService, ContextSufficiencyAssessment, CortexWeaveService,
-    HarnessContext, HarnessContextPolicy, HarnessContextRequest, HarnessHydrationRequest,
-    HarnessSelectedSource, HydratedContextSource, HydrationAuthorization, HydrationScoreProvenance,
-    LanguageReadiness, MemoryConsolidationProposal, MemoryConsolidationReport,
-    MemoryConsolidationRequest, MemoryContradiction, MemorySupersessionReviewRequest,
-    MemoryTrustReviewRequest, ProposedMemorySupersession, RebuildCost, WorkspaceReadiness,
+    GraphLanguageStatus, HarnessContext, HarnessContextPolicy, HarnessContextRequest,
+    HarnessHydrationRequest, HarnessSelectedSource, HydratedContextSource, HydrationAuthorization,
+    HydrationScoreProvenance, LanguageReadiness, MemoryConsolidationProposal,
+    MemoryConsolidationReport, MemoryConsolidationRequest, MemoryContradiction,
+    MemorySupersessionReviewRequest, MemoryTrustReviewRequest, ProposedMemorySupersession,
+    RebuildCost, StructuralService, WorkspaceGraphStatus, WorkspaceReadiness,
 };

@@ -535,3 +535,395 @@ when the newer record is trusted. Applying supersession remains a distinct,
 reviewed operation with a reviewer and reason; cycle prevention remains inside
 the storage transaction. This adds integrity semantics without introducing a
 reasoning model or allowing analysis to mutate durable memory.
+
+## D045: Graph Symbols Have Logical Identity Independent of Embedding Chunks
+
+**Status:** Accepted
+
+Graph node UUIDs are durable storage identities reconciled by a workspace-scoped
+logical key. Core-owned keys use reserved namespaces for the workspace, files,
+and external dependencies. Analyzer-owned symbol keys are namespaced by analyzer
+ID and the analyzer's pre-segmentation logical stable key. Analyzer version,
+structural extractor version, content hashes, source offsets, persisted chunk
+UUIDs, embedding segment ordinals, and embedding-space identity are provenance
+or compatibility data; none of them participates in symbol identity.
+
+Analyzers therefore emit symbols before language-neutral embedding segmentation.
+An optional graph-node-to-chunk link is only a hydration aid and must be
+consistent with the node's document. A symbol split into several embedding
+chunks remains one graph node. Reconciliation preserves a node UUID when its
+logical key remains present, even if its body, offsets, embedding segmentation,
+or structural metadata changes. A path rename is a delete plus add in v0.4
+because the shipped filesystem index has no durable file identity across paths;
+CortexWeave must not claim continuity it cannot prove.
+
+## D046: Source Documents Own Relationship Facts and Resolution Is a Projection
+
+**Status:** Accepted
+
+Every analyzer- or core-produced relationship fact is owned by the source
+document that supplied its evidence. Its durable identity is the workspace,
+source document, and a deterministic relationship key derived from the
+normalized source symbol, relationship type, typed target, and duplicate
+occurrence ordinal. This permits multiple call sites while preserving unchanged
+facts across ordinary body edits. Deleting or reanalyzing a source document
+removes or replaces only its owned facts.
+
+The source fact and its raw typed target survive independently of resolution.
+`SymbolResolver` deterministically projects a fact to a workspace-local graph
+edge, an explicit external target, an ambiguous candidate set, or an unresolved
+target. Deleting a target removes the resolved projection but not a still-valid
+source fact, allowing it to become unresolved and later resolve again without
+inventing evidence. A changed resolution target replaces the edge assertion;
+an unchanged target preserves its edge UUID. Ambiguous and unresolved facts
+never become edges, and semantic similarity never supplies a graph fact.
+
+Facts and resolved edges retain analyzer ID and version, structural extractor
+version, confidence, source document and segment, source content revision, and
+normalized target provenance. Core-generated file/container facts follow the
+same ownership and provenance rules.
+
+## D047: Content Revisions and Graph Watermarks Are Transactional Workspace State
+
+**Status:** Accepted
+
+SQLite stores a monotonic `content_revision`, a `graph_content_revision`
+watermark, and a graph schema version per workspace. Each document also records
+the content revision of its last material source-index change. A successful
+transaction increments `content_revision` exactly once when it adds or deletes
+a document or changes persisted document/chunk identity, content, structure, or
+segmentation. A no-op reconciliation, an embedding-only replacement, an event,
+a memory or working-set mutation, and a graph-only structural-version rebuild do
+not advance it. The new revision and source-index changes commit atomically;
+rollback advances neither.
+
+`graph_content_revision` is the greatest committed content snapshot that a
+complete graph reconciliation batch acknowledges. A graph batch may coalesce
+several content revisions, but it advances the watermark only after all dirty
+documents and affected dependents since the prior watermark have been applied
+atomically and a compare-and-set proves the workspace still has the source
+snapshot the batch analyzed. An out-of-order or overtaken batch cannot mark the
+graph current. A body-only edit may advance the watermark while preserving
+unchanged node and edge rows; per-document graph state records that the newer
+source revision was inspected.
+
+Graph failure leaves the previous committed facts and watermark intact and
+records the failed target revision. File-event timestamps and UUIDs remain
+diagnostic facts, not revision authorities, and no event sequence is inferred.
+Migrating a v0.3 workspace with documents initializes a nonzero content snapshot
+and a zero graph watermark so the missing graph is visibly stale; an empty
+workspace may begin at zero for both. Initial graph construction must reuse
+compatible chunks and embeddings.
+
+## D048: Structural Reads Are Snapshot-Labeled and Current-Only by Default
+
+**Status:** Accepted
+
+Every structural traversal, impact result, and context packet that uses graph
+evidence carries a transport-neutral graph snapshot containing workspace content
+revision, graph content revision, graph schema version, graph state, and any
+applied limits. `Current` requires equal content watermarks, no active or failed
+update for the current target, and a successful per-document analysis record for
+the configured structural extractor version, including documents that produced
+zero facts. `Updating`, `Stale`, and `Error` remain distinct observable states.
+
+Structural service operations and context expansion require current graph state
+by default. A caller may explicitly allow stale evidence; every returned path
+and graph-derived context reason must then retain the stale snapshot label.
+Context may instead omit structural expansion and report deterministic
+degradation. Existing `ContextFreshness` continues to describe the selected
+content itself and must not be used to disguise stale relationship evidence as
+current content. No adapter may discard or reinterpret the graph snapshot.
+
+## D049: Structural Extraction Is Separately Versioned and Capability-Gated
+
+**Status:** Accepted
+
+`LanguageAnalyzer` gains a normalized analysis result with logical chunks,
+symbols, typed relationship facts, exact capability flags, and a structural
+extractor version. Analyzer version continues to govern logical chunk
+compatibility; segmentation identity continues to govern embedding chunks;
+structural extractor version governs graph facts. Changing only the structural
+version reruns graph analysis and resolution without replacing compatible chunks
+or embeddings and without advancing the content revision.
+
+A per-document graph-analysis record stores the applied analyzer and structural
+versions even when an analyzer emits no symbols or relationships. A configured
+version mismatch makes graph state stale until reconciled. Generic fallback
+advertises no symbol or relationship capabilities and produces no structural
+claims; graph core may still create the workspace-scoped file node. An analyzer
+may emit symbols without calls, and adding a language or relationship capability
+requires no language branch in graph persistence, resolution, retrieval, or
+context code.
+
+## D050: The Graph Is a Workspace-Isolated Derived Domain Behind Services
+
+**Status:** Accepted
+
+Language analyzers return parser-neutral facts. A graph indexer coordinates
+source-owned reconciliation, a deterministic workspace-scoped resolver, and a
+graph storage port. `StructuralService` owns bounded reads and impact operations;
+context orchestration consumes that service rather than parser or SQL details.
+`CortexWeaveService` remains the application facade, and CLI/MCP remain thin
+adapters. Core graph code depends on neither MCP types nor language-specific AST
+logic.
+
+Graph nodes, relationship facts, and edges are a derived code domain, separate
+from chunks and embeddings, explicit memories, append-only events, and transient
+working-set state. Graph updates do not automatically mutate working sets, and
+watcher events do not own graph consistency. SQLite owns graph transaction
+boundaries and enforces workspace isolation with composite unique keys and
+foreign keys for source documents, local endpoints, candidate endpoints, and
+optional document/chunk links. Service filters alone are not sufficient. A
+local edge or ambiguity candidate that crosses workspaces must fail at the
+database boundary.
+
+## D051: Symbol Resolution Uses Conservative, Observable Precedence
+
+**Status:** Accepted
+
+`SymbolResolver` operates only inside the requested workspace and returns one
+of four explicit states: resolved, ambiguous, external, or unresolved. A local
+resolution records the rule that produced it. Precedence is deterministic:
+exact analyzer stable key; analyzer-supplied alias expansion; enclosing
+container; exact qualified name; source-document simple name; unique workspace
+simple name; and exact module or file identity. Candidates are sorted by stable
+key and UUID before they are returned. Language supplied by the request, or by
+its source node, is a hard structural boundary rather than an invitation to
+guess across languages.
+
+The resolver performs no fuzzy, case-folded, suffix, embedding, or semantic
+matching. Multiple surviving candidates remain ambiguous, including duplicate
+aliases and mixed local/external alias targets. An absent target remains
+unresolved. A target becomes external only when the analyzer classified it as
+external or the request supplied an explicit external module root; absence from
+the local registry is not evidence of externality. An exact local module may
+shadow a same-named external root, while aliases with multiple valid meanings
+never silently pick that local meaning.
+
+## D052: Document Symbol Registration Is Atomic and Collision-Intolerant
+
+**Status:** Accepted
+
+`SymbolRegistry` always materializes a core-owned file node and namespaces each
+analyzer symbol by analyzer ID plus its pre-segmentation logical stable key. A
+per-document registry reconciliation upserts current nodes and deletes stale
+nodes in one SQLite transaction. A retained logical key preserves its graph
+node UUID across source offsets, body content, analyzer metadata, and content
+revision changes. Removing a key deletes the node and allows dependent edge
+projections to disappear through database constraints; a later resolution then
+reports unresolved rather than retaining a ghost target.
+
+Workspace-wide stable keys are ownership claims. If two documents present the
+same namespaced key, registration fails and the transaction rolls back instead
+of moving the node to the second document. The lower-level graph-node upsert
+enforces the same ownership check. This treats analyzer identity collisions as
+integrity failures that must be fixed at extraction, rather than resolution
+ambiguities that can be guessed around.
+
+## D053: Relationship Extraction Emits Source Facts, Not Resolved Edges
+
+**Status:** Accepted
+
+Language analyzers emit normalized `AnalyzedRelationship` source facts only.
+Every fact has a typed target, source range, deterministic relationship key,
+confidence, and source symbol or core file-node key. The key is derived from
+the source key, relation type, typed target, and duplicate occurrence ordinal;
+the ordinal is ordered by source position only to distinguish otherwise equal
+facts. Parsing produces no graph-node UUIDs, SQL rows, resolver decisions, or
+cross-workspace edges.
+
+All structured analyzers emit exact `Contains` and `DeclaredIn` facts. Imports
+emit paired `Imports` and `DependsOn` facts from the source file to the exact
+parser-derived module text. Export facts are emitted only where syntax or the
+language contract proves them. This preserves analyzer pluggability: a language
+can expose any subset of capabilities, and graph storage or resolution needs no
+language-specific AST branch.
+
+## D054: Structural Claims Prefer Direct Syntax Evidence Over Dispatch Guesses
+
+**Status:** Accepted
+
+Calls and references are emitted only for direct identifier call expressions;
+member and receiver dispatch, reflection, dynamic attribute access, and other
+indirect forms remain unclaimed. A direct call emits both `Calls` and
+`References` facts at 0.9 confidence. Inheritance facts are emitted only from
+syntax that distinguishes the relation: Python and JavaScript/TypeScript
+`extends`, TypeScript `implements`, and Rust `impl Trait for Type`. C# base
+lists emit `UsesType` at 0.9 confidence because extraction alone cannot safely
+distinguish a base class from an interface. No analyzer advertises `Overrides`
+until it can identify the overridden member without a guess.
+
+Test nodes are explicit: Rust test attributes, Python `test_` functions,
+C#/Go test conventions, and JavaScript/TypeScript `test` or `it` declarations
+are represented as test symbols. `Tests` facts are currently derived only from
+direct calls inside an explicit test and carry 0.9 confidence with
+`likely/direct-call` provenance. They are useful association evidence, not proof
+of behavioral coverage. Co-location, imports, naming resemblance, and semantic
+similarity do not claim coverage.
+
+## D055: Graph Reconciliation Is One Source-Snapshot Compare-and-Swap
+
+**Status:** Accepted
+
+After source chunks commit, the graph indexer prepares the complete structural
+delta against an immutable in-memory workspace snapshot. SQLite then applies
+the document's nodes, source-owned relationship facts, affected resolved and
+unresolved projections, ambiguity candidates, per-document analysis state, and
+workspace graph watermark in one transaction. The transaction first proves
+that the workspace `content_revision` and graph-update ownership token identify
+the snapshot the batch analyzed. The token also serializes graph-only rebuilds
+that legitimately share one content revision. An overtaken batch returns
+`Superseded` without writing and may be rebuilt against the newer snapshot; it
+can never mark an older view current or overwrite a same-revision winner.
+
+Document deletion is stronger than a follow-up cascade: deleting the source
+document, advancing the content revision, reprojecting surviving dependents,
+and acknowledging the graph revision occur in the same transaction. Any
+storage error therefore rolls back both source deletion and graph changes.
+For ordinary edits, source indexing may already be committed when graph
+analysis fails, but the prior graph rows and watermark remain intact and the
+current target is labeled `Error`. Retrying graph-only work reuses compatible
+chunks and embeddings. `Current` is written only when every remaining document
+has a successful analysis record matching its own content and analyzer identity
+plus the structural version expected by the active analyzer registry; a
+structural-version-only rebuild does not advance source revision.
+
+## D056: Dependent Invalidation Follows Typed Resolution-Surface Changes
+
+**Status:** Accepted
+
+Every analyzer relationship remains a durable source-owned fact independent of
+its current projection. Reconciliation always replaces and reprojects facts
+owned by the changed document. Facts owned by other documents are re-resolved
+only when the changed document alters a typed resolver-visible candidate:
+stable or logical key, simple or qualified name, module/file identity,
+language, or module-capable node type. Projections that target a removed node
+are also invalidated directly. This covers additions that introduce ambiguity,
+renames, type changes, and deletions without a workspace-wide resolution pass.
+
+A body-only edit with an unchanged resolution surface updates the changed
+document's analysis state but does not rewrite dependent edges. A resolved edge
+keeps its UUID and creation time when its source, target, and relation type are
+unchanged. A changed or missing target yields an explicit ambiguous, external,
+or unresolved projection; ambiguity candidates retain workspace-enforced node
+identities. No fuzzy or model-based invalidation is used.
+
+## D057: Structural Reads Are Bounded Application-Service Operations
+
+**Status:** Accepted
+
+`StructuralService` owns symbol and path lookup, typed one-hop queries, bounded
+multi-hop traversal, and impact analysis. Storage supplies workspace-scoped
+node, edge, and source-chunk primitives but does not choose traversal intent;
+adapters receive transport-neutral domain values and do not issue graph SQL.
+Hard ceilings cap nodes, edges, and depth, while every result records the
+effective limits and whether they truncated the answer.
+
+Reads verify current graph state and configured analyzer structural versions by
+default. Explicit stale reads retain the non-current graph revision. A revision
+change during an operation rejects the result as retryable rather than labeling
+facts from multiple graph snapshots as one answer.
+
+## D058: Structural Retrieval Is Deterministic Evidence, Not Semantic Guessing
+
+**Status:** Accepted
+
+Hybrid retrieval has an independently configurable structural component. Exact
+query symbols take precedence as graph seeds; baseline semantic and lexical
+chunks seed the graph only when no exact symbol or path token matched. Query
+phrases deterministically choose caller, callee, implementation, test,
+dependency, dependent, general-neighborhood, or reverse-impact traversal.
+
+A structural score is the product of path confidence, the most conservative
+typed-relation multiplier on the path, and configured per-hop distance decay.
+It is normalized with semantic and lexical components only after source chunks
+are deduplicated. Every selected structural candidate keeps its seed, target,
+typed path, graph revision, limits, and truncation state. A stale or failed graph
+causes hybrid retrieval to omit this component; it does not relabel old edges as
+current or prevent the baseline retrieval modes from answering.
+
+## D059: Impact Is Reverse Dependency Reachability Without Diff Inference
+
+**Status:** Accepted
+
+Impact analysis starts from exact symbol nodes or a file node and walks incoming
+calls, references, implementations, inheritance, type use, construction,
+overrides, tests, imports, and dependencies. A file seed first expands its
+contained declarations. Results are unique graph nodes ordered by distance,
+confidence, and stable identity, with an explainable seed-to-impact path whose
+confidence is the product of its edge confidences.
+
+Context assembly uses the same structural paths to distinguish implementation,
+usage, test, dependency, and transitive-impact reasons while retaining existing
+token budgeting. v0.4 impact makes no claim about a git diff or runtime behavior;
+diff seeding remains a separate change-source adapter and later roadmap work.
+
+## D060: Graph Adapters Expose Exact IDs and Bounded Provenance
+
+**Status:** Accepted
+
+CLI and MCP expose the structural application service without graph SQL,
+resolver policy, parser objects, or adapter-specific graph types. Callers first
+resolve a symbol or path through `graph_find`, then use returned exact node IDs
+for relation tools. Impact accepts an exact symbol or indexed relative path.
+Each response is the original transport-neutral traversal or impact result,
+including snapshot, limits, typed edges, paths, confidence, and truncation.
+
+The CLI accepts the core service ceilings. MCP applies tighter request ceilings
+of 100 nodes, 500 edges, and depth 4 before calling the service so one stdio
+tool response remains operationally bounded. Both adapters default to
+current-only graph reads and require an explicit stale-read opt-in. Neither
+adapter creates graph facts, changes working sets, infers a diff, or maps raw
+observations to nodes; those remain core indexing and deferred Phase 13 work.
+
+## D061: Graph Health Is an Explicit Workspace Diagnostic
+
+**Status:** Accepted
+
+Workspace status carries a deterministic graph diagnostic alongside indexing
+status: persisted graph revision, explicit current/stale/error state, total
+nodes, resolved edges, unresolved relationship facts, and per-indexed-language
+active analyzer identity and capability set. Counts are calculated from the
+stored graph and source documents, not estimated from adapter output.
+
+`graph status`, MCP `graph_status`, and `doctor` all obtain this one
+application-service report. Diagnostic reads intentionally report a stale or
+failed projection instead of applying the current-only rule used for structural
+answers. `doctor` treats a registered non-current graph as unhealthy and shows
+the workspace-level report, while no registered workspaces remains healthy.
+
+## D062: Graph Performance Baselines Use Distributional Fixture Measurements
+
+**Status:** Accepted
+
+The deterministic in-repository benchmark fixture records initial integrated
+index-and-graph build, incremental graph update, exact symbol lookup, one- and
+two-hop traversal, reverse impact, graph-aware context assembly, and SQLite
+growth for single-language and mixed-language workspaces. Query operations use
+nine samples and report p50 and p95; averages alone are not an acceptance
+signal. The fixture uses a local deterministic embedding provider, so results
+isolate graph and storage overhead from network model inference.
+
+These numbers are a reproducible regression baseline rather than a universal
+latency promise: release qualification records the fixture size, hardware,
+warm/cold state, p50/p95, database growth, and agreed regression budget before
+comparison. Functional tests preserve incremental embedding reuse; timing
+assertions are deliberately avoided in variable CI environments.
+
+## D063: Analyzers Own Module-Path Semantics
+
+**Status:** Accepted
+
+Language analyzers own source-relative paths, extension candidates, package
+indexes, namespace separators, import aliases, and explicit external-module
+roots. They emit those possibilities as deterministic normalized relationship
+metadata. The graph resolver consumes that transport-neutral metadata and
+matches graph identities generically; it does not acquire Rust, Python,
+JavaScript, TypeScript, C#, or Go path rules.
+
+No candidate permits a best-effort guess. Zero matches remain unresolved,
+multiple matches remain ambiguous, and external classification requires an
+explicit analyzer-provided root. This keeps language-specific syntax and module
+semantics out of the indexing core while allowing ordinary local imports to
+resolve against canonical workspace paths.

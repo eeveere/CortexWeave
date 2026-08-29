@@ -187,20 +187,29 @@ mod tests {
 
         assert_eq!(
             upgraded.get_workspace(&workspace.id).await.unwrap(),
-            Some(workspace)
+            Some(workspace.clone())
         );
         assert_eq!(
             upgraded.get_session(&session.id).await.unwrap(),
             Some(session)
         );
         assert_eq!(upgraded.get_task(&task.id).await.unwrap(), Some(task));
+        let mut migrated_document = document.clone();
+        migrated_document.content_revision = 1;
         assert_eq!(
             upgraded
                 .find_document(&document.workspace_id, &document.relative_path)
                 .await
                 .unwrap(),
-            Some(document.clone())
+            Some(migrated_document)
         );
+        let graph_revision = upgraded
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(graph_revision.content_revision, 1);
+        assert_eq!(graph_revision.graph_content_revision, 0);
         assert_eq!(
             upgraded.list_chunks(&document.id).await.unwrap(),
             vec![chunk]

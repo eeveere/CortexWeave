@@ -124,6 +124,8 @@ pub struct Document {
     pub analyzer_id: String,
     pub analyzer_version: String,
     pub segmentation_id: String,
+    #[serde(default)]
+    pub content_revision: i64,
     pub content_hash: String,
     pub size_bytes: i64,
     pub modified_at_ns: Option<i64>,
@@ -140,6 +142,7 @@ impl Document {
             analyzer_id: "generic".into(),
             analyzer_version: "1".into(),
             segmentation_id: "legacy-v0.1".into(),
+            content_revision: 0,
             content_hash: String::new(),
             size_bytes: 0,
             modified_at_ns: None,

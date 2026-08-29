@@ -1,9 +1,12 @@
 use crate::{
     Result,
-    domain::{AnalyzedChunk, AnalyzerCapabilities, SymbolKind},
+    domain::{AnalysisResult, AnalyzerCapabilities, SymbolKind},
     parsing::{
         LanguageAnalyzer,
-        tree_sitter_support::{StructureSpec, SymbolDescriptor, analyze, field_text},
+        language_relationships::{RelationshipLanguage, extract_relationships},
+        tree_sitter_support::{
+            RelationshipDraft, StructureSpec, SymbolDescriptor, analyze, field_text,
+        },
     },
 };
 use std::path::Path;
@@ -21,6 +24,9 @@ impl LanguageAnalyzer for JavaScriptAnalyzer {
     fn analyzer_version(&self) -> String {
         format!("{}-2", env!("CARGO_PKG_VERSION"))
     }
+    fn structure_version(&self) -> String {
+        "javascript-structure:v2".into()
+    }
     fn extensions(&self) -> &'static [&'static str] {
         &["js", "jsx", "mjs", "cjs"]
     }
@@ -28,10 +34,19 @@ impl LanguageAnalyzer for JavaScriptAnalyzer {
         AnalyzerCapabilities {
             structural_chunks: true,
             qualified_symbols: true,
+            contains: true,
+            declared_in: true,
+            imports: true,
+            exports: true,
+            depends_on: true,
+            references: true,
+            calls: true,
+            inheritance: true,
+            tests: true,
             ..Default::default()
         }
     }
-    fn analyze(&self, path: &Path, source: &str) -> Result<Vec<AnalyzedChunk>> {
+    fn analyze(&self, path: &Path, source: &str) -> Result<AnalysisResult> {
         analyze(self, path, source)
     }
 }
@@ -63,6 +78,22 @@ impl StructureSpec for JavaScriptAnalyzer {
             key_kind,
             is_container: container,
         })
+    }
+
+    fn relationship_drafts(
+        &self,
+        root: Node<'_>,
+        source: &str,
+        normalized_path: &str,
+        symbols: &mut Vec<crate::domain::AnalyzedSymbol>,
+    ) -> Vec<RelationshipDraft> {
+        extract_relationships(
+            RelationshipLanguage::JavaScript,
+            root,
+            source,
+            normalized_path,
+            symbols,
+        )
     }
 }
 

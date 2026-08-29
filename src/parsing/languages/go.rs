@@ -4,10 +4,13 @@ use tree_sitter::{Language, Node};
 
 use crate::{
     Result,
-    domain::{AnalyzedChunk, AnalyzerCapabilities, SymbolKind},
+    domain::{AnalysisResult, AnalyzerCapabilities, SymbolKind},
     parsing::{
         LanguageAnalyzer,
-        tree_sitter_support::{StructureSpec, SymbolDescriptor, analyze, field_text},
+        language_relationships::{RelationshipLanguage, extract_relationships},
+        tree_sitter_support::{
+            RelationshipDraft, StructureSpec, SymbolDescriptor, analyze, field_text,
+        },
     },
 };
 
@@ -25,6 +28,9 @@ impl LanguageAnalyzer for GoAnalyzer {
     fn analyzer_version(&self) -> String {
         format!("{}-3", env!("CARGO_PKG_VERSION"))
     }
+    fn structure_version(&self) -> String {
+        "go-structure:v2".into()
+    }
 
     fn extensions(&self) -> &'static [&'static str] {
         &["go"]
@@ -34,11 +40,19 @@ impl LanguageAnalyzer for GoAnalyzer {
         AnalyzerCapabilities {
             structural_chunks: true,
             qualified_symbols: true,
+            contains: true,
+            declared_in: true,
+            imports: true,
+            exports: true,
+            depends_on: true,
+            references: true,
+            calls: true,
+            tests: true,
             ..Default::default()
         }
     }
 
-    fn analyze(&self, path: &Path, source: &str) -> Result<Vec<AnalyzedChunk>> {
+    fn analyze(&self, path: &Path, source: &str) -> Result<AnalysisResult> {
         analyze(self, path, source)
     }
 }
@@ -83,6 +97,22 @@ impl StructureSpec for GoAnalyzer {
             }
             _ => None,
         }
+    }
+
+    fn relationship_drafts(
+        &self,
+        root: Node<'_>,
+        source: &str,
+        normalized_path: &str,
+        symbols: &mut Vec<crate::domain::AnalyzedSymbol>,
+    ) -> Vec<RelationshipDraft> {
+        extract_relationships(
+            RelationshipLanguage::Go,
+            root,
+            source,
+            normalized_path,
+            symbols,
+        )
     }
 }
 

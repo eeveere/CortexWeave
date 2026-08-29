@@ -54,8 +54,14 @@ Core tools are `semantic_search`, `semantic_context`, `resume_context`,
 `semantic_get`, `memory_record`, `memory_search`, `memory_recent`,
 `working_set`, `context_pin`, `context_unpin`, `checkpoint_create`,
 `checkpoint_latest`, `workspace_list`, `workspace_status`,
-`workspace_readiness`, and `workspace_reindex`. Session and event tools remain `session_start`,
-`session_end`, and `event_record`.
+`workspace_readiness`, and `workspace_reindex`. Structural tools are
+`graph_status`, `graph_find`, `graph_neighbors`, `graph_callers`, `graph_callees`,
+`graph_references`, `graph_implementations`, `graph_tests`,
+`graph_dependencies`, `graph_dependents`, `graph_impact_symbol`, and
+`session_start`, `session_end`, and `event_record`.
+
+The [Structural Graph Architecture](graph-architecture.md) describes graph
+semantics, current-state behavior, analyzer capabilities, and limitations.
 
 `workspace_readiness` is read-only. It identifies supported languages currently
 using generic fallback and estimates the persisted chunks and embeddings that
@@ -72,6 +78,27 @@ returns the requested budget and the actual selected-item estimate.
 Set `include_explanation` on `semantic_context` or `resume_context` to include
 the selected items' reasons, component scores, token estimates, and truncation
 status. This diagnostic is outside the prompt packet budget.
+
+Use `graph_find` to resolve an exact graph symbol or source path, then pass a
+returned node ID to a graph relation tool. All graph tools accept optional
+`allow_stale`, `max_nodes`, `max_edges`, and `max_depth`. MCP caps those bounds
+at 100 nodes, 500 edges, and depth 4 to keep stdio responses compact. They
+return graph revision, applied limits, typed paths, confidence, and truncation.
+Current graph state is required unless `allow_stale` is explicitly true.
+`graph_impact_symbol` and `graph_impact_path` report reverse graph reachability,
+not an inferred source-control diff.
+
+`graph_neighbors` is always direct (one hop), regardless of a supplied depth.
+`graph_tests` returns likely direct-call test associations with their evidence
+and confidence; it does not prove behavioral coverage. Exact node IDs must
+belong to the selected workspace, and explicit seed requests that exceed the
+effective node bound fail rather than returning a partial answer.
+
+Use `graph_status` before a structural read when a client needs an explicit
+health decision. It returns the workspace graph revision, whether it is
+current, node/edge/unresolved counts, and per-language active analyzer
+capabilities. Unlike relation and impact tools, it is diagnostic and always
+reports the persisted state; it does not require an `allow_stale` opt-in.
 
 Use `semantic_context` as the one-call retrieval operation when an agent needs
 bounded evidence to answer a question. `semantic_get` is different: it accepts

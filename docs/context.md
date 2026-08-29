@@ -17,15 +17,24 @@ code + documents + memories + events + task/session state
 ## Semantic Context
 
 `ContextRequest` combines an optional query with session, task, path, and
-language scope. The service gathers direct semantic and lexical code matches,
+language scope. The service gathers direct semantic, lexical, and current-graph code matches,
 temporal evidence, task and session state, and working-set entries. Code
-expansion uses analyzer-normalized container and neighbor relationships, never
-language-specific logic in the indexing core.
+expansion uses analyzer-normalized graph relations plus deterministic container
+and neighbor relationships, never language-specific logic in the indexing core.
+Question intent selects caller/reference, implementation, test, dependency, or
+reverse-impact expansion. Thus “how does X work?”, “what uses X?”, and “what
+changes if X changes?” do not collapse to one generic neighborhood.
 
 Candidates retain semantic, lexical, task, working-set, recency, provenance,
 freshness, structural, and final scores. Stable source identity deduplicates
 them before bounded ranking. Current source is preferred over historical evidence
 when otherwise comparable.
+
+Graph-aware candidates retain the typed path, path confidence, workspace graph
+revision, applied traversal limits, and truncation state through final packet
+selection. Structural reads require a current graph. If indexing has left the
+graph stale or in error, ordinary context assembly omits graph expansion while
+preserving semantic, lexical, temporal, and working-set behavior.
 
 An explicit task or session request scopes task and session state to that
 effective session; an explicit task also selects only its own task state.

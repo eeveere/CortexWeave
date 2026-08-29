@@ -1,14 +1,18 @@
+use std::collections::{HashMap, HashSet};
+
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{FromRow, Sqlite};
+use sqlx::{FromRow, QueryBuilder, Sqlite};
 
 use crate::{
     CortexError, Result,
     domain::{
         Checkpoint, ContextPin, ContextSourceType, CortexEvent, Document, EmbeddingRecord,
-        EventType, MemoryClaim, MemoryKind, MemoryOrigin, MemoryRecord, MemorySupersession,
-        MemoryTrust, MemoryTrustReview, Session, SourceSegment, StoredChunk, SymbolKind, Task,
-        TaskStatus, TemporalBounds, WorkingSetEntry, Workspace,
+        EventType, GraphAnalysisExpectation, GraphAnalysisState, GraphEdge, GraphEdgeType,
+        GraphNode, GraphNodeType, GraphRelationshipFact, GraphState, MemoryClaim, MemoryKind,
+        MemoryOrigin, MemoryRecord, MemorySupersession, MemoryTrust, MemoryTrustReview,
+        RelationshipTargetKind, Session, SourceSegment, StoredChunk, SymbolKind, Task, TaskStatus,
+        TemporalBounds, UnresolvedRelationship, WorkingSetEntry, Workspace, WorkspaceGraphRevision,
     },
 };
 
@@ -40,6 +44,55 @@ pub(crate) enum StructuralRelation {
 pub(crate) struct StructuralCodeCandidate {
     pub candidate: TemporalCandidate,
     pub relation: StructuralRelation,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GraphRelationshipIdentity {
+    pub source_document_id: String,
+    pub relationship_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UnresolvedGraphProjection {
+    pub relationship: UnresolvedRelationship,
+    pub candidate_node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GraphReconciliationBatch {
+    pub workspace_id: String,
+    pub target_content_revision: i64,
+    pub expected_graph_updated_at: Option<DateTime<Utc>>,
+    pub update_started_at: Option<DateTime<Utc>>,
+    pub delete_relative_path: Option<String>,
+    pub source_document_id: Option<String>,
+    pub nodes: Vec<GraphNode>,
+    pub facts: Vec<GraphRelationshipFact>,
+    pub analysis_state: Option<GraphAnalysisState>,
+    pub expected_analysis: Vec<GraphAnalysisExpectation>,
+    pub affected_relationships: Vec<GraphRelationshipIdentity>,
+    pub edges: Vec<GraphEdge>,
+    pub unresolved: Vec<UnresolvedGraphProjection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GraphReconciliationStatus {
+    Current,
+    Stale,
+    Superseded,
+}
+
+#[derive(Debug, FromRow)]
+struct GraphAnalysisSnapshotRow {
+    document_id: String,
+    document_analyzer_id: String,
+    document_analyzer_version: String,
+    document_content_revision: i64,
+    state_content_revision: Option<i64>,
+    state_analyzer_id: Option<String>,
+    state_analyzer_version: Option<String>,
+    state_structure_version: Option<String>,
+    state_last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -306,7 +359,7 @@ impl SqliteStorage {
         relative_path: &str,
     ) -> Result<Option<Document>> {
         let row = sqlx::query_as::<_, DocumentRow>(
-            "SELECT id, workspace_id, relative_path, language, analyzer_id, analyzer_version, segmentation_id, content_hash, size_bytes, modified_at_ns, indexed_at FROM documents WHERE workspace_id = ? AND relative_path = ?",
+            "SELECT id, workspace_id, relative_path, language, analyzer_id, analyzer_version, segmentation_id, content_revision, content_hash, size_bytes, modified_at_ns, indexed_at FROM documents WHERE workspace_id = ? AND relative_path = ?",
         )
         .bind(workspace_id)
         .bind(relative_path)
@@ -317,7 +370,7 @@ impl SqliteStorage {
 
     pub async fn list_documents(&self, workspace_id: &str) -> Result<Vec<Document>> {
         let rows = sqlx::query_as::<_, DocumentRow>(
-            "SELECT id, workspace_id, relative_path, language, analyzer_id, analyzer_version, segmentation_id, content_hash, size_bytes, modified_at_ns, indexed_at FROM documents WHERE workspace_id = ? ORDER BY relative_path",
+            "SELECT id, workspace_id, relative_path, language, analyzer_id, analyzer_version, segmentation_id, content_revision, content_hash, size_bytes, modified_at_ns, indexed_at FROM documents WHERE workspace_id = ? ORDER BY relative_path",
         )
         .bind(workspace_id)
         .fetch_all(self.pool())
@@ -326,13 +379,19 @@ impl SqliteStorage {
     }
 
     pub async fn delete_document(&self, workspace_id: &str, relative_path: &str) -> Result<bool> {
+        let mut transaction = self.pool().begin().await?;
         let result =
             sqlx::query("DELETE FROM documents WHERE workspace_id = ? AND relative_path = ?")
                 .bind(workspace_id)
                 .bind(relative_path)
-                .execute(self.pool())
+                .execute(&mut *transaction)
                 .await?;
-        Ok(result.rows_affected() == 1)
+        let deleted = result.rows_affected() == 1;
+        if deleted {
+            bump_content_revision(&mut transaction, workspace_id, Utc::now()).await?;
+        }
+        transaction.commit().await?;
+        Ok(deleted)
     }
 
     pub async fn insert_chunk(&self, chunk: &StoredChunk) -> Result<()> {
@@ -347,6 +406,75 @@ impl SqliteStorage {
         .fetch_all(self.pool())
         .await?;
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub(crate) async fn workspace_chunk_count(&self, workspace_id: &str) -> Result<usize> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.workspace_id = ?",
+        )
+        .bind(workspace_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(count as usize)
+    }
+
+    pub(crate) async fn workspace_graph_counts(
+        &self,
+        workspace_id: &str,
+    ) -> Result<(usize, usize, usize)> {
+        let (nodes,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM graph_nodes WHERE workspace_id = ?")
+                .bind(workspace_id)
+                .fetch_one(self.pool())
+                .await?;
+        let (edges,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM graph_edges WHERE workspace_id = ?")
+                .bind(workspace_id)
+                .fetch_one(self.pool())
+                .await?;
+        let (unresolved,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM unresolved_relationships WHERE workspace_id = ?")
+                .bind(workspace_id)
+                .fetch_one(self.pool())
+                .await?;
+        Ok((nodes as usize, edges as usize, unresolved as usize))
+    }
+
+    pub(crate) async fn workspace_graph_counts_by_language(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<(String, usize, usize, usize)>> {
+        let rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT language, SUM(nodes), SUM(edges), SUM(unresolved_relationships) FROM (\
+                SELECT COALESCE(n.language, d.language, 'graph') AS language, COUNT(*) AS nodes, 0 AS edges, 0 AS unresolved_relationships \
+                FROM graph_nodes n LEFT JOIN documents d ON d.id = n.document_id AND d.workspace_id = n.workspace_id \
+                WHERE n.workspace_id = ? GROUP BY COALESCE(n.language, d.language, 'graph') \
+                UNION ALL \
+                SELECT d.language AS language, 0 AS nodes, COUNT(*) AS edges, 0 AS unresolved_relationships \
+                FROM graph_edges e JOIN documents d ON d.id = e.source_document_id AND d.workspace_id = e.workspace_id \
+                WHERE e.workspace_id = ? GROUP BY d.language \
+                UNION ALL \
+                SELECT d.language AS language, 0 AS nodes, 0 AS edges, COUNT(*) AS unresolved_relationships \
+                FROM unresolved_relationships u JOIN documents d ON d.id = u.source_document_id AND d.workspace_id = u.workspace_id \
+                WHERE u.workspace_id = ? GROUP BY d.language\
+             ) GROUP BY language ORDER BY language",
+        )
+        .bind(workspace_id)
+        .bind(workspace_id)
+        .bind(workspace_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(language, nodes, edges, unresolved)| {
+                (
+                    language,
+                    nodes as usize,
+                    edges as usize,
+                    unresolved as usize,
+                )
+            })
+            .collect())
     }
 
     pub(crate) async fn code_candidate(
@@ -1316,6 +1444,1087 @@ impl SqliteStorage {
         Ok(row.map(Into::into))
     }
 
+    pub async fn workspace_graph_revision(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<WorkspaceGraphRevision>> {
+        let row = sqlx::query_as::<_, WorkspaceGraphRevisionRow>(
+            "SELECT workspace_id, content_revision, graph_content_revision, graph_schema_version, graph_state, graph_update_started_at, failed_graph_target_revision, last_graph_error, updated_at FROM workspace_graph_revisions WHERE workspace_id = ?",
+        )
+        .bind(workspace_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn mark_graph_updating(
+        &self,
+        workspace_id: &str,
+        started_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE workspace_graph_revisions SET graph_state = 'updating', graph_update_started_at = ?, failed_graph_target_revision = NULL, last_graph_error = NULL, updated_at = ? WHERE workspace_id = ?",
+        )
+        .bind(started_at)
+        .bind(started_at)
+        .bind(workspace_id)
+        .execute(self.pool())
+        .await?;
+        require_one(
+            result.rows_affected(),
+            "workspace graph revision",
+            workspace_id,
+        )
+    }
+
+    pub(crate) async fn mark_graph_updating_if_current(
+        &self,
+        workspace_id: &str,
+        target_revision: i64,
+        expected_graph_updated_at: DateTime<Utc>,
+        started_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE workspace_graph_revisions SET graph_state = 'updating', graph_update_started_at = ?, updated_at = ? WHERE workspace_id = ? AND content_revision = ? AND updated_at = ?",
+        )
+        .bind(started_at)
+        .bind(started_at)
+        .bind(workspace_id)
+        .bind(target_revision)
+        .bind(expected_graph_updated_at)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn mark_graph_error(
+        &self,
+        workspace_id: &str,
+        target_revision: i64,
+        error: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE workspace_graph_revisions SET graph_state = 'error', graph_update_started_at = NULL, failed_graph_target_revision = ?, last_graph_error = ?, updated_at = ? WHERE workspace_id = ?",
+        )
+        .bind(target_revision)
+        .bind(error)
+        .bind(updated_at)
+        .bind(workspace_id)
+        .execute(self.pool())
+        .await?;
+        require_one(
+            result.rows_affected(),
+            "workspace graph revision",
+            workspace_id,
+        )
+    }
+
+    pub(crate) async fn mark_graph_error_if_snapshot(
+        &self,
+        workspace_id: &str,
+        target_revision: i64,
+        expected_graph_updated_at: DateTime<Utc>,
+        error: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE workspace_graph_revisions SET graph_state = 'error', graph_update_started_at = NULL, failed_graph_target_revision = ?, last_graph_error = ?, updated_at = ? WHERE workspace_id = ? AND content_revision = ? AND updated_at = ?",
+        )
+        .bind(target_revision)
+        .bind(error)
+        .bind(updated_at)
+        .bind(workspace_id)
+        .bind(target_revision)
+        .bind(expected_graph_updated_at)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn mark_graph_error_for_update(
+        &self,
+        workspace_id: &str,
+        target_revision: i64,
+        update_started_at: DateTime<Utc>,
+        error: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE workspace_graph_revisions SET graph_state = 'error', graph_update_started_at = NULL, failed_graph_target_revision = ?, last_graph_error = ?, updated_at = ? WHERE workspace_id = ? AND content_revision = ? AND graph_state = 'updating' AND graph_update_started_at = ?",
+        )
+        .bind(target_revision)
+        .bind(error)
+        .bind(updated_at)
+        .bind(workspace_id)
+        .bind(target_revision)
+        .bind(update_started_at)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn clear_graph_update_if_owned(
+        &self,
+        workspace_id: &str,
+        target_revision: i64,
+        update_started_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE workspace_graph_revisions SET graph_state = 'stale', graph_update_started_at = NULL, updated_at = ? WHERE workspace_id = ? AND content_revision = ? AND graph_state = 'updating' AND graph_update_started_at = ?",
+        )
+        .bind(updated_at)
+        .bind(workspace_id)
+        .bind(target_revision)
+        .bind(update_started_at)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn acknowledge_graph_revision(
+        &self,
+        workspace_id: &str,
+        target_revision: i64,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE workspace_graph_revisions SET graph_content_revision = ?, graph_state = CASE WHEN content_revision = ? THEN 'current' ELSE 'stale' END, graph_update_started_at = NULL, failed_graph_target_revision = CASE WHEN content_revision = ? THEN NULL ELSE failed_graph_target_revision END, last_graph_error = CASE WHEN content_revision = ? THEN NULL ELSE last_graph_error END, updated_at = ? WHERE workspace_id = ? AND content_revision = ? AND graph_content_revision <= ?",
+        )
+        .bind(target_revision)
+        .bind(target_revision)
+        .bind(target_revision)
+        .bind(target_revision)
+        .bind(updated_at)
+        .bind(workspace_id)
+        .bind(target_revision)
+        .bind(target_revision)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn graph_analysis_state(
+        &self,
+        document_id: &str,
+    ) -> Result<Option<GraphAnalysisState>> {
+        let row = sqlx::query_as::<_, GraphAnalysisStateRow>(
+            "SELECT document_id, workspace_id, content_revision, analyzer_id, analyzer_version, structure_version, last_error, analyzed_at FROM graph_document_states WHERE document_id = ?",
+        )
+        .bind(document_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn upsert_graph_analysis_state(&self, state: &GraphAnalysisState) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO graph_document_states(document_id, workspace_id, content_revision, analyzer_id, analyzer_version, structure_version, last_error, analyzed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(document_id) DO UPDATE SET workspace_id = excluded.workspace_id, content_revision = excluded.content_revision, analyzer_id = excluded.analyzer_id, analyzer_version = excluded.analyzer_version, structure_version = excluded.structure_version, last_error = excluded.last_error, analyzed_at = excluded.analyzed_at",
+        )
+        .bind(&state.document_id)
+        .bind(&state.workspace_id)
+        .bind(state.content_revision)
+        .bind(&state.analyzer_id)
+        .bind(&state.analyzer_version)
+        .bind(&state.structure_version)
+        .bind(&state.last_error)
+        .bind(state.analyzed_at)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn graph_node_by_stable_key(
+        &self,
+        workspace_id: &str,
+        stable_key: &str,
+    ) -> Result<Option<GraphNode>> {
+        let row = sqlx::query_as::<_, GraphNodeRow>(
+            "SELECT id, workspace_id, node_type, stable_key, language, name, qualified_name, document_id, chunk_id, source_path, source_start_byte, source_end_byte, analyzer_id, analyzer_version, structure_version, content_revision, metadata_json, created_at, updated_at FROM graph_nodes WHERE workspace_id = ? AND stable_key = ?",
+        )
+        .bind(workspace_id)
+        .bind(stable_key)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn graph_nodes(&self, workspace_id: &str) -> Result<Vec<GraphNode>> {
+        let rows = sqlx::query_as::<_, GraphNodeRow>(
+            "SELECT id, workspace_id, node_type, stable_key, language, name, qualified_name, document_id, chunk_id, source_path, source_start_byte, source_end_byte, analyzer_id, analyzer_version, structure_version, content_revision, metadata_json, created_at, updated_at FROM graph_nodes WHERE workspace_id = ? ORDER BY stable_key",
+        )
+        .bind(workspace_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub(crate) async fn graph_nodes_matching(
+        &self,
+        workspace_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<GraphNode>> {
+        if limit == 0 || query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = query.trim().replace('\\', "/");
+        let rows = sqlx::query_as::<_, GraphNodeRow>(
+            "SELECT id, workspace_id, node_type, stable_key, language, name, qualified_name, document_id, chunk_id, source_path, source_start_byte, source_end_byte, analyzer_id, analyzer_version, structure_version, content_revision, metadata_json, created_at, updated_at FROM graph_nodes WHERE workspace_id = ? AND (stable_key = ? OR qualified_name = ? OR name = ? OR source_path = ?) ORDER BY CASE WHEN stable_key = ? THEN 0 WHEN qualified_name = ? THEN 1 WHEN source_path = ? THEN 2 ELSE 3 END, stable_key LIMIT ?",
+        )
+        .bind(workspace_id)
+        .bind(&query)
+        .bind(&query)
+        .bind(&query)
+        .bind(&query)
+        .bind(&query)
+        .bind(&query)
+        .bind(&query)
+        .bind(memory_limit(limit)?)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub(crate) async fn graph_nodes_for_chunk(
+        &self,
+        workspace_id: &str,
+        chunk_id: &str,
+        limit: usize,
+    ) -> Result<Vec<GraphNode>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, GraphNodeRow>(
+            "SELECT n.id, n.workspace_id, n.node_type, n.stable_key, n.language, n.name, n.qualified_name, n.document_id, n.chunk_id, n.source_path, n.source_start_byte, n.source_end_byte, n.analyzer_id, n.analyzer_version, n.structure_version, n.content_revision, n.metadata_json, n.created_at, n.updated_at FROM graph_nodes n JOIN chunks c ON c.document_id = n.document_id JOIN documents d ON d.id = c.document_id AND d.workspace_id = n.workspace_id WHERE n.workspace_id = ? AND c.id = ? AND n.source_start_byte IS NOT NULL AND n.source_end_byte IS NOT NULL AND n.source_start_byte <= c.end_byte AND n.source_end_byte >= c.start_byte ORDER BY CASE WHEN n.node_type = 'file' THEN 1 ELSE 0 END, (n.source_end_byte - n.source_start_byte), n.stable_key LIMIT ?",
+        )
+        .bind(workspace_id)
+        .bind(chunk_id)
+        .bind(memory_limit(limit)?)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn graph_node_by_id(
+        &self,
+        workspace_id: &str,
+        node_id: &str,
+    ) -> Result<Option<GraphNode>> {
+        let row = sqlx::query_as::<_, GraphNodeRow>(
+            "SELECT id, workspace_id, node_type, stable_key, language, name, qualified_name, document_id, chunk_id, source_path, source_start_byte, source_end_byte, analyzer_id, analyzer_version, structure_version, content_revision, metadata_json, created_at, updated_at FROM graph_nodes WHERE workspace_id = ? AND id = ?",
+        )
+        .bind(workspace_id)
+        .bind(node_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn graph_nodes_by_qualified_name(
+        &self,
+        workspace_id: &str,
+        qualified_name: &str,
+        language: Option<&str>,
+    ) -> Result<Vec<GraphNode>> {
+        let rows = sqlx::query_as::<_, GraphNodeRow>(
+            "SELECT id, workspace_id, node_type, stable_key, language, name, qualified_name, document_id, chunk_id, source_path, source_start_byte, source_end_byte, analyzer_id, analyzer_version, structure_version, content_revision, metadata_json, created_at, updated_at FROM graph_nodes WHERE workspace_id = ? AND qualified_name = ? AND (? IS NULL OR language = ?) ORDER BY stable_key",
+        )
+        .bind(workspace_id)
+        .bind(qualified_name)
+        .bind(language)
+        .bind(language)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn graph_nodes_by_name(
+        &self,
+        workspace_id: &str,
+        name: &str,
+        language: Option<&str>,
+    ) -> Result<Vec<GraphNode>> {
+        let rows = sqlx::query_as::<_, GraphNodeRow>(
+            "SELECT id, workspace_id, node_type, stable_key, language, name, qualified_name, document_id, chunk_id, source_path, source_start_byte, source_end_byte, analyzer_id, analyzer_version, structure_version, content_revision, metadata_json, created_at, updated_at FROM graph_nodes WHERE workspace_id = ? AND name = ? AND (? IS NULL OR language = ?) ORDER BY stable_key",
+        )
+        .bind(workspace_id)
+        .bind(name)
+        .bind(language)
+        .bind(language)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn graph_nodes_for_document(
+        &self,
+        workspace_id: &str,
+        document_id: &str,
+    ) -> Result<Vec<GraphNode>> {
+        let rows = sqlx::query_as::<_, GraphNodeRow>(
+            "SELECT id, workspace_id, node_type, stable_key, language, name, qualified_name, document_id, chunk_id, source_path, source_start_byte, source_end_byte, analyzer_id, analyzer_version, structure_version, content_revision, metadata_json, created_at, updated_at FROM graph_nodes WHERE workspace_id = ? AND document_id = ? ORDER BY stable_key",
+        )
+        .bind(workspace_id)
+        .bind(document_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn delete_graph_node(&self, workspace_id: &str, node_id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM graph_nodes WHERE workspace_id = ? AND id = ?")
+            .bind(workspace_id)
+            .bind(node_id)
+            .execute(self.pool())
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn upsert_graph_node(&self, node: &GraphNode) -> Result<GraphNode> {
+        let (source_path, source_start_byte, source_end_byte) =
+            graph_source_segment_bindings(&node.source_segment)?;
+        let mut transaction = self.pool().begin().await?;
+        let conflicting_owner: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM graph_nodes WHERE workspace_id = ? AND stable_key = ? AND document_id IS NOT ?",
+        )
+        .bind(&node.workspace_id)
+        .bind(&node.stable_key)
+        .bind(&node.document_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if conflicting_owner != 0 {
+            return Err(CortexError::Analysis(format!(
+                "graph node stable key {} is already owned by another document",
+                node.stable_key
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO graph_nodes(id, workspace_id, node_type, stable_key, language, name, qualified_name, document_id, chunk_id, source_path, source_start_byte, source_end_byte, analyzer_id, analyzer_version, structure_version, content_revision, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, stable_key) DO UPDATE SET node_type = excluded.node_type, language = excluded.language, name = excluded.name, qualified_name = excluded.qualified_name, document_id = excluded.document_id, chunk_id = excluded.chunk_id, source_path = excluded.source_path, source_start_byte = excluded.source_start_byte, source_end_byte = excluded.source_end_byte, analyzer_id = excluded.analyzer_id, analyzer_version = excluded.analyzer_version, structure_version = excluded.structure_version, content_revision = excluded.content_revision, metadata_json = excluded.metadata_json, updated_at = excluded.updated_at",
+        )
+        .bind(&node.id)
+        .bind(&node.workspace_id)
+        .bind(node.node_type.storage_name())
+        .bind(&node.stable_key)
+        .bind(&node.language)
+        .bind(&node.name)
+        .bind(&node.qualified_name)
+        .bind(&node.document_id)
+        .bind(&node.chunk_id)
+        .bind(source_path)
+        .bind(source_start_byte)
+        .bind(source_end_byte)
+        .bind(&node.analyzer_id)
+        .bind(&node.analyzer_version)
+        .bind(&node.structure_version)
+        .bind(node.content_revision)
+        .bind(serde_json::to_string(&node.metadata)?)
+        .bind(node.created_at)
+        .bind(node.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        self.graph_node_by_stable_key(&node.workspace_id, &node.stable_key)
+            .await?
+            .ok_or_else(|| CortexError::NotFound(format!("graph node {}", node.stable_key)))
+    }
+
+    pub async fn reconcile_graph_nodes_for_document(
+        &self,
+        workspace_id: &str,
+        document_id: &str,
+        nodes: &[GraphNode],
+    ) -> Result<Vec<GraphNode>> {
+        let mut stable_keys = HashSet::with_capacity(nodes.len());
+        for node in nodes {
+            if node.workspace_id != workspace_id || node.document_id.as_deref() != Some(document_id)
+            {
+                return Err(CortexError::Analysis(
+                    "graph node reconciliation crossed a workspace or document boundary".into(),
+                ));
+            }
+            if !stable_keys.insert(node.stable_key.as_str()) {
+                return Err(CortexError::Analysis(format!(
+                    "duplicate graph node stable key {}",
+                    node.stable_key
+                )));
+            }
+        }
+
+        let mut transaction = self.pool().begin().await?;
+        let previous_keys: Vec<String> = sqlx::query_scalar(
+            "SELECT stable_key FROM graph_nodes WHERE workspace_id = ? AND document_id = ?",
+        )
+        .bind(workspace_id)
+        .bind(document_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+
+        for node in nodes {
+            let conflicting_owner: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM graph_nodes WHERE workspace_id = ? AND stable_key = ? AND document_id IS NOT ?",
+            )
+            .bind(workspace_id)
+            .bind(&node.stable_key)
+            .bind(&node.document_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if conflicting_owner != 0 {
+                return Err(CortexError::Analysis(format!(
+                    "graph node stable key {} is already owned by another document",
+                    node.stable_key
+                )));
+            }
+            let (source_path, source_start_byte, source_end_byte) =
+                graph_source_segment_bindings(&node.source_segment)?;
+            sqlx::query(
+                "INSERT INTO graph_nodes(id, workspace_id, node_type, stable_key, language, name, qualified_name, document_id, chunk_id, source_path, source_start_byte, source_end_byte, analyzer_id, analyzer_version, structure_version, content_revision, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, stable_key) DO UPDATE SET node_type = excluded.node_type, language = excluded.language, name = excluded.name, qualified_name = excluded.qualified_name, document_id = excluded.document_id, chunk_id = excluded.chunk_id, source_path = excluded.source_path, source_start_byte = excluded.source_start_byte, source_end_byte = excluded.source_end_byte, analyzer_id = excluded.analyzer_id, analyzer_version = excluded.analyzer_version, structure_version = excluded.structure_version, content_revision = excluded.content_revision, metadata_json = excluded.metadata_json, updated_at = excluded.updated_at",
+            )
+            .bind(&node.id)
+            .bind(&node.workspace_id)
+            .bind(node.node_type.storage_name())
+            .bind(&node.stable_key)
+            .bind(&node.language)
+            .bind(&node.name)
+            .bind(&node.qualified_name)
+            .bind(&node.document_id)
+            .bind(&node.chunk_id)
+            .bind(source_path)
+            .bind(source_start_byte)
+            .bind(source_end_byte)
+            .bind(&node.analyzer_id)
+            .bind(&node.analyzer_version)
+            .bind(&node.structure_version)
+            .bind(node.content_revision)
+            .bind(serde_json::to_string(&node.metadata)?)
+            .bind(node.created_at)
+            .bind(node.updated_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        for previous_key in previous_keys {
+            if !stable_keys.contains(previous_key.as_str()) {
+                sqlx::query(
+                    "DELETE FROM graph_nodes WHERE workspace_id = ? AND document_id = ? AND stable_key = ?",
+                )
+                .bind(workspace_id)
+                .bind(document_id)
+                .bind(previous_key)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+        transaction.commit().await?;
+        self.graph_nodes_for_document(workspace_id, document_id)
+            .await
+    }
+
+    pub async fn graph_edges(&self, workspace_id: &str) -> Result<Vec<GraphEdge>> {
+        let rows = sqlx::query_as::<_, GraphEdgeRow>(
+            "SELECT id, workspace_id, relationship_key, relationship_fact_id, from_node, to_node, edge_type, confidence, analyzer_id, analyzer_version, structure_version, source_document_id, source_path, source_start_byte, source_end_byte, content_revision, metadata_json, created_at FROM graph_edges WHERE workspace_id = ? ORDER BY relationship_key",
+        )
+        .bind(workspace_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub(crate) async fn graph_edges_for_node(
+        &self,
+        workspace_id: &str,
+        node_id: &str,
+        incoming: bool,
+        edge_types: &[GraphEdgeType],
+        limit: usize,
+    ) -> Result<Vec<GraphEdge>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let endpoint = if incoming { "to_node" } else { "from_node" };
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT id, workspace_id, relationship_key, relationship_fact_id, from_node, to_node, edge_type, confidence, analyzer_id, analyzer_version, structure_version, source_document_id, source_path, source_start_byte, source_end_byte, content_revision, metadata_json, created_at FROM graph_edges WHERE workspace_id = ",
+        );
+        query.push_bind(workspace_id);
+        query.push(format!(" AND {endpoint} = "));
+        query.push_bind(node_id);
+        if !edge_types.is_empty() {
+            query.push(" AND edge_type IN (");
+            let mut separated = query.separated(", ");
+            for edge_type in edge_types {
+                separated.push_bind(edge_type.storage_name());
+            }
+            separated.push_unseparated(")");
+        }
+        query.push(" ORDER BY edge_type, relationship_key LIMIT ");
+        query.push_bind(memory_limit(limit)?);
+        let rows = query
+            .build_query_as::<GraphEdgeRow>()
+            .fetch_all(self.pool())
+            .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub(crate) async fn code_candidates_for_graph_node(
+        &self,
+        workspace_id: &str,
+        node_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CodeCandidate>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, CodeCandidateRow>(
+            "SELECT c.id, c.document_id, c.stable_key, c.language, c.symbol, c.qualified_symbol, c.symbol_kind, c.start_byte, c.end_byte, c.start_line, c.end_line, c.content, c.content_hash, c.metadata_json, c.created_at, c.updated_at, d.workspace_id, d.relative_path FROM graph_nodes n JOIN documents d ON d.id = n.document_id AND d.workspace_id = n.workspace_id JOIN chunks c ON c.document_id = n.document_id WHERE n.workspace_id = ? AND n.id = ? ORDER BY CASE WHEN n.source_start_byte IS NOT NULL AND n.source_end_byte IS NOT NULL AND c.start_byte <= n.source_end_byte AND c.end_byte >= n.source_start_byte THEN 0 ELSE 1 END, ABS(c.start_byte - COALESCE(n.source_start_byte, c.start_byte)), (c.end_byte - c.start_byte), c.start_byte, c.id LIMIT ?",
+        )
+        .bind(workspace_id)
+        .bind(node_id)
+        .bind(memory_limit(limit)?)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn upsert_graph_edge(&self, edge: &GraphEdge) -> Result<GraphEdge> {
+        let (source_path, source_start_byte, source_end_byte) =
+            graph_source_segment_bindings(&edge.source_segment)?;
+        sqlx::query(
+            "INSERT INTO graph_edges(id, workspace_id, relationship_key, relationship_fact_id, from_node, to_node, edge_type, confidence, analyzer_id, analyzer_version, structure_version, source_document_id, source_path, source_start_byte, source_end_byte, content_revision, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, relationship_key) DO UPDATE SET relationship_fact_id = excluded.relationship_fact_id, from_node = excluded.from_node, to_node = excluded.to_node, edge_type = excluded.edge_type, confidence = excluded.confidence, analyzer_id = excluded.analyzer_id, analyzer_version = excluded.analyzer_version, structure_version = excluded.structure_version, source_document_id = excluded.source_document_id, source_path = excluded.source_path, source_start_byte = excluded.source_start_byte, source_end_byte = excluded.source_end_byte, content_revision = excluded.content_revision, metadata_json = excluded.metadata_json",
+        )
+        .bind(&edge.id)
+        .bind(&edge.workspace_id)
+        .bind(&edge.relationship_key)
+        .bind(&edge.relationship_fact_id)
+        .bind(&edge.from_node)
+        .bind(&edge.to_node)
+        .bind(edge.edge_type.storage_name())
+        .bind(edge.confidence)
+        .bind(&edge.analyzer_id)
+        .bind(&edge.analyzer_version)
+        .bind(&edge.structure_version)
+        .bind(&edge.source_document_id)
+        .bind(source_path)
+        .bind(source_start_byte)
+        .bind(source_end_byte)
+        .bind(edge.content_revision)
+        .bind(serde_json::to_string(&edge.metadata)?)
+        .bind(edge.created_at)
+        .execute(self.pool())
+        .await?;
+        self.graph_edges(&edge.workspace_id)
+            .await?
+            .into_iter()
+            .find(|stored| stored.relationship_key == edge.relationship_key)
+            .ok_or_else(|| CortexError::NotFound(format!("graph edge {}", edge.relationship_key)))
+    }
+
+    pub async fn graph_relationship_facts(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<GraphRelationshipFact>> {
+        let rows = sqlx::query_as::<_, UnresolvedRelationshipRow>(
+            "SELECT id, workspace_id, source_document_id, relationship_key, from_node, from_stable_key, edge_type, target_kind, target_value, confidence, analyzer_id, analyzer_version, structure_version, source_path, source_start_byte, source_end_byte, content_revision, metadata_json, created_at, updated_at FROM graph_relationship_facts WHERE workspace_id = ? ORDER BY source_document_id, relationship_key",
+        )
+        .bind(workspace_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn upsert_graph_relationship_fact(
+        &self,
+        fact: &GraphRelationshipFact,
+    ) -> Result<GraphRelationshipFact> {
+        let (source_path, source_start_byte, source_end_byte) =
+            graph_source_segment_bindings(&fact.source_segment)?;
+        sqlx::query(
+            "INSERT INTO graph_relationship_facts(id, workspace_id, source_document_id, relationship_key, from_node, from_stable_key, edge_type, target_kind, target_value, confidence, analyzer_id, analyzer_version, structure_version, source_path, source_start_byte, source_end_byte, content_revision, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, source_document_id, relationship_key) DO UPDATE SET from_node = excluded.from_node, from_stable_key = excluded.from_stable_key, edge_type = excluded.edge_type, target_kind = excluded.target_kind, target_value = excluded.target_value, confidence = excluded.confidence, analyzer_id = excluded.analyzer_id, analyzer_version = excluded.analyzer_version, structure_version = excluded.structure_version, source_path = excluded.source_path, source_start_byte = excluded.source_start_byte, source_end_byte = excluded.source_end_byte, content_revision = excluded.content_revision, metadata_json = excluded.metadata_json, updated_at = excluded.updated_at",
+        )
+        .bind(&fact.id)
+        .bind(&fact.workspace_id)
+        .bind(&fact.source_document_id)
+        .bind(&fact.relationship_key)
+        .bind(&fact.from_node)
+        .bind(&fact.from_stable_key)
+        .bind(fact.edge_type.storage_name())
+        .bind(fact.target_kind.storage_name())
+        .bind(&fact.target_value)
+        .bind(fact.confidence)
+        .bind(&fact.analyzer_id)
+        .bind(&fact.analyzer_version)
+        .bind(&fact.structure_version)
+        .bind(source_path)
+        .bind(source_start_byte)
+        .bind(source_end_byte)
+        .bind(fact.content_revision)
+        .bind(serde_json::to_string(&fact.metadata)?)
+        .bind(fact.created_at)
+        .bind(fact.updated_at)
+        .execute(self.pool())
+        .await?;
+        self.graph_relationship_facts(&fact.workspace_id)
+            .await?
+            .into_iter()
+            .find(|stored| {
+                stored.source_document_id == fact.source_document_id
+                    && stored.relationship_key == fact.relationship_key
+            })
+            .ok_or_else(|| {
+                CortexError::NotFound(format!("graph relationship fact {}", fact.relationship_key))
+            })
+    }
+
+    pub async fn unresolved_relationships(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<UnresolvedRelationship>> {
+        let rows = sqlx::query_as::<_, UnresolvedRelationshipRow>(
+            "SELECT id, workspace_id, source_document_id, relationship_key, from_node, from_stable_key, edge_type, target_kind, target_value, confidence, analyzer_id, analyzer_version, structure_version, source_path, source_start_byte, source_end_byte, content_revision, metadata_json, created_at, updated_at FROM unresolved_relationships WHERE workspace_id = ? ORDER BY source_document_id, relationship_key",
+        )
+        .bind(workspace_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn upsert_unresolved_relationship(
+        &self,
+        relationship: &UnresolvedRelationship,
+    ) -> Result<UnresolvedRelationship> {
+        let (source_path, source_start_byte, source_end_byte) =
+            graph_source_segment_bindings(&relationship.source_segment)?;
+        sqlx::query(
+            "INSERT INTO unresolved_relationships(id, workspace_id, source_document_id, relationship_key, from_node, from_stable_key, edge_type, target_kind, target_value, confidence, analyzer_id, analyzer_version, structure_version, source_path, source_start_byte, source_end_byte, content_revision, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, source_document_id, relationship_key) DO UPDATE SET from_node = excluded.from_node, from_stable_key = excluded.from_stable_key, edge_type = excluded.edge_type, target_kind = excluded.target_kind, target_value = excluded.target_value, confidence = excluded.confidence, analyzer_id = excluded.analyzer_id, analyzer_version = excluded.analyzer_version, structure_version = excluded.structure_version, source_path = excluded.source_path, source_start_byte = excluded.source_start_byte, source_end_byte = excluded.source_end_byte, content_revision = excluded.content_revision, metadata_json = excluded.metadata_json, updated_at = excluded.updated_at",
+        )
+        .bind(&relationship.id)
+        .bind(&relationship.workspace_id)
+        .bind(&relationship.source_document_id)
+        .bind(&relationship.relationship_key)
+        .bind(&relationship.from_node)
+        .bind(&relationship.from_stable_key)
+        .bind(relationship.edge_type.storage_name())
+        .bind(relationship.target_kind.storage_name())
+        .bind(&relationship.target_value)
+        .bind(relationship.confidence)
+        .bind(&relationship.analyzer_id)
+        .bind(&relationship.analyzer_version)
+        .bind(&relationship.structure_version)
+        .bind(source_path)
+        .bind(source_start_byte)
+        .bind(source_end_byte)
+        .bind(relationship.content_revision)
+        .bind(serde_json::to_string(&relationship.metadata)?)
+        .bind(relationship.created_at)
+        .bind(relationship.updated_at)
+        .execute(self.pool())
+        .await?;
+        self.unresolved_relationships(&relationship.workspace_id)
+            .await?
+            .into_iter()
+            .find(|stored| {
+                stored.source_document_id == relationship.source_document_id
+                    && stored.relationship_key == relationship.relationship_key
+            })
+            .ok_or_else(|| {
+                CortexError::NotFound(format!(
+                    "unresolved relationship {}",
+                    relationship.relationship_key
+                ))
+            })
+    }
+
+    pub async fn insert_unresolved_relationship_candidate(
+        &self,
+        relationship_id: &str,
+        workspace_id: &str,
+        candidate_node_id: &str,
+        created_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO unresolved_relationship_candidates(unresolved_relationship_id, workspace_id, candidate_node_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(unresolved_relationship_id, candidate_node_id) DO NOTHING",
+        )
+        .bind(relationship_id)
+        .bind(workspace_id)
+        .bind(candidate_node_id)
+        .bind(created_at)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn apply_graph_reconciliation(
+        &self,
+        batch: &GraphReconciliationBatch,
+        updated_at: DateTime<Utc>,
+    ) -> Result<GraphReconciliationStatus> {
+        validate_graph_reconciliation_batch(batch)?;
+        let mut transaction = self.pool().begin().await?;
+        let (current_revision, graph_state, graph_update_started_at, graph_updated_at): (
+            i64,
+            String,
+            Option<DateTime<Utc>>,
+            DateTime<Utc>,
+        ) = sqlx::query_as(
+            "SELECT content_revision, graph_state, graph_update_started_at, updated_at FROM workspace_graph_revisions WHERE workspace_id = ?",
+        )
+        .bind(&batch.workspace_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let expected_revision = if batch.delete_relative_path.is_some() {
+            batch
+                .target_content_revision
+                .checked_sub(1)
+                .ok_or_else(|| {
+                    CortexError::Analysis("graph deletion target revision must be positive".into())
+                })?
+        } else {
+            batch.target_content_revision
+        };
+        if current_revision != expected_revision {
+            transaction.rollback().await?;
+            return Ok(GraphReconciliationStatus::Superseded);
+        }
+        let owns_snapshot = match (
+            batch.delete_relative_path.as_ref(),
+            batch.expected_graph_updated_at,
+            batch.update_started_at,
+        ) {
+            (Some(_), Some(expected), None) => graph_updated_at == expected,
+            (None, None, Some(started_at)) => {
+                graph_state == "updating" && graph_update_started_at == Some(started_at)
+            }
+            _ => false,
+        };
+        if !owns_snapshot {
+            transaction.rollback().await?;
+            return Ok(GraphReconciliationStatus::Superseded);
+        }
+
+        if let Some(state) = &batch.analysis_state {
+            let source_is_current: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM documents WHERE id = ? AND workspace_id = ? AND content_revision = ? AND analyzer_id = ? AND analyzer_version = ?",
+            )
+            .bind(&state.document_id)
+            .bind(&state.workspace_id)
+            .bind(state.content_revision)
+            .bind(&state.analyzer_id)
+            .bind(&state.analyzer_version)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if source_is_current != 1 {
+                transaction.rollback().await?;
+                return Ok(GraphReconciliationStatus::Superseded);
+            }
+        }
+
+        if let Some(relative_path) = &batch.delete_relative_path {
+            let deleted =
+                sqlx::query("DELETE FROM documents WHERE workspace_id = ? AND relative_path = ?")
+                    .bind(&batch.workspace_id)
+                    .bind(relative_path)
+                    .execute(&mut *transaction)
+                    .await?;
+            if deleted.rows_affected() != 1 {
+                transaction.rollback().await?;
+                return Ok(GraphReconciliationStatus::Superseded);
+            }
+            let revision =
+                bump_content_revision(&mut transaction, &batch.workspace_id, updated_at).await?;
+            if revision != batch.target_content_revision {
+                return Err(CortexError::Analysis(format!(
+                    "graph deletion produced content revision {revision}, expected {}",
+                    batch.target_content_revision
+                )));
+            }
+        }
+
+        if let Some(document_id) = &batch.source_document_id {
+            let previous_node_keys: Vec<String> = sqlx::query_scalar(
+                "SELECT stable_key FROM graph_nodes WHERE workspace_id = ? AND document_id = ?",
+            )
+            .bind(&batch.workspace_id)
+            .bind(document_id)
+            .fetch_all(&mut *transaction)
+            .await?;
+            let next_node_keys: HashSet<_> = batch
+                .nodes
+                .iter()
+                .map(|node| node.stable_key.as_str())
+                .collect();
+
+            for node in &batch.nodes {
+                let conflicting_owner: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM graph_nodes WHERE workspace_id = ? AND stable_key = ? AND document_id IS NOT ?",
+                )
+                .bind(&batch.workspace_id)
+                .bind(&node.stable_key)
+                .bind(document_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+                if conflicting_owner != 0 {
+                    return Err(CortexError::Analysis(format!(
+                        "graph node stable key {} is already owned by another document",
+                        node.stable_key
+                    )));
+                }
+                let (source_path, source_start_byte, source_end_byte) =
+                    graph_source_segment_bindings(&node.source_segment)?;
+                sqlx::query(
+                    "INSERT INTO graph_nodes(id, workspace_id, node_type, stable_key, language, name, qualified_name, document_id, chunk_id, source_path, source_start_byte, source_end_byte, analyzer_id, analyzer_version, structure_version, content_revision, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, stable_key) DO UPDATE SET node_type = excluded.node_type, language = excluded.language, name = excluded.name, qualified_name = excluded.qualified_name, document_id = excluded.document_id, chunk_id = excluded.chunk_id, source_path = excluded.source_path, source_start_byte = excluded.source_start_byte, source_end_byte = excluded.source_end_byte, analyzer_id = excluded.analyzer_id, analyzer_version = excluded.analyzer_version, structure_version = excluded.structure_version, content_revision = excluded.content_revision, metadata_json = excluded.metadata_json, updated_at = excluded.updated_at",
+                )
+                .bind(&node.id)
+                .bind(&node.workspace_id)
+                .bind(node.node_type.storage_name())
+                .bind(&node.stable_key)
+                .bind(&node.language)
+                .bind(&node.name)
+                .bind(&node.qualified_name)
+                .bind(&node.document_id)
+                .bind(&node.chunk_id)
+                .bind(source_path)
+                .bind(source_start_byte)
+                .bind(source_end_byte)
+                .bind(&node.analyzer_id)
+                .bind(&node.analyzer_version)
+                .bind(&node.structure_version)
+                .bind(node.content_revision)
+                .bind(serde_json::to_string(&node.metadata)?)
+                .bind(node.created_at)
+                .bind(node.updated_at)
+                .execute(&mut *transaction)
+                .await?;
+            }
+
+            let previous_fact_keys: Vec<String> = sqlx::query_scalar(
+                "SELECT relationship_key FROM graph_relationship_facts WHERE workspace_id = ? AND source_document_id = ?",
+            )
+            .bind(&batch.workspace_id)
+            .bind(document_id)
+            .fetch_all(&mut *transaction)
+            .await?;
+            let next_fact_keys: HashSet<_> = batch
+                .facts
+                .iter()
+                .map(|fact| fact.relationship_key.as_str())
+                .collect();
+            for fact in &batch.facts {
+                let (source_path, source_start_byte, source_end_byte) =
+                    graph_source_segment_bindings(&fact.source_segment)?;
+                sqlx::query(
+                    "INSERT INTO graph_relationship_facts(id, workspace_id, source_document_id, relationship_key, from_node, from_stable_key, edge_type, target_kind, target_value, confidence, analyzer_id, analyzer_version, structure_version, source_path, source_start_byte, source_end_byte, content_revision, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, source_document_id, relationship_key) DO UPDATE SET from_node = excluded.from_node, from_stable_key = excluded.from_stable_key, edge_type = excluded.edge_type, target_kind = excluded.target_kind, target_value = excluded.target_value, confidence = excluded.confidence, analyzer_id = excluded.analyzer_id, analyzer_version = excluded.analyzer_version, structure_version = excluded.structure_version, source_path = excluded.source_path, source_start_byte = excluded.source_start_byte, source_end_byte = excluded.source_end_byte, content_revision = excluded.content_revision, metadata_json = excluded.metadata_json, updated_at = excluded.updated_at",
+                )
+                .bind(&fact.id)
+                .bind(&fact.workspace_id)
+                .bind(&fact.source_document_id)
+                .bind(&fact.relationship_key)
+                .bind(&fact.from_node)
+                .bind(&fact.from_stable_key)
+                .bind(fact.edge_type.storage_name())
+                .bind(fact.target_kind.storage_name())
+                .bind(&fact.target_value)
+                .bind(fact.confidence)
+                .bind(&fact.analyzer_id)
+                .bind(&fact.analyzer_version)
+                .bind(&fact.structure_version)
+                .bind(source_path)
+                .bind(source_start_byte)
+                .bind(source_end_byte)
+                .bind(fact.content_revision)
+                .bind(serde_json::to_string(&fact.metadata)?)
+                .bind(fact.created_at)
+                .bind(fact.updated_at)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            for previous_key in previous_fact_keys {
+                if !next_fact_keys.contains(previous_key.as_str()) {
+                    sqlx::query(
+                        "DELETE FROM graph_relationship_facts WHERE workspace_id = ? AND source_document_id = ? AND relationship_key = ?",
+                    )
+                    .bind(&batch.workspace_id)
+                    .bind(document_id)
+                    .bind(previous_key)
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+            }
+            for previous_key in previous_node_keys {
+                if !next_node_keys.contains(previous_key.as_str()) {
+                    sqlx::query(
+                        "DELETE FROM graph_nodes WHERE workspace_id = ? AND document_id = ? AND stable_key = ?",
+                    )
+                    .bind(&batch.workspace_id)
+                    .bind(document_id)
+                    .bind(previous_key)
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+            }
+        }
+
+        for identity in &batch.affected_relationships {
+            sqlx::query(
+                "DELETE FROM graph_edges WHERE workspace_id = ? AND source_document_id = ? AND relationship_key = ?",
+            )
+            .bind(&batch.workspace_id)
+            .bind(&identity.source_document_id)
+            .bind(&identity.relationship_key)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "DELETE FROM unresolved_relationships WHERE workspace_id = ? AND source_document_id = ? AND relationship_key = ?",
+            )
+            .bind(&batch.workspace_id)
+            .bind(&identity.source_document_id)
+            .bind(&identity.relationship_key)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        for edge in &batch.edges {
+            let (source_path, source_start_byte, source_end_byte) =
+                graph_source_segment_bindings(&edge.source_segment)?;
+            sqlx::query(
+                "INSERT INTO graph_edges(id, workspace_id, relationship_key, relationship_fact_id, from_node, to_node, edge_type, confidence, analyzer_id, analyzer_version, structure_version, source_document_id, source_path, source_start_byte, source_end_byte, content_revision, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&edge.id)
+            .bind(&edge.workspace_id)
+            .bind(&edge.relationship_key)
+            .bind(&edge.relationship_fact_id)
+            .bind(&edge.from_node)
+            .bind(&edge.to_node)
+            .bind(edge.edge_type.storage_name())
+            .bind(edge.confidence)
+            .bind(&edge.analyzer_id)
+            .bind(&edge.analyzer_version)
+            .bind(&edge.structure_version)
+            .bind(&edge.source_document_id)
+            .bind(source_path)
+            .bind(source_start_byte)
+            .bind(source_end_byte)
+            .bind(edge.content_revision)
+            .bind(serde_json::to_string(&edge.metadata)?)
+            .bind(edge.created_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        for projection in &batch.unresolved {
+            let relationship = &projection.relationship;
+            let (source_path, source_start_byte, source_end_byte) =
+                graph_source_segment_bindings(&relationship.source_segment)?;
+            sqlx::query(
+                "INSERT INTO unresolved_relationships(id, workspace_id, source_document_id, relationship_key, from_node, from_stable_key, edge_type, target_kind, target_value, confidence, analyzer_id, analyzer_version, structure_version, source_path, source_start_byte, source_end_byte, content_revision, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&relationship.id)
+            .bind(&relationship.workspace_id)
+            .bind(&relationship.source_document_id)
+            .bind(&relationship.relationship_key)
+            .bind(&relationship.from_node)
+            .bind(&relationship.from_stable_key)
+            .bind(relationship.edge_type.storage_name())
+            .bind(relationship.target_kind.storage_name())
+            .bind(&relationship.target_value)
+            .bind(relationship.confidence)
+            .bind(&relationship.analyzer_id)
+            .bind(&relationship.analyzer_version)
+            .bind(&relationship.structure_version)
+            .bind(source_path)
+            .bind(source_start_byte)
+            .bind(source_end_byte)
+            .bind(relationship.content_revision)
+            .bind(serde_json::to_string(&relationship.metadata)?)
+            .bind(relationship.created_at)
+            .bind(relationship.updated_at)
+            .execute(&mut *transaction)
+            .await?;
+            for candidate_node_id in &projection.candidate_node_ids {
+                sqlx::query(
+                    "INSERT INTO unresolved_relationship_candidates(unresolved_relationship_id, workspace_id, candidate_node_id, created_at) VALUES (?, ?, ?, ?)",
+                )
+                .bind(&relationship.id)
+                .bind(&batch.workspace_id)
+                .bind(candidate_node_id)
+                .bind(updated_at)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+
+        if let Some(state) = &batch.analysis_state {
+            sqlx::query(
+                "INSERT INTO graph_document_states(document_id, workspace_id, content_revision, analyzer_id, analyzer_version, structure_version, last_error, analyzed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(document_id) DO UPDATE SET workspace_id = excluded.workspace_id, content_revision = excluded.content_revision, analyzer_id = excluded.analyzer_id, analyzer_version = excluded.analyzer_version, structure_version = excluded.structure_version, last_error = excluded.last_error, analyzed_at = excluded.analyzed_at",
+            )
+            .bind(&state.document_id)
+            .bind(&state.workspace_id)
+            .bind(state.content_revision)
+            .bind(&state.analyzer_id)
+            .bind(&state.analyzer_version)
+            .bind(&state.structure_version)
+            .bind(&state.last_error)
+            .bind(state.analyzed_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        let analysis_rows = sqlx::query_as::<_, GraphAnalysisSnapshotRow>(
+            "SELECT d.id AS document_id, d.analyzer_id AS document_analyzer_id, d.analyzer_version AS document_analyzer_version, d.content_revision AS document_content_revision, s.content_revision AS state_content_revision, s.analyzer_id AS state_analyzer_id, s.analyzer_version AS state_analyzer_version, s.structure_version AS state_structure_version, s.last_error AS state_last_error FROM documents d LEFT JOIN graph_document_states s ON s.document_id = d.id AND s.workspace_id = d.workspace_id WHERE d.workspace_id = ?",
+        )
+        .bind(&batch.workspace_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let analysis_by_document: HashMap<_, _> = analysis_rows
+            .iter()
+            .map(|row| (row.document_id.as_str(), row))
+            .collect();
+        let expectations_match = analysis_by_document.len() == batch.expected_analysis.len()
+            && batch.expected_analysis.iter().all(|expectation| {
+                analysis_by_document
+                    .get(expectation.document_id.as_str())
+                    .is_some_and(|row| {
+                        row.document_analyzer_id == expectation.analyzer_id
+                            && row.document_analyzer_version == expectation.analyzer_version
+                            && row.state_content_revision == Some(row.document_content_revision)
+                            && row.state_analyzer_id.as_deref()
+                                == Some(expectation.analyzer_id.as_str())
+                            && row.state_analyzer_version.as_deref()
+                                == Some(expectation.analyzer_version.as_str())
+                            && row.state_structure_version.as_deref()
+                                == Some(expectation.structure_version.as_str())
+                            && row.state_last_error.is_none()
+                    })
+            });
+        let status = if expectations_match {
+            let updated = sqlx::query(
+                "UPDATE workspace_graph_revisions SET graph_content_revision = ?, graph_state = 'current', graph_update_started_at = NULL, failed_graph_target_revision = NULL, last_graph_error = NULL, updated_at = ? WHERE workspace_id = ? AND content_revision = ? AND graph_content_revision <= ?",
+            )
+            .bind(batch.target_content_revision)
+            .bind(updated_at)
+            .bind(&batch.workspace_id)
+            .bind(batch.target_content_revision)
+            .bind(batch.target_content_revision)
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() != 1 {
+                transaction.rollback().await?;
+                return Ok(GraphReconciliationStatus::Superseded);
+            }
+            GraphReconciliationStatus::Current
+        } else {
+            sqlx::query(
+                "UPDATE workspace_graph_revisions SET graph_state = 'stale', graph_update_started_at = NULL, updated_at = ? WHERE workspace_id = ? AND content_revision = ?",
+            )
+            .bind(updated_at)
+            .bind(&batch.workspace_id)
+            .bind(batch.target_content_revision)
+            .execute(&mut *transaction)
+            .await?;
+            GraphReconciliationStatus::Stale
+        };
+        transaction.commit().await?;
+        Ok(status)
+    }
+
     pub async fn persist_document_tree(
         &self,
         document: &Document,
@@ -1350,8 +2559,19 @@ impl SqliteStorage {
         embeddings: &[EmbeddingRecord],
         removed_chunk_ids: &[String],
         reset_chunks: bool,
-    ) -> Result<()> {
+        content_index_changed: bool,
+    ) -> Result<i64> {
         let mut transaction = self.pool().begin().await?;
+        let content_revision = if content_index_changed {
+            bump_content_revision(
+                &mut transaction,
+                &document.workspace_id,
+                document.indexed_at,
+            )
+            .await?
+        } else {
+            document.content_revision
+        };
         if reset_chunks {
             sqlx::query("DELETE FROM chunks WHERE document_id = ?")
                 .bind(&document.id)
@@ -1367,7 +2587,7 @@ impl SqliteStorage {
             }
         }
         sqlx::query(
-            "INSERT INTO documents(id, workspace_id, relative_path, language, analyzer_id, analyzer_version, segmentation_id, content_hash, size_bytes, modified_at_ns, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, relative_path) DO UPDATE SET language = excluded.language, analyzer_id = excluded.analyzer_id, analyzer_version = excluded.analyzer_version, segmentation_id = excluded.segmentation_id, content_hash = excluded.content_hash, size_bytes = excluded.size_bytes, modified_at_ns = excluded.modified_at_ns, indexed_at = excluded.indexed_at",
+            "INSERT INTO documents(id, workspace_id, relative_path, language, analyzer_id, analyzer_version, segmentation_id, content_revision, content_hash, size_bytes, modified_at_ns, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, relative_path) DO UPDATE SET language = excluded.language, analyzer_id = excluded.analyzer_id, analyzer_version = excluded.analyzer_version, segmentation_id = excluded.segmentation_id, content_revision = excluded.content_revision, content_hash = excluded.content_hash, size_bytes = excluded.size_bytes, modified_at_ns = excluded.modified_at_ns, indexed_at = excluded.indexed_at",
         )
         .bind(&document.id)
         .bind(&document.workspace_id)
@@ -1376,6 +2596,7 @@ impl SqliteStorage {
         .bind(&document.analyzer_id)
         .bind(&document.analyzer_version)
         .bind(&document.segmentation_id)
+        .bind(content_revision)
         .bind(&document.content_hash)
         .bind(document.size_bytes)
         .bind(document.modified_at_ns)
@@ -1418,7 +2639,7 @@ impl SqliteStorage {
             .await?;
         }
         transaction.commit().await?;
-        Ok(())
+        Ok(content_revision)
     }
 }
 
@@ -1505,6 +2726,177 @@ fn stored_source_segment(path: &str, start_byte: i64, end_byte: i64) -> Option<S
     (start_byte < end_byte).then(|| SourceSegment::new(path, start_byte, end_byte))
 }
 
+fn validate_graph_reconciliation_batch(batch: &GraphReconciliationBatch) -> Result<()> {
+    if batch.workspace_id.trim().is_empty() || batch.target_content_revision < 0 {
+        return Err(CortexError::Analysis(
+            "graph reconciliation requires a workspace and non-negative target revision".into(),
+        ));
+    }
+    if batch.delete_relative_path.is_some() && batch.source_document_id.is_some() {
+        return Err(CortexError::Analysis(
+            "graph reconciliation cannot update and delete a source document together".into(),
+        ));
+    }
+    match (
+        batch.delete_relative_path.as_ref(),
+        batch.expected_graph_updated_at,
+        batch.update_started_at,
+    ) {
+        (Some(_), Some(_), None) | (None, None, Some(_)) => {}
+        _ => {
+            return Err(CortexError::Analysis(
+                "graph reconciliation has an invalid snapshot ownership token".into(),
+            ));
+        }
+    }
+    let mut node_keys = HashSet::new();
+    for node in &batch.nodes {
+        if node.workspace_id != batch.workspace_id
+            || node.document_id.as_deref() != batch.source_document_id.as_deref()
+            || !node_keys.insert(node.stable_key.as_str())
+        {
+            return Err(CortexError::Analysis(
+                "graph reconciliation contains invalid or duplicate source nodes".into(),
+            ));
+        }
+    }
+    let mut fact_keys = HashSet::new();
+    for fact in &batch.facts {
+        if fact.workspace_id != batch.workspace_id
+            || Some(fact.source_document_id.as_str()) != batch.source_document_id.as_deref()
+            || !fact_keys.insert(fact.relationship_key.as_str())
+        {
+            return Err(CortexError::Analysis(
+                "graph reconciliation contains invalid or duplicate source facts".into(),
+            ));
+        }
+    }
+    if let Some(state) = &batch.analysis_state
+        && (state.workspace_id != batch.workspace_id
+            || Some(state.document_id.as_str()) != batch.source_document_id.as_deref())
+    {
+        return Err(CortexError::Analysis(
+            "graph analysis state does not match its reconciliation target".into(),
+        ));
+    }
+    let mut expected_documents = HashSet::new();
+    for expectation in &batch.expected_analysis {
+        if expectation.document_id.trim().is_empty()
+            || expectation.analyzer_id.trim().is_empty()
+            || expectation.analyzer_version.trim().is_empty()
+            || expectation.structure_version.trim().is_empty()
+            || !expected_documents.insert(expectation.document_id.as_str())
+        {
+            return Err(CortexError::Analysis(
+                "graph reconciliation contains invalid analysis expectations".into(),
+            ));
+        }
+    }
+
+    let mut affected = HashSet::new();
+    for identity in &batch.affected_relationships {
+        if !affected.insert((
+            identity.source_document_id.as_str(),
+            identity.relationship_key.as_str(),
+        )) {
+            return Err(CortexError::Analysis(
+                "graph reconciliation contains duplicate affected relationships".into(),
+            ));
+        }
+    }
+    let mut projected = HashSet::new();
+    let mut edge_ids = HashSet::new();
+    for edge in &batch.edges {
+        let Some(source_document_id) = edge.source_document_id.as_deref() else {
+            return Err(CortexError::Analysis(
+                "resolved graph projections require source ownership".into(),
+            ));
+        };
+        let identity = (source_document_id, edge.relationship_key.as_str());
+        if edge.workspace_id != batch.workspace_id
+            || !affected.contains(&identity)
+            || !projected.insert(identity)
+            || !edge_ids.insert(edge.id.as_str())
+        {
+            return Err(CortexError::Analysis(
+                "resolved graph projections do not match the affected relationship set".into(),
+            ));
+        }
+    }
+    let mut unresolved_ids = HashSet::new();
+    for projection in &batch.unresolved {
+        let relationship = &projection.relationship;
+        let identity = (
+            relationship.source_document_id.as_str(),
+            relationship.relationship_key.as_str(),
+        );
+        let mut candidate_ids = HashSet::new();
+        if relationship.workspace_id != batch.workspace_id
+            || !affected.contains(&identity)
+            || !projected.insert(identity)
+            || !unresolved_ids.insert(relationship.id.as_str())
+            || projection
+                .candidate_node_ids
+                .iter()
+                .any(|id| !candidate_ids.insert(id.as_str()))
+        {
+            return Err(CortexError::Analysis(
+                "unresolved graph projections do not match the affected relationship set".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn graph_source_segment_bindings(
+    segment: &Option<SourceSegment>,
+) -> Result<(Option<String>, Option<i64>, Option<i64>)> {
+    let Some(segment) = segment else {
+        return Ok((None, None, None));
+    };
+    let start_byte = i64::try_from(segment.start_byte).map_err(|_| {
+        CortexError::Analysis("graph source segment start exceeds SQLite range".into())
+    })?;
+    let end_byte = i64::try_from(segment.end_byte).map_err(|_| {
+        CortexError::Analysis("graph source segment end exceeds SQLite range".into())
+    })?;
+    if end_byte < start_byte {
+        return Err(CortexError::Analysis(
+            "graph source segment ends before it starts".into(),
+        ));
+    }
+    Ok((
+        Some(segment.source.clone()),
+        Some(start_byte),
+        Some(end_byte),
+    ))
+}
+
+fn graph_source_segment_from_columns(
+    source_path: Option<String>,
+    source_start_byte: Option<i64>,
+    source_end_byte: Option<i64>,
+) -> Result<Option<SourceSegment>> {
+    match (source_path, source_start_byte, source_end_byte) {
+        (None, None, None) => Ok(None),
+        (Some(source), Some(start_byte), Some(end_byte)) => {
+            let start_byte = u64::try_from(start_byte)
+                .map_err(|_| CortexError::Analysis("negative graph source segment start".into()))?;
+            let end_byte = u64::try_from(end_byte)
+                .map_err(|_| CortexError::Analysis("negative graph source segment end".into()))?;
+            if end_byte < start_byte {
+                return Err(CortexError::Analysis(
+                    "graph source segment ends before it starts".into(),
+                ));
+            }
+            Ok(Some(SourceSegment::new(source, start_byte, end_byte)))
+        }
+        _ => Err(CortexError::Analysis(
+            "incomplete graph source segment columns".into(),
+        )),
+    }
+}
+
 async fn insert_document<'e, E>(executor: E, document: &Document) -> Result<()>
 where
     E: sqlx::Executor<'e, Database = Sqlite>,
@@ -1526,6 +2918,21 @@ where
     .execute(executor)
     .await?;
     Ok(())
+}
+
+async fn bump_content_revision(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    workspace_id: &str,
+    updated_at: DateTime<Utc>,
+) -> Result<i64> {
+    let revision = sqlx::query_scalar::<_, i64>(
+        "UPDATE workspace_graph_revisions SET content_revision = content_revision + 1, graph_state = 'stale', graph_update_started_at = NULL, failed_graph_target_revision = NULL, last_graph_error = NULL, updated_at = ? WHERE workspace_id = ? RETURNING content_revision",
+    )
+    .bind(updated_at)
+    .bind(workspace_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(revision)
 }
 
 async fn insert_chunk<'e, E>(executor: E, chunk: &StoredChunk) -> Result<()>
@@ -1678,6 +3085,7 @@ struct DocumentRow {
     analyzer_id: String,
     analyzer_version: String,
     segmentation_id: String,
+    content_revision: i64,
     content_hash: String,
     size_bytes: i64,
     modified_at_ns: Option<i64>,
@@ -1694,11 +3102,238 @@ impl From<DocumentRow> for Document {
             analyzer_id: row.analyzer_id,
             analyzer_version: row.analyzer_version,
             segmentation_id: row.segmentation_id,
+            content_revision: row.content_revision,
             content_hash: row.content_hash,
             size_bytes: row.size_bytes,
             modified_at_ns: row.modified_at_ns,
             indexed_at: row.indexed_at,
         }
+    }
+}
+
+#[derive(FromRow)]
+struct WorkspaceGraphRevisionRow {
+    workspace_id: String,
+    content_revision: i64,
+    graph_content_revision: i64,
+    graph_schema_version: i64,
+    graph_state: String,
+    graph_update_started_at: Option<DateTime<Utc>>,
+    failed_graph_target_revision: Option<i64>,
+    last_graph_error: Option<String>,
+    updated_at: DateTime<Utc>,
+}
+
+impl TryFrom<WorkspaceGraphRevisionRow> for WorkspaceGraphRevision {
+    type Error = CortexError;
+
+    fn try_from(row: WorkspaceGraphRevisionRow) -> Result<Self> {
+        if row.content_revision < 0
+            || row.graph_content_revision < 0
+            || row.graph_content_revision > row.content_revision
+            || row.graph_schema_version <= 0
+        {
+            return Err(CortexError::Analysis(
+                "invalid persisted workspace graph revision".into(),
+            ));
+        }
+        Ok(Self {
+            workspace_id: row.workspace_id,
+            content_revision: row.content_revision,
+            graph_content_revision: row.graph_content_revision,
+            graph_schema_version: row.graph_schema_version,
+            graph_state: GraphState::from_storage(&row.graph_state),
+            graph_update_started_at: row.graph_update_started_at,
+            failed_graph_target_revision: row.failed_graph_target_revision,
+            last_graph_error: row.last_graph_error,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
+#[derive(FromRow)]
+struct GraphAnalysisStateRow {
+    document_id: String,
+    workspace_id: String,
+    content_revision: i64,
+    analyzer_id: String,
+    analyzer_version: String,
+    structure_version: String,
+    last_error: Option<String>,
+    analyzed_at: DateTime<Utc>,
+}
+
+impl From<GraphAnalysisStateRow> for GraphAnalysisState {
+    fn from(row: GraphAnalysisStateRow) -> Self {
+        Self {
+            document_id: row.document_id,
+            workspace_id: row.workspace_id,
+            content_revision: row.content_revision,
+            analyzer_id: row.analyzer_id,
+            analyzer_version: row.analyzer_version,
+            structure_version: row.structure_version,
+            last_error: row.last_error,
+            analyzed_at: row.analyzed_at,
+        }
+    }
+}
+
+#[derive(FromRow)]
+struct GraphNodeRow {
+    id: String,
+    workspace_id: String,
+    node_type: String,
+    stable_key: String,
+    language: Option<String>,
+    name: String,
+    qualified_name: Option<String>,
+    document_id: Option<String>,
+    chunk_id: Option<String>,
+    source_path: Option<String>,
+    source_start_byte: Option<i64>,
+    source_end_byte: Option<i64>,
+    analyzer_id: String,
+    analyzer_version: String,
+    structure_version: String,
+    content_revision: i64,
+    metadata_json: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl TryFrom<GraphNodeRow> for GraphNode {
+    type Error = CortexError;
+
+    fn try_from(row: GraphNodeRow) -> Result<Self> {
+        Ok(Self {
+            id: row.id,
+            workspace_id: row.workspace_id,
+            node_type: GraphNodeType::from_storage(&row.node_type),
+            stable_key: row.stable_key,
+            language: row.language,
+            name: row.name,
+            qualified_name: row.qualified_name,
+            document_id: row.document_id,
+            chunk_id: row.chunk_id,
+            source_segment: graph_source_segment_from_columns(
+                row.source_path,
+                row.source_start_byte,
+                row.source_end_byte,
+            )?,
+            analyzer_id: row.analyzer_id,
+            analyzer_version: row.analyzer_version,
+            structure_version: row.structure_version,
+            content_revision: row.content_revision,
+            metadata: serde_json::from_str(&row.metadata_json)?,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
+#[derive(FromRow)]
+struct GraphEdgeRow {
+    id: String,
+    workspace_id: String,
+    relationship_key: String,
+    relationship_fact_id: Option<String>,
+    from_node: String,
+    to_node: String,
+    edge_type: String,
+    confidence: f32,
+    analyzer_id: String,
+    analyzer_version: String,
+    structure_version: String,
+    source_document_id: Option<String>,
+    source_path: Option<String>,
+    source_start_byte: Option<i64>,
+    source_end_byte: Option<i64>,
+    content_revision: i64,
+    metadata_json: String,
+    created_at: DateTime<Utc>,
+}
+
+impl TryFrom<GraphEdgeRow> for GraphEdge {
+    type Error = CortexError;
+
+    fn try_from(row: GraphEdgeRow) -> Result<Self> {
+        Ok(Self {
+            id: row.id,
+            workspace_id: row.workspace_id,
+            relationship_key: row.relationship_key,
+            relationship_fact_id: row.relationship_fact_id,
+            from_node: row.from_node,
+            to_node: row.to_node,
+            edge_type: GraphEdgeType::from_storage(&row.edge_type),
+            confidence: row.confidence,
+            analyzer_id: row.analyzer_id,
+            analyzer_version: row.analyzer_version,
+            structure_version: row.structure_version,
+            source_document_id: row.source_document_id,
+            source_segment: graph_source_segment_from_columns(
+                row.source_path,
+                row.source_start_byte,
+                row.source_end_byte,
+            )?,
+            content_revision: row.content_revision,
+            metadata: serde_json::from_str(&row.metadata_json)?,
+            created_at: row.created_at,
+        })
+    }
+}
+
+#[derive(FromRow)]
+struct UnresolvedRelationshipRow {
+    id: String,
+    workspace_id: String,
+    source_document_id: String,
+    relationship_key: String,
+    from_node: Option<String>,
+    from_stable_key: String,
+    edge_type: String,
+    target_kind: String,
+    target_value: String,
+    confidence: f32,
+    analyzer_id: String,
+    analyzer_version: String,
+    structure_version: String,
+    source_path: Option<String>,
+    source_start_byte: Option<i64>,
+    source_end_byte: Option<i64>,
+    content_revision: i64,
+    metadata_json: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl TryFrom<UnresolvedRelationshipRow> for UnresolvedRelationship {
+    type Error = CortexError;
+
+    fn try_from(row: UnresolvedRelationshipRow) -> Result<Self> {
+        Ok(Self {
+            id: row.id,
+            workspace_id: row.workspace_id,
+            source_document_id: row.source_document_id,
+            relationship_key: row.relationship_key,
+            from_node: row.from_node,
+            from_stable_key: row.from_stable_key,
+            edge_type: GraphEdgeType::from_storage(&row.edge_type),
+            target_kind: RelationshipTargetKind::from_storage(&row.target_kind),
+            target_value: row.target_value,
+            confidence: row.confidence,
+            analyzer_id: row.analyzer_id,
+            analyzer_version: row.analyzer_version,
+            structure_version: row.structure_version,
+            source_segment: graph_source_segment_from_columns(
+                row.source_path,
+                row.source_start_byte,
+                row.source_end_byte,
+            )?,
+            content_revision: row.content_revision,
+            metadata: serde_json::from_str(&row.metadata_json)?,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
     }
 }
 
@@ -2265,7 +3900,267 @@ impl From<TemporalCandidateRow> for TemporalCandidate {
 mod tests {
     use tempfile::tempdir;
 
+    use crate::domain::{GraphEdgeType, GraphNode, GraphNodeType, UnresolvedRelationship};
+
     use super::*;
+
+    #[tokio::test]
+    async fn graph_storage_enforces_workspace_isolation_and_preserves_node_identity() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let first_workspace = Workspace::new("C:/first", "first");
+        let second_workspace = Workspace::new("C:/second", "second");
+        storage.insert_workspace(&first_workspace).await.unwrap();
+        storage.insert_workspace(&second_workspace).await.unwrap();
+
+        let first_document = Document::new(&first_workspace.id, "src/lib.rs");
+        let second_document = Document::new(&second_workspace.id, "src/lib.rs");
+        storage.insert_document(&first_document).await.unwrap();
+        storage.insert_document(&second_document).await.unwrap();
+
+        let mut first_node = GraphNode::new(
+            &first_workspace.id,
+            GraphNodeType::Function,
+            "symbol:tree-sitter-rust:src/lib.rs::function:run",
+            "run",
+        );
+        first_node.document_id = Some(first_document.id.clone());
+        let first_node = storage.upsert_graph_node(&first_node).await.unwrap();
+
+        let mut replacement = first_node.clone();
+        replacement.id = uuid::Uuid::new_v4().to_string();
+        replacement.qualified_name = Some("crate::run".into());
+        replacement.updated_at = Utc::now();
+        let replacement = storage.upsert_graph_node(&replacement).await.unwrap();
+        assert_eq!(replacement.id, first_node.id);
+        assert_eq!(replacement.qualified_name.as_deref(), Some("crate::run"));
+
+        let mut second_node = GraphNode::new(
+            &second_workspace.id,
+            GraphNodeType::Function,
+            "symbol:tree-sitter-rust:src/lib.rs::function:run",
+            "run",
+        );
+        second_node.document_id = Some(second_document.id.clone());
+        let second_node = storage.upsert_graph_node(&second_node).await.unwrap();
+
+        let cross_workspace_edge = GraphEdge::new(
+            &first_workspace.id,
+            "first-to-second",
+            &first_node.id,
+            &second_node.id,
+            GraphEdgeType::Calls,
+        );
+        assert!(
+            storage
+                .upsert_graph_edge(&cross_workspace_edge)
+                .await
+                .is_err()
+        );
+
+        let mut unresolved = UnresolvedRelationship::new(
+            &first_workspace.id,
+            &first_document.id,
+            "ambiguous-run",
+            &first_node.stable_key,
+            GraphEdgeType::Calls,
+            RelationshipTargetKind::QualifiedSymbol,
+            "run",
+        );
+        unresolved.from_node = Some(first_node.id.clone());
+        let unresolved = storage
+            .upsert_unresolved_relationship(&unresolved)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .insert_unresolved_relationship_candidate(
+                    &unresolved.id,
+                    &first_workspace.id,
+                    &second_node.id,
+                    Utc::now(),
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn source_revisions_advance_only_for_committed_source_index_changes() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let workspace = Workspace::new("C:/project", "project");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let initial = storage
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.content_revision, 0);
+        assert!(initial.is_current());
+
+        let document = Document::new(&workspace.id, "src/lib.rs");
+        storage
+            .apply_document_reconciliation(&document, &[], &[], &[], false, true)
+            .await
+            .unwrap();
+        let changed = storage
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.content_revision, 1);
+        assert_eq!(changed.graph_content_revision, 0);
+        assert_eq!(changed.graph_state, GraphState::Stale);
+
+        assert!(
+            storage
+                .acknowledge_graph_revision(&workspace.id, 1, Utc::now())
+                .await
+                .unwrap()
+        );
+        let acknowledged = storage
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(acknowledged.is_current());
+
+        let mut unchanged = document.clone();
+        unchanged.content_revision = 1;
+        storage
+            .apply_document_reconciliation(&unchanged, &[], &[], &[], false, false)
+            .await
+            .unwrap();
+        let no_op = storage
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(no_op.content_revision, 1);
+        assert!(no_op.is_current());
+    }
+
+    #[tokio::test]
+    async fn stale_graph_compare_and_swap_does_not_mutate_the_graph() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let workspace = Workspace::new("C:/project", "project");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let document = Document::new(&workspace.id, "src/lib.rs");
+        storage
+            .apply_document_reconciliation(&document, &[], &[], &[], false, true)
+            .await
+            .unwrap();
+        let mut node = GraphNode::new(
+            &workspace.id,
+            GraphNodeType::Function,
+            "symbol:test:run",
+            "run",
+        );
+        node.document_id = Some(document.id.clone());
+        let batch = GraphReconciliationBatch {
+            workspace_id: workspace.id.clone(),
+            target_content_revision: 0,
+            expected_graph_updated_at: None,
+            update_started_at: Some(Utc::now()),
+            delete_relative_path: None,
+            source_document_id: Some(document.id.clone()),
+            nodes: vec![node],
+            facts: Vec::new(),
+            analysis_state: None,
+            expected_analysis: Vec::new(),
+            affected_relationships: Vec::new(),
+            edges: Vec::new(),
+            unresolved: Vec::new(),
+        };
+
+        assert_eq!(
+            storage
+                .apply_graph_reconciliation(&batch, Utc::now())
+                .await
+                .unwrap(),
+            GraphReconciliationStatus::Superseded
+        );
+        assert!(storage.graph_nodes(&workspace.id).await.unwrap().is_empty());
+        let revision = storage
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision.content_revision, 1);
+        assert_eq!(revision.graph_content_revision, 0);
+        assert_eq!(revision.graph_state, GraphState::Stale);
+    }
+
+    #[tokio::test]
+    async fn same_revision_graph_batches_require_the_current_update_token() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let workspace = Workspace::new("C:/project", "project");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let document = Document::new(&workspace.id, "src/lib.rs");
+        storage
+            .apply_document_reconciliation(&document, &[], &[], &[], false, true)
+            .await
+            .unwrap();
+        let snapshot = storage
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_token = snapshot.updated_at + chrono::Duration::milliseconds(1);
+        assert!(
+            storage
+                .mark_graph_updating_if_current(
+                    &workspace.id,
+                    snapshot.content_revision,
+                    snapshot.updated_at,
+                    first_token,
+                )
+                .await
+                .unwrap()
+        );
+        let second_token = first_token + chrono::Duration::milliseconds(1);
+        assert!(
+            storage
+                .mark_graph_updating_if_current(
+                    &workspace.id,
+                    snapshot.content_revision,
+                    first_token,
+                    second_token,
+                )
+                .await
+                .unwrap()
+        );
+        let batch = GraphReconciliationBatch {
+            workspace_id: workspace.id.clone(),
+            target_content_revision: snapshot.content_revision,
+            expected_graph_updated_at: None,
+            update_started_at: Some(first_token),
+            delete_relative_path: None,
+            source_document_id: None,
+            nodes: Vec::new(),
+            facts: Vec::new(),
+            analysis_state: None,
+            expected_analysis: Vec::new(),
+            affected_relationships: Vec::new(),
+            edges: Vec::new(),
+            unresolved: Vec::new(),
+        };
+
+        assert_eq!(
+            storage
+                .apply_graph_reconciliation(&batch, Utc::now())
+                .await
+                .unwrap(),
+            GraphReconciliationStatus::Superseded
+        );
+        let revision = storage
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision.graph_state, GraphState::Updating);
+        assert_eq!(revision.graph_update_started_at, Some(second_token));
+        assert!(storage.graph_nodes(&workspace.id).await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn persists_across_restart_and_cascades_workspace_data() {
@@ -2363,6 +4258,7 @@ mod tests {
                     &[invalid_embedding],
                     &[],
                     false,
+                    true,
                 )
                 .await
                 .is_err()

@@ -5,11 +5,11 @@ use std::{
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cortexweave::{
-    AppConfig, CortexError, CortexWeaveService, Result,
+    AppConfig, CortexError, CortexWeaveService, Result, WorkspaceGraphStatus,
     adapters::mcp::{McpServer, WorkspaceHint},
     domain::{
         Checkpoint, ContextRequest, ContextSourceType, MemoryKind, MemoryRecord,
-        ResumeContextRequest,
+        ResumeContextRequest, StructuralReadOptions,
     },
     workspace::WorkspaceSelector,
 };
@@ -45,6 +45,10 @@ enum Command {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    Graph {
+        #[command(subcommand)]
+        command: GraphCommand,
+    },
     Search(SearchArgs),
     Context(ContextArgs),
     Resume(ResumeArgs),
@@ -78,6 +82,91 @@ enum WorkspaceCommand {
         name: Option<String>,
     },
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum GraphCommand {
+    Status {
+        workspace_id: String,
+    },
+    Find {
+        workspace_id: String,
+        symbol_or_path: String,
+        #[command(flatten)]
+        options: GraphReadArgs,
+    },
+    Neighbors {
+        workspace_id: String,
+        node_id: String,
+        #[command(flatten)]
+        options: GraphReadArgs,
+    },
+    Callers {
+        workspace_id: String,
+        node_id: String,
+        #[command(flatten)]
+        options: GraphReadArgs,
+    },
+    Callees {
+        workspace_id: String,
+        node_id: String,
+        #[command(flatten)]
+        options: GraphReadArgs,
+    },
+    References {
+        workspace_id: String,
+        node_id: String,
+        #[command(flatten)]
+        options: GraphReadArgs,
+    },
+    Implementations {
+        workspace_id: String,
+        node_id: String,
+        #[command(flatten)]
+        options: GraphReadArgs,
+    },
+    Tests {
+        workspace_id: String,
+        node_id: String,
+        #[command(flatten)]
+        options: GraphReadArgs,
+    },
+    Dependencies {
+        workspace_id: String,
+        node_id: String,
+        #[command(flatten)]
+        options: GraphReadArgs,
+    },
+    Dependents {
+        workspace_id: String,
+        node_id: String,
+        #[command(flatten)]
+        options: GraphReadArgs,
+    },
+    ImpactSymbol {
+        workspace_id: String,
+        symbol: String,
+        #[command(flatten)]
+        options: GraphReadArgs,
+    },
+    ImpactPath {
+        workspace_id: String,
+        path: String,
+        #[command(flatten)]
+        options: GraphReadArgs,
+    },
+}
+
+#[derive(Debug, Args)]
+struct GraphReadArgs {
+    #[arg(long)]
+    allow_stale: bool,
+    #[arg(long)]
+    max_nodes: Option<usize>,
+    #[arg(long)]
+    max_edges: Option<usize>,
+    #[arg(long)]
+    max_depth: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -250,6 +339,8 @@ struct DoctorReport {
     registered_analyzers: Vec<String>,
     grammar_initialization: Check,
     watcher: Check,
+    graph: Check,
+    graph_workspaces: Vec<GraphWorkspaceCheck>,
     workspaces: Vec<WorkspaceCheck>,
 }
 
@@ -265,6 +356,13 @@ struct WorkspaceCheck {
     root_path: String,
     root_exists: bool,
     root_is_directory: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphWorkspaceCheck {
+    id: String,
+    status: Option<WorkspaceGraphStatus>,
+    error: Option<String>,
 }
 
 #[tokio::main]
@@ -297,6 +395,7 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
                 && report.workspace_resolution.ok
                 && report.grammar_initialization.ok
                 && report.watcher.ok
+                && report.graph.ok
                 && report
                     .workspaces
                     .iter()
@@ -339,6 +438,110 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
                 print_json(service.register_workspace(root_path, name).await?)?;
             }
             WorkspaceCommand::List => print_json(service.list_workspaces().await?)?,
+        },
+        Command::Graph { command } => match command {
+            GraphCommand::Status { workspace_id } => {
+                print_json(service.workspace_graph_status(&workspace_id).await?)?
+            }
+            GraphCommand::Find {
+                workspace_id,
+                symbol_or_path,
+                options,
+            } => print_json(
+                service
+                    .graph_find_symbol(&workspace_id, &symbol_or_path, &graph_read_options(options))
+                    .await?,
+            )?,
+            GraphCommand::Neighbors {
+                workspace_id,
+                node_id,
+                options,
+            } => print_json(
+                service
+                    .graph_neighbors(&workspace_id, &node_id, &graph_read_options(options))
+                    .await?,
+            )?,
+            GraphCommand::Callers {
+                workspace_id,
+                node_id,
+                options,
+            } => print_json(
+                service
+                    .graph_callers(&workspace_id, &node_id, &graph_read_options(options))
+                    .await?,
+            )?,
+            GraphCommand::Callees {
+                workspace_id,
+                node_id,
+                options,
+            } => print_json(
+                service
+                    .graph_callees(&workspace_id, &node_id, &graph_read_options(options))
+                    .await?,
+            )?,
+            GraphCommand::References {
+                workspace_id,
+                node_id,
+                options,
+            } => print_json(
+                service
+                    .graph_references(&workspace_id, &node_id, &graph_read_options(options))
+                    .await?,
+            )?,
+            GraphCommand::Implementations {
+                workspace_id,
+                node_id,
+                options,
+            } => print_json(
+                service
+                    .graph_implementations(&workspace_id, &node_id, &graph_read_options(options))
+                    .await?,
+            )?,
+            GraphCommand::Tests {
+                workspace_id,
+                node_id,
+                options,
+            } => print_json(
+                service
+                    .graph_tests(&workspace_id, &node_id, &graph_read_options(options))
+                    .await?,
+            )?,
+            GraphCommand::Dependencies {
+                workspace_id,
+                node_id,
+                options,
+            } => print_json(
+                service
+                    .graph_dependencies(&workspace_id, &node_id, &graph_read_options(options))
+                    .await?,
+            )?,
+            GraphCommand::Dependents {
+                workspace_id,
+                node_id,
+                options,
+            } => print_json(
+                service
+                    .graph_dependents(&workspace_id, &node_id, &graph_read_options(options))
+                    .await?,
+            )?,
+            GraphCommand::ImpactSymbol {
+                workspace_id,
+                symbol,
+                options,
+            } => print_json(
+                service
+                    .graph_impact_symbol(&workspace_id, &symbol, &graph_read_options(options))
+                    .await?,
+            )?,
+            GraphCommand::ImpactPath {
+                workspace_id,
+                path,
+                options,
+            } => print_json(
+                service
+                    .graph_impact_path(&workspace_id, &path, &graph_read_options(options))
+                    .await?,
+            )?,
         },
         Command::Search(args) => {
             let limit = args.limit.unwrap_or(service.config().retrieval.default_k);
@@ -486,6 +689,16 @@ fn serve_workspace_hint(argument: Option<PathBuf>) -> Option<WorkspaceHint> {
         .map(WorkspaceHint::RootPath)
 }
 
+fn graph_read_options(args: GraphReadArgs) -> StructuralReadOptions {
+    let defaults = StructuralReadOptions::default();
+    StructuralReadOptions {
+        allow_stale: args.allow_stale,
+        max_nodes: args.max_nodes.unwrap_or(defaults.max_nodes),
+        max_edges: args.max_edges.unwrap_or(defaults.max_edges),
+        max_depth: args.max_depth.unwrap_or(defaults.max_depth),
+    }
+}
+
 async fn doctor(service: &CortexWeaveService) -> DoctorReport {
     let database = check(
         service.storage().health_check().await,
@@ -629,6 +842,47 @@ async fn doctor(service: &CortexWeaveService) -> DoctorReport {
             .all(|workspace| workspace.root_is_directory),
         detail: "all registered workspace roots are available for watcher startup".into(),
     };
+    let mut graph_workspaces = Vec::with_capacity(workspaces.len());
+    for workspace in &workspaces {
+        match service.workspace_graph_status(&workspace.id).await {
+            Ok(status) => graph_workspaces.push(GraphWorkspaceCheck {
+                id: workspace.id.clone(),
+                status: Some(status),
+                error: None,
+            }),
+            Err(error) => graph_workspaces.push(GraphWorkspaceCheck {
+                id: workspace.id.clone(),
+                status: None,
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+    let graph = Check {
+        ok: graph_workspaces.iter().all(|workspace| {
+            workspace.error.is_none()
+                && workspace
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.is_current)
+        }),
+        detail: if graph_workspaces.is_empty() {
+            "no workspaces are registered".into()
+        } else {
+            let current = graph_workspaces
+                .iter()
+                .filter(|workspace| {
+                    workspace
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.is_current)
+                })
+                .count();
+            format!(
+                "{current}/{} workspace graph projections are current",
+                graph_workspaces.len()
+            )
+        },
+    };
     DoctorReport {
         config: Check {
             ok: true,
@@ -643,6 +897,8 @@ async fn doctor(service: &CortexWeaveService) -> DoctorReport {
         registered_analyzers,
         grammar_initialization,
         watcher,
+        graph,
+        graph_workspaces,
         workspaces,
     }
 }

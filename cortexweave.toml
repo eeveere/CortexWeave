@@ -42,6 +42,19 @@ default_k = 8
 semantic_weight = 0.70
 lexical_weight = 0.30
 
+[retrieval.structural]
+enabled = true
+weight = 0.20
+max_depth = 3
+candidate_limit = 32
+distance_decay = 0.65
+calls_weight = 1.0
+references_weight = 0.8
+implementations_weight = 1.0
+tests_weight = 1.0
+dependencies_weight = 0.8
+other_weight = 0.6
+
 [context]
 candidate_pool_limit = 50
 structural_expansion_limit = 4

@@ -24,7 +24,7 @@ mod tests {
     use super::*;
 
     fn chunks(analyzer: &dyn LanguageAnalyzer, path: &str, source: &str) -> Vec<AnalyzedChunk> {
-        analyzer.analyze(Path::new(path), source).unwrap()
+        analyzer.analyze(Path::new(path), source).unwrap().chunks
     }
 
     fn key_for(chunks: &[AnalyzedChunk], symbol: &str) -> String {
@@ -88,6 +88,60 @@ mod tests {
             assert!(chunk.qualified_symbol.as_deref().unwrap().contains(method));
             assert!(chunk.start_byte < chunk.end_byte);
             assert!(chunk.start_line <= chunk.end_line);
+        }
+    }
+
+    #[test]
+    fn structured_analyzers_emit_symbols_and_foundational_relationships() {
+        let cases: Vec<(&dyn LanguageAnalyzer, &str, &str)> = vec![
+            (
+                &RustAnalyzer,
+                "src/lib.rs",
+                "struct Engine; impl Engine { fn run(&self) {} }",
+            ),
+            (
+                &PythonAnalyzer,
+                "engine.py",
+                "class Engine:\n    def run(self):\n        pass\n",
+            ),
+            (
+                &JavaScriptAnalyzer,
+                "engine.js",
+                "class Engine { run() {} }",
+            ),
+            (
+                &TypeScriptAnalyzer,
+                "engine.ts",
+                "class Engine { run(): void {} }",
+            ),
+            (
+                &CSharpAnalyzer,
+                "Engine.cs",
+                "class Engine { void Run() {} }",
+            ),
+            (
+                &GoAnalyzer,
+                "engine.go",
+                "package engine\ntype Engine struct{}\nfunc (e Engine) Run() {}",
+            ),
+        ];
+        for (analyzer, path, source) in cases {
+            let result = analyzer.analyze(Path::new(path), source).unwrap();
+            assert!(!result.chunks.is_empty());
+            assert!(!result.symbols.is_empty());
+            assert!(
+                result
+                    .relationships
+                    .iter()
+                    .any(|relationship| relationship.relationship
+                        == crate::domain::GraphEdgeType::Contains)
+            );
+            assert!(result.relationships.iter().any(|relationship| {
+                relationship.relationship == crate::domain::GraphEdgeType::DeclaredIn
+            }));
+            assert!(!analyzer.structure_version().is_empty());
+            assert!(analyzer.capabilities().contains);
+            assert!(analyzer.capabilities().declared_in);
         }
     }
 

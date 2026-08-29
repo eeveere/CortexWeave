@@ -1,3 +1,6 @@
 mod service;
 
-pub use service::{RetrievalResult, RetrievalScores, RetrievalService, RetrievalSource};
+pub use service::{
+    RetrievalResult, RetrievalScores, RetrievalService, RetrievalSource,
+    StructuralRetrievalEvidence,
+};

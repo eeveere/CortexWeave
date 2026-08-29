@@ -4,7 +4,7 @@ use serde_json::json;
 
 use crate::{
     Result,
-    domain::{AnalyzedChunk, AnalyzerCapabilities},
+    domain::{AnalysisResult, AnalyzedChunk, AnalyzerCapabilities},
 };
 
 use super::LanguageAnalyzer;
@@ -43,6 +43,9 @@ impl LanguageAnalyzer for GenericAnalyzer {
             self.target_chars, self.overlap_chars
         )
     }
+    fn structure_version(&self) -> String {
+        "generic-structure:v1".into()
+    }
     fn extensions(&self) -> &'static [&'static str] {
         &[]
     }
@@ -50,42 +53,44 @@ impl LanguageAnalyzer for GenericAnalyzer {
         AnalyzerCapabilities::default()
     }
 
-    fn analyze(&self, path: &Path, source: &str) -> Result<Vec<AnalyzedChunk>> {
+    fn analyze(&self, path: &Path, source: &str) -> Result<AnalysisResult> {
         if source.is_empty() {
-            return Ok(Vec::new());
+            return Ok(AnalysisResult::default());
         }
 
         let boundaries = chunk_boundaries(source, self.target_chars, self.overlap_chars);
         let path = path.to_string_lossy().replace('\\', "/");
-        Ok(boundaries
-            .into_iter()
-            .enumerate()
-            .map(|(index, (start, end))| {
-                let start_line = source[..start]
-                    .bytes()
-                    .filter(|byte| *byte == b'\n')
-                    .count()
-                    + 1;
-                let end_line = start_line
-                    + source[start..end]
+        Ok(AnalysisResult::chunks_only(
+            boundaries
+                .into_iter()
+                .enumerate()
+                .map(|(index, (start, end))| {
+                    let start_line = source[..start]
                         .bytes()
                         .filter(|byte| *byte == b'\n')
-                        .count();
-                AnalyzedChunk {
-                    stable_key: format!("{path}::text:{index}"),
-                    language: "text".into(),
-                    symbol: None,
-                    qualified_symbol: None,
-                    symbol_kind: None,
-                    start_byte: start,
-                    end_byte: end,
-                    start_line,
-                    end_line,
-                    content: source[start..end].to_owned(),
-                    metadata: json!({"chunk_index": index}),
-                }
-            })
-            .collect())
+                        .count()
+                        + 1;
+                    let end_line = start_line
+                        + source[start..end]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count();
+                    AnalyzedChunk {
+                        stable_key: format!("{path}::text:{index}"),
+                        language: "text".into(),
+                        symbol: None,
+                        qualified_symbol: None,
+                        symbol_kind: None,
+                        start_byte: start,
+                        end_byte: end,
+                        start_line,
+                        end_line,
+                        content: source[start..end].to_owned(),
+                        metadata: json!({"chunk_index": index}),
+                    }
+                })
+                .collect(),
+        ))
     }
 }
 
@@ -164,9 +169,17 @@ mod tests {
         let chunks = analyzer
             .analyze(Path::new("notes.md"), "alpha βeta gamma")
             .unwrap();
-        assert!(chunks.len() > 1);
-        assert!(chunks.iter().all(|chunk| !chunk.content.is_empty()));
-        assert!(chunks.iter().all(|chunk| chunk.start_byte < chunk.end_byte));
+        assert!(chunks.chunks.len() > 1);
+        assert!(chunks.chunks.iter().all(|chunk| !chunk.content.is_empty()));
+        assert!(
+            chunks
+                .chunks
+                .iter()
+                .all(|chunk| chunk.start_byte < chunk.end_byte)
+        );
+        assert!(chunks.symbols.is_empty());
+        assert!(chunks.relationships.is_empty());
+        assert_eq!(analyzer.capabilities(), AnalyzerCapabilities::default());
     }
 
     #[test]
