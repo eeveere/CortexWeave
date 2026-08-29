@@ -2,10 +2,10 @@
 
 # CortexWeave
 
-CortexWeave v0.3 is a local-first context substrate for coding agents and
-harnesses. It indexes registered workspaces, keeps explicit memory with durable
-provenance, and returns bounded, explainable context packets through a CLI and
-MCP over stdio.
+CortexWeave v0.4 is a local-first context substrate for coding agents and
+harnesses. It indexes registered workspaces, keeps explicit memory and a
+durable structural code graph with provenance, and returns bounded, explainable
+context packets through a CLI and MCP over stdio.
 
 It is not an agent harness. CortexWeave does not invoke reasoning models,
 execute tools, or orchestrate agent loops. A harness such as Crush decides when
@@ -14,6 +14,14 @@ to call it and owns any subsequent tool use.
 ## What It Provides
 
 - Semantic, lexical, and hybrid retrieval over code and documents.
+- A persistent, incrementally reconciled structural graph with normalized
+  symbols, typed code relationships, provenance, revisions, and freshness
+  state.
+- Exact symbol and path lookup; callers, callees, references, implementations,
+  dependencies, dependents, likely direct-call tests, and bounded impact
+  analysis.
+- Graph-aware context that retains bounded structural evidence without
+  displacing required task, checkpoint, or pinned context.
 - Token-bounded context packets assembled from code, documents, trusted
   memories, events, and task or session state.
 - Working sets, pins, checkpoints, and resume context for long-running work.
@@ -73,6 +81,17 @@ target/release/cortexweave --config cortexweave.toml readiness <workspace-id>
    using `docs/mcp-setup.md`. The hint lets ordinary MCP calls omit the UUID; it
    never registers a workspace automatically.
 
+7. Inspect the structural graph after indexing:
+
+```text
+target/release/cortexweave --config cortexweave.toml graph status <workspace-id>
+target/release/cortexweave --config cortexweave.toml graph find <workspace-id> <symbol-or-path>
+```
+
+   Use `graph find` to obtain an exact node ID before requesting relationships
+   or impact. Graph reads require a current projection by default; pass
+   `--allow-stale` only when a caller can safely accept a stale result.
+
 For multiple Crush projects, follow
 [Using CortexWeave with More Than One Crush Project](docs/crush-workspaces.md).
 Use [`.crushrc.example`](.crushrc.example) as the project-local Crush template.
@@ -93,6 +112,8 @@ Use [`.crushrc.example`](.crushrc.example) as the project-local Crush template.
 - `docs/memory-integrity.md`: imported-memory trust and consolidation policy
 - `docs/v0.3-plan.md`: completed v0.3 delivery plan
 - `docs/native-adapter.md`: direct-harness compatibility constraints
+- `docs/graph-architecture.md`: structural graph semantics, provenance, freshness, and extension boundaries
+- `docs/v0.5-release-boundary.md`: accepted verified-experience scope for the next release
 
 ## Context and Memory Boundaries
 
