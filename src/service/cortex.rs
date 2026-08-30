@@ -12,10 +12,11 @@ use crate::{
     AppConfig, CortexError, Result,
     domain::{
         Checkpoint, ContextCandidatePool, ContextPacket, ContextPin, ContextRequest,
-        ContextSourceType, CortexEvent, Document, EventType, ImpactReport, MemoryOrigin,
-        MemoryRecord, MemorySupersession, MemoryTrust, MemoryTrustReview, ResumeContext,
-        ResumeContextRequest, Session, StructuralReadOptions, StructuralResult, Task, TaskStatus,
-        TemporalContextItem, TemporalQuery, WorkingSetEntry, WorkingSetSnapshot, Workspace,
+        ContextSourceType, CortexEvent, Document, EventType, GraphRepairMode, GraphRepairOutcome,
+        ImpactReport, MemoryOrigin, MemoryRecord, MemorySupersession, MemoryTrust,
+        MemoryTrustReview, ResumeContext, ResumeContextRequest, Session, StructuralReadOptions,
+        StructuralResult, Task, TaskStatus, TemporalContextItem, TemporalQuery, WorkingSetEntry,
+        WorkingSetSnapshot, Workspace,
     },
     embedding::{
         EmbeddingLimits, EmbeddingProvider, OpenAiCompatibleEmbeddingProvider, TokenCount,
@@ -75,6 +76,7 @@ pub struct WorkspaceStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceGraphStatus {
     pub revision: Option<crate::domain::WorkspaceGraphRevision>,
+    pub repair: Option<crate::domain::GraphRepairGeneration>,
     pub is_current: bool,
     pub nodes: usize,
     pub edges: usize,
@@ -408,10 +410,30 @@ impl CortexWeaveService {
         workspace_id: &str,
         documents: &[Document],
     ) -> Result<WorkspaceGraphStatus> {
-        let revision = match self.storage.workspace_graph_revision(workspace_id).await? {
-            Some(_) => Some(self.structural.graph_snapshot(workspace_id, true).await?),
-            None => None,
-        };
+        let mut revision = self.storage.workspace_graph_revision(workspace_id).await?;
+        let repair = self.storage.workspace_graph_repair(workspace_id).await?;
+        if let Some(snapshot) = &mut revision
+            && snapshot.is_current()
+        {
+            for document in documents {
+                let analyzer = self.analyzers.for_path(Path::new(&document.relative_path));
+                let state_is_current = self
+                    .storage
+                    .graph_analysis_state(&document.id)
+                    .await?
+                    .is_some_and(|state| {
+                        state.content_revision == document.content_revision
+                            && state.analyzer_id == analyzer.analyzer_id()
+                            && state.analyzer_version == analyzer.analyzer_version()
+                            && state.structure_version == analyzer.structure_version()
+                            && state.last_error.is_none()
+                    });
+                if !state_is_current {
+                    snapshot.graph_state = crate::domain::GraphState::Stale;
+                    break;
+                }
+            }
+        }
         let (nodes, edges, unresolved_relationships) =
             self.storage.workspace_graph_counts(workspace_id).await?;
         let language_counts: BTreeMap<_, _> = self
@@ -451,8 +473,12 @@ impl CortexWeaveService {
         Ok(WorkspaceGraphStatus {
             is_current: revision
                 .as_ref()
-                .is_some_and(|revision| revision.is_current()),
+                .is_some_and(|revision| revision.is_current())
+                && !repair
+                    .as_ref()
+                    .is_some_and(|repair| repair.state.blocks_structural_reads()),
             revision,
+            repair,
             nodes,
             edges,
             unresolved_relationships,
@@ -628,6 +654,15 @@ impl CortexWeaveService {
     pub async fn workspace_reindex(&self, workspace_id: &str) -> Result<WorkspaceReindexOutcome> {
         let workspace = self.require_workspace(workspace_id).await?;
         self.indexing.reindex_workspace(&workspace).await
+    }
+
+    pub async fn workspace_graph_repair(
+        &self,
+        workspace_id: &str,
+        mode: GraphRepairMode,
+    ) -> Result<GraphRepairOutcome> {
+        let workspace = self.require_workspace(workspace_id).await?;
+        self.indexing.repair_graph(&workspace, mode).await
     }
 
     pub async fn semantic_search(

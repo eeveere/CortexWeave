@@ -1459,6 +1459,29 @@ fn build_context_packet(
             .then_with(|| candidate_order(&candidates[*left], &candidates[*right]))
     });
 
+    if let Some(index) = candidate_indexes.iter().copied().find(|index| {
+        let candidate = &candidates[*index];
+        !candidate.structural_evidence.is_empty()
+            && !selected_keys.contains(&candidate_key(candidate))
+            && !is_redundant_code(candidate, &items)
+    }) {
+        let candidate = &candidates[index];
+        let structural_budget = category_budgets[BudgetCategory::Structural.index()]
+            .saturating_sub(category_usage[BudgetCategory::Structural.index()])
+            .min(token_budget.saturating_sub(used_tokens));
+        if let Some(item) =
+            context_item_for_budget(candidate, structural_budget, true, token_counter)
+        {
+            record_selected_item(
+                &mut items,
+                &mut selected_keys,
+                &mut category_usage,
+                &mut used_tokens,
+                item,
+            );
+        }
+    }
+
     for index in &candidate_indexes {
         let candidate = &candidates[*index];
         if selected_keys.contains(&candidate_key(candidate)) || is_redundant_code(candidate, &items)
@@ -1627,7 +1650,7 @@ fn candidate_value(candidate: &ContextCandidate, estimated_tokens: usize) -> f32
 fn budget_category(candidate: &ContextCandidate) -> BudgetCategory {
     match candidate.source_type {
         ContextSourceType::Code | ContextSourceType::Document => {
-            if candidate.scores.structural > 0.0 {
+            if candidate.scores.structural > 0.0 || !candidate.structural_evidence.is_empty() {
                 BudgetCategory::Structural
             } else {
                 BudgetCategory::Code
@@ -1745,7 +1768,7 @@ fn record_selected_item(
 ) {
     let category = match item.source_type {
         ContextSourceType::Code | ContextSourceType::Document => {
-            if item.scores.structural > 0.0 {
+            if item.scores.structural > 0.0 || !item.structural_evidence.is_empty() {
                 BudgetCategory::Structural
             } else {
                 BudgetCategory::Code

@@ -927,3 +927,130 @@ multiple matches remain ambiguous, and external classification requires an
 explicit analyzer-provided root. This keeps language-specific syntax and module
 semantics out of the indexing core while allowing ordinary local imports to
 resolve against canonical workspace paths.
+
+## D064: Release Identity Is Diagnostic and the Upgrade Floor Is Explicit
+
+**Status:** Accepted
+
+The v0.4.1 operational release aligns the Cargo package version, binary
+`--version` output, release checkpoint, and release notes on `0.4.1`. Earlier
+roadmap labels that differed from the package manifest remain historical
+metadata. Neither a roadmap label nor the Cargo package version may select a
+migration, repair path, compatibility classification, or persisted-data rewrite.
+Those decisions use validated migration history and the identities of the
+affected persisted components.
+
+The supported database floor is any intact SQLx-validated prefix of the bundled
+migration history beginning at `0001_initial.sql`. The primary populated
+pre-graph qualification state ends at `0004_memory_integrity.sql`; the graph
+domain begins at `0005_graph_domain.sql`, with `0006_graph_repair_generations.sql`
+adding durable graph-repair ownership and per-document projection manifests. A fixture ending at `0003` proves that
+the current binary applies the real `0004`, `0005`, and `0006` transitions in one open,
+while a populated `0001` fixture proves the entire supported chain. Missing,
+modified, or newer migration history fails closed before application writes.
+
+OPiHype and Crush are named v0.4.1 operational evaluation environments only.
+They may supply release evidence, but core and application policy remain
+workspace-generic and contain no branches for either client or repository.
+
+## D065: Graph Repair Is Serialized In Place and Incomplete Generations Are Unreadable
+
+**Status:** Accepted
+
+v0.4.1 uses serialized in-place reprojection rather than a duplicate staged
+graph. One durable workspace repair generation owns `if_needed` or `force` work
+for one target content revision. The generation carries an unguessable owner
+token, mode, target revision, lifecycle state, start and lease times, progress,
+and bounded failure provenance. Per-document projection remains atomic under the
+existing D055 compare-and-swap contract, while the repair generation remains
+active across all document transactions. A new migration is justified because
+the current watermark cannot distinguish active, abandoned, failed-partial, and
+complete same-revision repair.
+
+The repair planner records a per-document projection expectation sufficient to
+detect missing projection rows, not only a compatible analysis-state row. The
+exact schema is a Phase 1 decision, but final promotion must prove every indexed
+document has the expected analysis identity and complete projection manifest for
+the target revision. Only one transaction that still owns the generation may
+promote the workspace to `Current` and complete the generation.
+
+Current-only structural reads reject every active, failed-partial, or abandoned
+repair generation. Explicit stale reads may use the last coherent projection
+when the graph is stale or failed and no in-place generation has begun mutating
+it. From repair lease acquisition until successful completion, explicit stale
+reads also fail; after interruption or failure they remain unavailable because
+the persisted graph may contain a mixed generation. Status, doctor, and repair
+diagnostics remain readable throughout. Semantic and lexical retrieval continue,
+while graph-aware retrieval omits structural evidence under the same rule.
+
+This availability tradeoff is accepted for v0.4.1. It avoids graph-table
+duplication and unbounded database growth while preserving revision truth. A
+forced rebuild of a current graph therefore creates a bounded structural-read
+outage. A later staged-generation design requires new evidence and a separate
+decision; it is not implemented speculatively.
+
+Phase 4 will make watcher, manual reindex, and explicit rebuild acquire the same
+generation lease through the application service. A competing caller never writes around
+the owner: it reports in-progress work or, after a winning generation completes,
+that convergence was completed elsewhere. Lease expiry and takeover use a
+durable compare-and-swap rule. A process restart does not clear an owner merely
+because another process opened the database; only an expired lease can become an
+explicit interrupted generation and be resumed or replaced.
+
+## D066: Repair Ownership Is Fenced at Every Graph Mutation Boundary
+
+**Status:** Accepted
+
+Breakpoint 1 confirmed that generation identity alone is insufficient: lease
+validity and incomplete-generation state must participate in every storage
+compare-and-swap. Graph update entry, projection application, progress renewal,
+failure recording, and final publication now require the matching active
+generation, target content revision, and an unexpired lease. An expired owner
+cannot renew itself, write, fail, or publish; a later acquisition atomically
+marks it interrupted and installs a new unguessable owner.
+
+Unowned graph writes are rejected while a workspace repair is active, failed,
+or interrupted. They resume only after a generation completes or a new owner
+replaces the incomplete generation. Source indexing remains authoritative and
+may advance the content revision during repair; that revision change supersedes
+the old repair before graph mutation or publication.
+
+Structural evidence reads reject active, failed, and interrupted generations,
+including callers that explicitly allow stale evidence. Operational workspace
+and graph status bypass that evidence gate and remain readable so recovery can
+be diagnosed. These fences live in storage and application services, not in CLI
+or MCP adapters, and are the invariant Phase 4 integration must reuse.
+
+## D067: Broad Source Reindexing Ends with One Fenced Graph Repair
+
+**Status:** Accepted
+
+Workspace reindexing and watcher batches reconcile source documents first,
+including source deletions, and then invoke exactly one `IfNeeded` graph repair
+generation. They do not publish a partial graph as each source file is handled.
+This makes the generation lease from D066 the sole owner of broad graph
+convergence while leaving incremental single-file reconciliation available for
+callers that intentionally need it.
+
+The public reindex outcome reports source work separately from the graph repair
+outcome. An unchanged scan can therefore truthfully report zero updated files
+and a completed graph reprojection, or an explicit current/no-op reason. This
+preserves source revisions and compatible embeddings while making graph-only
+recovery observable.
+
+## D068: Exact Graph Seeds Are Evidence Without Invented Relationships
+
+**Status:** Accepted
+
+A graph-aware retrieval query may identify an exact declaration even when the
+analyzer cannot prove a caller, callee, dependency, implementation, or likely
+test edge. The exact seed is still structural evidence: it has a stable graph
+node identity, source provenance, graph revision, and bounded read limits.
+Retrieval may therefore return a zero-distance seed path and the code candidate
+overlapping that node before relationship traversal.
+
+A zero-distance seed must not be relabeled as a relationship. Direct graph
+tools remain fact-only and may return an empty result for dynamic member calls
+such as Python attribute dispatch. This gives context packets honest graph
+provenance without weakening the conservative analyzer contract or claiming an
+edge the graph does not contain.

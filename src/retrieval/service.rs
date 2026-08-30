@@ -357,6 +357,34 @@ impl RetrievalService {
             return Ok(Vec::new());
         }
         let seed_ids: Vec<_> = seeds.seeds.iter().map(|node| node.id.clone()).collect();
+        let mut candidates = Vec::new();
+        for seed in seeds
+            .seeds
+            .iter()
+            .filter(|seed| query_names_exactly_identify_seed(query, seed))
+        {
+            let evidence = StructuralRetrievalEvidence {
+                seed_node_id: seed.id.clone(),
+                node_id: seed.id.clone(),
+                path: StructuralPath {
+                    node_ids: vec![seed.id.clone()],
+                    edges: Vec::new(),
+                    confidence: 1.0,
+                },
+                snapshot: seeds.snapshot.clone(),
+                limits: seeds.limits.clone(),
+                truncated: seeds.truncated,
+            };
+            for candidate in structural
+                .code_candidates_for_node(workspace_id, &seed.id, 1)
+                .await?
+            {
+                candidates.push((code_result(candidate), 0.0, evidence.clone()));
+                if candidates.len() == self.structural_config.candidate_limit {
+                    return Ok(candidates);
+                }
+            }
+        }
         let (nodes, paths, snapshot, truncated) = if intent == StructuralQueryIntent::Impact {
             let report = structural
                 .impact_from_nodes(workspace_id, &seed_ids, &options)
@@ -389,7 +417,6 @@ impl RetrievalService {
             )
         };
         let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id.as_str(), node)).collect();
-        let mut candidates = Vec::new();
         for path in paths {
             let Some(node_id) = path.node_ids.last() else {
                 continue;
@@ -470,6 +497,23 @@ impl RetrievalService {
         }
         Ok(vector)
     }
+}
+
+fn query_names_exactly_identify_seed(query: &str, seed: &crate::domain::GraphNode) -> bool {
+    query
+        .split(|character: char| {
+            !character.is_alphanumeric() && !matches!(character, '_' | ':' | '.' | '/' | '\\')
+        })
+        .map(str::trim)
+        .filter(|token| token.len() > 1)
+        .filter(|token| token.contains(['_', ':', '.', '/', '\\']))
+        .any(|token| {
+            seed.name.eq_ignore_ascii_case(token)
+                || seed
+                    .qualified_name
+                    .as_deref()
+                    .is_some_and(|qualified| qualified.eq_ignore_ascii_case(token))
+        })
 }
 
 fn code_result(candidate: CodeCandidate) -> RetrievalResult {

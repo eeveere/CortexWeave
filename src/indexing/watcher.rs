@@ -20,7 +20,7 @@ use tokio::{
 
 use crate::{
     CortexError, Result,
-    domain::{CortexEvent, EventType, Workspace},
+    domain::{CortexEvent, EventType, GraphRepairMode, Workspace},
     storage::SqliteStorage,
 };
 
@@ -203,7 +203,10 @@ async fn process_batch(
             full_rescan = true;
             continue;
         }
-        let result = match indexing.reconcile_file(workspace, &path, relative).await {
+        let result = match indexing
+            .reconcile_file_source_only(workspace, &path, relative)
+            .await
+        {
             Ok(result) => result,
             Err(error) => {
                 tracing::warn!(%error, path = %path.display(), "file reconciliation failed");
@@ -234,6 +237,18 @@ async fn process_batch(
         {
             tracing::error!(%error, workspace_id = %workspace.id, "watcher rescan event persistence failed");
         }
+    } else {
+        let repair = indexing
+            .repair_graph(workspace, GraphRepairMode::IfNeeded)
+            .await?;
+        if repair.error.is_some() && !repair.already_completed_elsewhere {
+            tracing::warn!(
+                workspace_id = %workspace.id,
+                generation_id = ?repair.generation_id,
+                error = ?repair.error,
+                "watcher graph repair did not converge"
+            );
+        }
     }
     Ok(())
 }
@@ -253,6 +268,7 @@ async fn persist_rescan_event(
             "files_seen": result.files_seen,
             "files_updated": result.files_updated,
             "files_failed": result.files_failed,
+            "failed_paths": &result.failed_paths,
             "files_removed": result.files_removed,
             "chunks_embedded": result.chunks_embedded,
         }),

@@ -2,15 +2,16 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{FromRow, QueryBuilder, Sqlite};
+use sqlx::{FromRow, QueryBuilder, Sqlite, Transaction};
 
 use crate::{
     CortexError, Result,
     domain::{
         Checkpoint, ContextPin, ContextSourceType, CortexEvent, Document, EmbeddingRecord,
         EventType, GraphAnalysisExpectation, GraphAnalysisState, GraphEdge, GraphEdgeType,
-        GraphNode, GraphNodeType, GraphRelationshipFact, GraphState, MemoryClaim, MemoryKind,
-        MemoryOrigin, MemoryRecord, MemorySupersession, MemoryTrust, MemoryTrustReview,
+        GraphNode, GraphNodeType, GraphProjectionManifest, GraphRelationshipFact,
+        GraphRepairGeneration, GraphRepairMode, GraphRepairState, GraphState, MemoryClaim,
+        MemoryKind, MemoryOrigin, MemoryRecord, MemorySupersession, MemoryTrust, MemoryTrustReview,
         RelationshipTargetKind, Session, SourceSegment, StoredChunk, SymbolKind, Task, TaskStatus,
         TemporalBounds, UnresolvedRelationship, WorkingSetEntry, Workspace, WorkspaceGraphRevision,
     },
@@ -64,6 +65,7 @@ pub(crate) struct GraphReconciliationBatch {
     pub target_content_revision: i64,
     pub expected_graph_updated_at: Option<DateTime<Utc>>,
     pub update_started_at: Option<DateTime<Utc>>,
+    pub repair_generation_id: Option<String>,
     pub delete_relative_path: Option<String>,
     pub source_document_id: Option<String>,
     pub nodes: Vec<GraphNode>,
@@ -82,6 +84,12 @@ pub(crate) enum GraphReconciliationStatus {
     Superseded,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GraphRepairAcquire {
+    Acquired(GraphRepairGeneration),
+    InProgress(GraphRepairGeneration),
+}
+
 #[derive(Debug, FromRow)]
 struct GraphAnalysisSnapshotRow {
     document_id: String,
@@ -93,6 +101,18 @@ struct GraphAnalysisSnapshotRow {
     state_analyzer_version: Option<String>,
     state_structure_version: Option<String>,
     state_last_error: Option<String>,
+    manifest_content_revision: Option<i64>,
+    manifest_analyzer_id: Option<String>,
+    manifest_analyzer_version: Option<String>,
+    manifest_structure_version: Option<String>,
+    manifest_node_count: Option<i64>,
+    manifest_fact_count: Option<i64>,
+    manifest_edge_count: Option<i64>,
+    manifest_unresolved_count: Option<i64>,
+    physical_node_count: i64,
+    physical_fact_count: i64,
+    physical_edge_count: i64,
+    physical_unresolved_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1483,17 +1503,36 @@ impl SqliteStorage {
         target_revision: i64,
         expected_graph_updated_at: DateTime<Utc>,
         started_at: DateTime<Utc>,
+        repair_generation_id: Option<&str>,
     ) -> Result<bool> {
-        let result = sqlx::query(
-            "UPDATE workspace_graph_revisions SET graph_state = 'updating', graph_update_started_at = ?, updated_at = ? WHERE workspace_id = ? AND content_revision = ? AND updated_at = ?",
-        )
-        .bind(started_at)
-        .bind(started_at)
-        .bind(workspace_id)
-        .bind(target_revision)
-        .bind(expected_graph_updated_at)
-        .execute(self.pool())
-        .await?;
+        let result = if let Some(generation_id) = repair_generation_id {
+            sqlx::query(
+                "UPDATE workspace_graph_revisions SET graph_state = 'updating', graph_update_started_at = ?, updated_at = ? WHERE workspace_id = ? AND content_revision = ? AND updated_at = ? AND EXISTS (SELECT 1 FROM workspace_graph_repairs repair WHERE repair.workspace_id = ? AND repair.generation_id = ? AND repair.target_content_revision = ? AND repair.state = 'active' AND repair.lease_expires_at > ?)",
+            )
+            .bind(started_at)
+            .bind(started_at)
+            .bind(workspace_id)
+            .bind(target_revision)
+            .bind(expected_graph_updated_at)
+            .bind(workspace_id)
+            .bind(generation_id)
+            .bind(target_revision)
+            .bind(started_at)
+            .execute(self.pool())
+            .await?
+        } else {
+            sqlx::query(
+                "UPDATE workspace_graph_revisions SET graph_state = 'updating', graph_update_started_at = ?, updated_at = ? WHERE workspace_id = ? AND content_revision = ? AND updated_at = ? AND NOT EXISTS (SELECT 1 FROM workspace_graph_repairs repair WHERE repair.workspace_id = ? AND repair.state IN ('active', 'failed', 'interrupted'))",
+            )
+            .bind(started_at)
+            .bind(started_at)
+            .bind(workspace_id)
+            .bind(target_revision)
+            .bind(expected_graph_updated_at)
+            .bind(workspace_id)
+            .execute(self.pool())
+            .await?
+        };
         Ok(result.rows_affected() == 1)
     }
 
@@ -1525,20 +1564,40 @@ impl SqliteStorage {
         workspace_id: &str,
         target_revision: i64,
         expected_graph_updated_at: DateTime<Utc>,
+        repair_generation_id: Option<&str>,
         error: &str,
         updated_at: DateTime<Utc>,
     ) -> Result<bool> {
-        let result = sqlx::query(
-            "UPDATE workspace_graph_revisions SET graph_state = 'error', graph_update_started_at = NULL, failed_graph_target_revision = ?, last_graph_error = ?, updated_at = ? WHERE workspace_id = ? AND content_revision = ? AND updated_at = ?",
-        )
-        .bind(target_revision)
-        .bind(error)
-        .bind(updated_at)
-        .bind(workspace_id)
-        .bind(target_revision)
-        .bind(expected_graph_updated_at)
-        .execute(self.pool())
-        .await?;
+        let result = if let Some(generation_id) = repair_generation_id {
+            sqlx::query(
+                "UPDATE workspace_graph_revisions SET graph_state = 'error', graph_update_started_at = NULL, failed_graph_target_revision = ?, last_graph_error = ?, updated_at = ? WHERE workspace_id = ? AND content_revision = ? AND updated_at = ? AND EXISTS (SELECT 1 FROM workspace_graph_repairs repair WHERE repair.workspace_id = ? AND repair.generation_id = ? AND repair.target_content_revision = ? AND repair.state = 'active' AND repair.lease_expires_at > ?)",
+            )
+            .bind(target_revision)
+            .bind(error)
+            .bind(updated_at)
+            .bind(workspace_id)
+            .bind(target_revision)
+            .bind(expected_graph_updated_at)
+            .bind(workspace_id)
+            .bind(generation_id)
+            .bind(target_revision)
+            .bind(updated_at)
+            .execute(self.pool())
+            .await?
+        } else {
+            sqlx::query(
+                "UPDATE workspace_graph_revisions SET graph_state = 'error', graph_update_started_at = NULL, failed_graph_target_revision = ?, last_graph_error = ?, updated_at = ? WHERE workspace_id = ? AND content_revision = ? AND updated_at = ? AND NOT EXISTS (SELECT 1 FROM workspace_graph_repairs repair WHERE repair.workspace_id = ? AND repair.state IN ('active', 'failed', 'interrupted'))",
+            )
+            .bind(target_revision)
+            .bind(error)
+            .bind(updated_at)
+            .bind(workspace_id)
+            .bind(target_revision)
+            .bind(expected_graph_updated_at)
+            .bind(workspace_id)
+            .execute(self.pool())
+            .await?
+        };
         Ok(result.rows_affected() == 1)
     }
 
@@ -1603,6 +1662,187 @@ impl SqliteStorage {
         .execute(self.pool())
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn workspace_graph_repair(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<GraphRepairGeneration>> {
+        let row = sqlx::query_as::<_, GraphRepairGenerationRow>(
+            "SELECT workspace_id, generation_id, mode, target_content_revision, state, started_at, lease_expires_at, updated_at, completed_at, documents_considered, documents_repaired, documents_failed, last_error FROM workspace_graph_repairs WHERE workspace_id = ?",
+        )
+        .bind(workspace_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub(crate) async fn acquire_graph_repair(
+        &self,
+        generation: &GraphRepairGeneration,
+        now: DateTime<Utc>,
+    ) -> Result<GraphRepairAcquire> {
+        let mut transaction = self.pool().begin().await?;
+        sqlx::query(
+            "UPDATE workspace_graph_repairs SET state = 'interrupted', updated_at = ?, last_error = COALESCE(last_error, 'graph repair lease expired') WHERE workspace_id = ? AND state = 'active' AND lease_expires_at <= ?",
+        )
+        .bind(now)
+        .bind(&generation.workspace_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO workspace_graph_repairs(workspace_id, generation_id, mode, target_content_revision, state, started_at, lease_expires_at, updated_at, completed_at, documents_considered, documents_repaired, documents_failed, last_error) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, NULL, ?, 0, 0, NULL) ON CONFLICT(workspace_id) DO UPDATE SET generation_id = excluded.generation_id, mode = excluded.mode, target_content_revision = excluded.target_content_revision, state = 'active', started_at = excluded.started_at, lease_expires_at = excluded.lease_expires_at, updated_at = excluded.updated_at, completed_at = NULL, documents_considered = excluded.documents_considered, documents_repaired = 0, documents_failed = 0, last_error = NULL WHERE workspace_graph_repairs.state IN ('completed', 'failed', 'interrupted')",
+        )
+        .bind(&generation.workspace_id)
+        .bind(&generation.generation_id)
+        .bind(generation.mode.storage_name())
+        .bind(generation.target_content_revision)
+        .bind(generation.started_at)
+        .bind(generation.lease_expires_at)
+        .bind(generation.updated_at)
+        .bind(i64::try_from(generation.documents_considered).map_err(|_| {
+            CortexError::Analysis("graph repair document count exceeds SQLite integer range".into())
+        })?)
+        .execute(&mut *transaction)
+        .await?;
+        if inserted.rows_affected() == 1 {
+            transaction.commit().await?;
+            return Ok(GraphRepairAcquire::Acquired(generation.clone()));
+        }
+        let current = sqlx::query_as::<_, GraphRepairGenerationRow>(
+            "SELECT workspace_id, generation_id, mode, target_content_revision, state, started_at, lease_expires_at, updated_at, completed_at, documents_considered, documents_repaired, documents_failed, last_error FROM workspace_graph_repairs WHERE workspace_id = ?",
+        )
+        .bind(&generation.workspace_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(GraphRepairAcquire::InProgress(current.try_into()?))
+    }
+
+    pub(crate) async fn record_graph_repair_progress(
+        &self,
+        workspace_id: &str,
+        generation_id: &str,
+        documents_repaired: usize,
+        lease_expires_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        if lease_expires_at <= updated_at {
+            return Err(CortexError::Analysis(
+                "graph repair lease renewal must expire after its update time".into(),
+            ));
+        }
+        let result = sqlx::query(
+            "UPDATE workspace_graph_repairs SET documents_repaired = ?, lease_expires_at = ?, updated_at = ? WHERE workspace_id = ? AND generation_id = ? AND state = 'active' AND lease_expires_at > ?",
+        )
+        .bind(i64::try_from(documents_repaired).map_err(|_| {
+            CortexError::Analysis("graph repair document count exceeds SQLite integer range".into())
+        })?)
+        .bind(lease_expires_at)
+        .bind(updated_at)
+        .bind(workspace_id)
+        .bind(generation_id)
+        .bind(updated_at)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn fail_graph_repair(
+        &self,
+        workspace_id: &str,
+        generation_id: &str,
+        documents_repaired: usize,
+        error: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE workspace_graph_repairs SET state = 'failed', documents_repaired = ?, documents_failed = documents_failed + 1, updated_at = ?, last_error = ? WHERE workspace_id = ? AND generation_id = ? AND state = 'active' AND lease_expires_at > ?",
+        )
+        .bind(i64::try_from(documents_repaired).map_err(|_| {
+            CortexError::Analysis("graph repair document count exceeds SQLite integer range".into())
+        })?)
+        .bind(updated_at)
+        .bind(error)
+        .bind(workspace_id)
+        .bind(generation_id)
+        .bind(updated_at)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn complete_graph_repair(
+        &self,
+        workspace_id: &str,
+        generation_id: &str,
+        target_revision: i64,
+        expected_analysis: &[GraphAnalysisExpectation],
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let mut transaction = self.pool().begin().await?;
+        let owned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workspace_graph_repairs WHERE workspace_id = ? AND generation_id = ? AND target_content_revision = ? AND state = 'active' AND lease_expires_at > ?",
+        )
+        .bind(workspace_id)
+        .bind(generation_id)
+        .bind(target_revision)
+        .bind(updated_at)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if owned != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let rows = graph_analysis_snapshot_rows(&mut transaction, workspace_id).await?;
+        if !analysis_expectations_match(&rows, expected_analysis) {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let acknowledged = sqlx::query(
+            "UPDATE workspace_graph_revisions SET graph_content_revision = ?, graph_state = 'current', graph_update_started_at = NULL, failed_graph_target_revision = NULL, last_graph_error = NULL, updated_at = ? WHERE workspace_id = ? AND content_revision = ?",
+        )
+        .bind(target_revision)
+        .bind(updated_at)
+        .bind(workspace_id)
+        .bind(target_revision)
+        .execute(&mut *transaction)
+        .await?;
+        if acknowledged.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let completed = sqlx::query(
+            "UPDATE workspace_graph_repairs SET state = 'completed', lease_expires_at = ?, updated_at = ?, completed_at = ?, last_error = NULL WHERE workspace_id = ? AND generation_id = ? AND state = 'active' AND lease_expires_at > ?",
+        )
+        .bind(updated_at)
+        .bind(updated_at)
+        .bind(updated_at)
+        .bind(workspace_id)
+        .bind(generation_id)
+        .bind(updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        if completed.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn graph_projection_manifest(
+        &self,
+        document_id: &str,
+    ) -> Result<Option<GraphProjectionManifest>> {
+        let row = sqlx::query_as::<_, GraphProjectionManifestRow>(
+            "SELECT document_id, workspace_id, content_revision, analyzer_id, analyzer_version, structure_version, node_count, fact_count, edge_count, unresolved_count, projected_at FROM graph_document_projections WHERE document_id = ?",
+        )
+        .bind(document_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(TryInto::try_into).transpose()
     }
 
     pub async fn graph_analysis_state(
@@ -2200,6 +2440,32 @@ impl SqliteStorage {
             transaction.rollback().await?;
             return Ok(GraphReconciliationStatus::Superseded);
         }
+        if let Some(generation_id) = &batch.repair_generation_id {
+            let repair_owned: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM workspace_graph_repairs WHERE workspace_id = ? AND generation_id = ? AND target_content_revision = ? AND state = 'active' AND lease_expires_at > ?",
+            )
+            .bind(&batch.workspace_id)
+            .bind(generation_id)
+            .bind(batch.target_content_revision)
+            .bind(updated_at)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if repair_owned != 1 {
+                transaction.rollback().await?;
+                return Ok(GraphReconciliationStatus::Superseded);
+            }
+        } else {
+            let blocking_repair: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM workspace_graph_repairs WHERE workspace_id = ? AND state IN ('active', 'failed', 'interrupted')",
+            )
+            .bind(&batch.workspace_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if blocking_repair != 0 {
+                transaction.rollback().await?;
+                return Ok(GraphReconciliationStatus::Superseded);
+            }
+        }
 
         if let Some(state) = &batch.analysis_state {
             let source_is_current: i64 = sqlx::query_scalar(
@@ -2467,34 +2733,18 @@ impl SqliteStorage {
             .await?;
         }
 
-        let analysis_rows = sqlx::query_as::<_, GraphAnalysisSnapshotRow>(
-            "SELECT d.id AS document_id, d.analyzer_id AS document_analyzer_id, d.analyzer_version AS document_analyzer_version, d.content_revision AS document_content_revision, s.content_revision AS state_content_revision, s.analyzer_id AS state_analyzer_id, s.analyzer_version AS state_analyzer_version, s.structure_version AS state_structure_version, s.last_error AS state_last_error FROM documents d LEFT JOIN graph_document_states s ON s.document_id = d.id AND s.workspace_id = d.workspace_id WHERE d.workspace_id = ?",
+        sqlx::query(
+            "INSERT INTO graph_document_projections(document_id, workspace_id, content_revision, analyzer_id, analyzer_version, structure_version, node_count, fact_count, edge_count, unresolved_count, projected_at) SELECT s.document_id, s.workspace_id, s.content_revision, s.analyzer_id, s.analyzer_version, s.structure_version, (SELECT COUNT(*) FROM graph_nodes nodes WHERE nodes.workspace_id = s.workspace_id AND nodes.document_id = s.document_id), (SELECT COUNT(*) FROM graph_relationship_facts facts WHERE facts.workspace_id = s.workspace_id AND facts.source_document_id = s.document_id), (SELECT COUNT(*) FROM graph_edges edges WHERE edges.workspace_id = s.workspace_id AND edges.source_document_id = s.document_id), (SELECT COUNT(*) FROM unresolved_relationships unresolved WHERE unresolved.workspace_id = s.workspace_id AND unresolved.source_document_id = s.document_id), s.analyzed_at FROM graph_document_states s WHERE s.workspace_id = ? ON CONFLICT(document_id) DO UPDATE SET workspace_id = excluded.workspace_id, content_revision = excluded.content_revision, analyzer_id = excluded.analyzer_id, analyzer_version = excluded.analyzer_version, structure_version = excluded.structure_version, node_count = excluded.node_count, fact_count = excluded.fact_count, edge_count = excluded.edge_count, unresolved_count = excluded.unresolved_count, projected_at = excluded.projected_at",
         )
         .bind(&batch.workspace_id)
-        .fetch_all(&mut *transaction)
+        .execute(&mut *transaction)
         .await?;
-        let analysis_by_document: HashMap<_, _> = analysis_rows
-            .iter()
-            .map(|row| (row.document_id.as_str(), row))
-            .collect();
-        let expectations_match = analysis_by_document.len() == batch.expected_analysis.len()
-            && batch.expected_analysis.iter().all(|expectation| {
-                analysis_by_document
-                    .get(expectation.document_id.as_str())
-                    .is_some_and(|row| {
-                        row.document_analyzer_id == expectation.analyzer_id
-                            && row.document_analyzer_version == expectation.analyzer_version
-                            && row.state_content_revision == Some(row.document_content_revision)
-                            && row.state_analyzer_id.as_deref()
-                                == Some(expectation.analyzer_id.as_str())
-                            && row.state_analyzer_version.as_deref()
-                                == Some(expectation.analyzer_version.as_str())
-                            && row.state_structure_version.as_deref()
-                                == Some(expectation.structure_version.as_str())
-                            && row.state_last_error.is_none()
-                    })
-            });
-        let status = if expectations_match {
+
+        let analysis_rows =
+            graph_analysis_snapshot_rows(&mut transaction, &batch.workspace_id).await?;
+        let expectations_match =
+            analysis_expectations_match(&analysis_rows, &batch.expected_analysis);
+        let status = if expectations_match && batch.repair_generation_id.is_none() {
             let updated = sqlx::query(
                 "UPDATE workspace_graph_revisions SET graph_content_revision = ?, graph_state = 'current', graph_update_started_at = NULL, failed_graph_target_revision = NULL, last_graph_error = NULL, updated_at = ? WHERE workspace_id = ? AND content_revision = ? AND graph_content_revision <= ?",
             )
@@ -2848,6 +3098,56 @@ fn validate_graph_reconciliation_batch(batch: &GraphReconciliationBatch) -> Resu
     Ok(())
 }
 
+async fn graph_analysis_snapshot_rows(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+) -> Result<Vec<GraphAnalysisSnapshotRow>> {
+    Ok(sqlx::query_as::<_, GraphAnalysisSnapshotRow>(
+        "SELECT d.id AS document_id, d.analyzer_id AS document_analyzer_id, d.analyzer_version AS document_analyzer_version, d.content_revision AS document_content_revision, s.content_revision AS state_content_revision, s.analyzer_id AS state_analyzer_id, s.analyzer_version AS state_analyzer_version, s.structure_version AS state_structure_version, s.last_error AS state_last_error, p.content_revision AS manifest_content_revision, p.analyzer_id AS manifest_analyzer_id, p.analyzer_version AS manifest_analyzer_version, p.structure_version AS manifest_structure_version, p.node_count AS manifest_node_count, p.fact_count AS manifest_fact_count, p.edge_count AS manifest_edge_count, p.unresolved_count AS manifest_unresolved_count, (SELECT COUNT(*) FROM graph_nodes nodes WHERE nodes.workspace_id = d.workspace_id AND nodes.document_id = d.id) AS physical_node_count, (SELECT COUNT(*) FROM graph_relationship_facts facts WHERE facts.workspace_id = d.workspace_id AND facts.source_document_id = d.id) AS physical_fact_count, (SELECT COUNT(*) FROM graph_edges edges WHERE edges.workspace_id = d.workspace_id AND edges.source_document_id = d.id) AS physical_edge_count, (SELECT COUNT(*) FROM unresolved_relationships unresolved WHERE unresolved.workspace_id = d.workspace_id AND unresolved.source_document_id = d.id) AS physical_unresolved_count FROM documents d LEFT JOIN graph_document_states s ON s.document_id = d.id AND s.workspace_id = d.workspace_id LEFT JOIN graph_document_projections p ON p.document_id = d.id AND p.workspace_id = d.workspace_id WHERE d.workspace_id = ?",
+    )
+    .bind(workspace_id)
+    .fetch_all(&mut **transaction)
+    .await?)
+}
+
+fn analysis_expectations_match(
+    rows: &[GraphAnalysisSnapshotRow],
+    expected_analysis: &[GraphAnalysisExpectation],
+) -> bool {
+    let analysis_by_document: HashMap<_, _> = rows
+        .iter()
+        .map(|row| (row.document_id.as_str(), row))
+        .collect();
+    analysis_by_document.len() == expected_analysis.len()
+        && expected_analysis.iter().all(|expectation| {
+            analysis_by_document
+                .get(expectation.document_id.as_str())
+                .is_some_and(|row| {
+                    row.document_analyzer_id == expectation.analyzer_id
+                        && row.document_analyzer_version == expectation.analyzer_version
+                        && row.state_content_revision == Some(row.document_content_revision)
+                        && row.state_analyzer_id.as_deref()
+                            == Some(expectation.analyzer_id.as_str())
+                        && row.state_analyzer_version.as_deref()
+                            == Some(expectation.analyzer_version.as_str())
+                        && row.state_structure_version.as_deref()
+                            == Some(expectation.structure_version.as_str())
+                        && row.state_last_error.is_none()
+                        && row.manifest_content_revision == Some(row.document_content_revision)
+                        && row.manifest_analyzer_id.as_deref()
+                            == Some(expectation.analyzer_id.as_str())
+                        && row.manifest_analyzer_version.as_deref()
+                            == Some(expectation.analyzer_version.as_str())
+                        && row.manifest_structure_version.as_deref()
+                            == Some(expectation.structure_version.as_str())
+                        && row.manifest_node_count == Some(row.physical_node_count)
+                        && row.manifest_fact_count == Some(row.physical_fact_count)
+                        && row.manifest_edge_count == Some(row.physical_edge_count)
+                        && row.manifest_unresolved_count == Some(row.physical_unresolved_count)
+                })
+        })
+}
+
 fn graph_source_segment_bindings(
     segment: &Option<SourceSegment>,
 ) -> Result<(Option<String>, Option<i64>, Option<i64>)> {
@@ -3175,6 +3475,94 @@ impl From<GraphAnalysisStateRow> for GraphAnalysisState {
             last_error: row.last_error,
             analyzed_at: row.analyzed_at,
         }
+    }
+}
+
+#[derive(FromRow)]
+struct GraphRepairGenerationRow {
+    workspace_id: String,
+    generation_id: String,
+    mode: String,
+    target_content_revision: i64,
+    state: String,
+    started_at: DateTime<Utc>,
+    lease_expires_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
+    documents_considered: i64,
+    documents_repaired: i64,
+    documents_failed: i64,
+    last_error: Option<String>,
+}
+
+impl TryFrom<GraphRepairGenerationRow> for GraphRepairGeneration {
+    type Error = CortexError;
+
+    fn try_from(row: GraphRepairGenerationRow) -> Result<Self> {
+        Ok(Self {
+            workspace_id: row.workspace_id,
+            generation_id: row.generation_id,
+            mode: GraphRepairMode::from_storage(&row.mode),
+            target_content_revision: row.target_content_revision,
+            state: GraphRepairState::from_storage(&row.state),
+            started_at: row.started_at,
+            lease_expires_at: row.lease_expires_at,
+            updated_at: row.updated_at,
+            completed_at: row.completed_at,
+            documents_considered: usize::try_from(row.documents_considered).map_err(|_| {
+                CortexError::Analysis("invalid persisted graph repair document count".into())
+            })?,
+            documents_repaired: usize::try_from(row.documents_repaired).map_err(|_| {
+                CortexError::Analysis("invalid persisted graph repair document count".into())
+            })?,
+            documents_failed: usize::try_from(row.documents_failed).map_err(|_| {
+                CortexError::Analysis("invalid persisted graph repair document count".into())
+            })?,
+            last_error: row.last_error,
+        })
+    }
+}
+
+#[derive(FromRow)]
+struct GraphProjectionManifestRow {
+    document_id: String,
+    workspace_id: String,
+    content_revision: i64,
+    analyzer_id: String,
+    analyzer_version: String,
+    structure_version: String,
+    node_count: i64,
+    fact_count: i64,
+    edge_count: i64,
+    unresolved_count: i64,
+    projected_at: DateTime<Utc>,
+}
+
+impl TryFrom<GraphProjectionManifestRow> for GraphProjectionManifest {
+    type Error = CortexError;
+
+    fn try_from(row: GraphProjectionManifestRow) -> Result<Self> {
+        Ok(Self {
+            document_id: row.document_id,
+            workspace_id: row.workspace_id,
+            content_revision: row.content_revision,
+            analyzer_id: row.analyzer_id,
+            analyzer_version: row.analyzer_version,
+            structure_version: row.structure_version,
+            node_count: usize::try_from(row.node_count).map_err(|_| {
+                CortexError::Analysis("invalid persisted graph projection count".into())
+            })?,
+            fact_count: usize::try_from(row.fact_count).map_err(|_| {
+                CortexError::Analysis("invalid persisted graph projection count".into())
+            })?,
+            edge_count: usize::try_from(row.edge_count).map_err(|_| {
+                CortexError::Analysis("invalid persisted graph projection count".into())
+            })?,
+            unresolved_count: usize::try_from(row.unresolved_count).map_err(|_| {
+                CortexError::Analysis("invalid persisted graph projection count".into())
+            })?,
+            projected_at: row.projected_at,
+        })
     }
 }
 
@@ -3900,7 +4288,10 @@ impl From<TemporalCandidateRow> for TemporalCandidate {
 mod tests {
     use tempfile::tempdir;
 
-    use crate::domain::{GraphEdgeType, GraphNode, GraphNodeType, UnresolvedRelationship};
+    use crate::domain::{
+        GraphEdgeType, GraphNode, GraphNodeType, GraphRepairGeneration, GraphRepairMode,
+        GraphRepairState, UnresolvedRelationship,
+    };
 
     use super::*;
 
@@ -4061,6 +4452,7 @@ mod tests {
             target_content_revision: 0,
             expected_graph_updated_at: None,
             update_started_at: Some(Utc::now()),
+            repair_generation_id: None,
             delete_relative_path: None,
             source_document_id: Some(document.id.clone()),
             nodes: vec![node],
@@ -4113,6 +4505,7 @@ mod tests {
                     snapshot.content_revision,
                     snapshot.updated_at,
                     first_token,
+                    None,
                 )
                 .await
                 .unwrap()
@@ -4125,6 +4518,7 @@ mod tests {
                     snapshot.content_revision,
                     first_token,
                     second_token,
+                    None,
                 )
                 .await
                 .unwrap()
@@ -4134,6 +4528,7 @@ mod tests {
             target_content_revision: snapshot.content_revision,
             expected_graph_updated_at: None,
             update_started_at: Some(first_token),
+            repair_generation_id: None,
             delete_relative_path: None,
             source_document_id: None,
             nodes: Vec::new(),
@@ -4160,6 +4555,353 @@ mod tests {
         assert_eq!(revision.graph_state, GraphState::Updating);
         assert_eq!(revision.graph_update_started_at, Some(second_token));
         assert!(storage.graph_nodes(&workspace.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_repair_excludes_normal_graph_writes_and_owns_publication() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let workspace = Workspace::new("C:/repair-owner", "repair-owner");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let snapshot = storage
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = snapshot.updated_at + chrono::Duration::milliseconds(1);
+        let generation = test_repair_generation(&workspace.id, "owner", 0, now, 60);
+        assert!(matches!(
+            storage
+                .acquire_graph_repair(&generation, now)
+                .await
+                .unwrap(),
+            GraphRepairAcquire::Acquired(_)
+        ));
+
+        let normal_started = now + chrono::Duration::milliseconds(1);
+        assert!(
+            !storage
+                .mark_graph_updating_if_current(
+                    &workspace.id,
+                    0,
+                    snapshot.updated_at,
+                    normal_started,
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+        let owner_started = normal_started + chrono::Duration::milliseconds(1);
+        assert!(
+            storage
+                .mark_graph_updating_if_current(
+                    &workspace.id,
+                    0,
+                    snapshot.updated_at,
+                    owner_started,
+                    Some(&generation.generation_id),
+                )
+                .await
+                .unwrap()
+        );
+        let batch = GraphReconciliationBatch {
+            workspace_id: workspace.id.clone(),
+            target_content_revision: 0,
+            expected_graph_updated_at: None,
+            update_started_at: Some(owner_started),
+            repair_generation_id: Some(generation.generation_id.clone()),
+            delete_relative_path: None,
+            source_document_id: None,
+            nodes: Vec::new(),
+            facts: Vec::new(),
+            analysis_state: None,
+            expected_analysis: Vec::new(),
+            affected_relationships: Vec::new(),
+            edges: Vec::new(),
+            unresolved: Vec::new(),
+        };
+        let applied_at = owner_started + chrono::Duration::milliseconds(1);
+        assert_eq!(
+            storage
+                .apply_graph_reconciliation(&batch, applied_at)
+                .await
+                .unwrap(),
+            GraphReconciliationStatus::Stale
+        );
+        let completed_at = applied_at + chrono::Duration::milliseconds(1);
+        assert!(
+            storage
+                .complete_graph_repair(
+                    &workspace.id,
+                    &generation.generation_id,
+                    0,
+                    &[],
+                    completed_at,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            storage
+                .workspace_graph_revision(&workspace.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_current()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_repair_cannot_renew_write_fail_or_publish_and_can_be_replaced() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let workspace = Workspace::new("C:/expired-repair", "expired-repair");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let snapshot = storage
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = snapshot.updated_at + chrono::Duration::milliseconds(1);
+        let expired = test_repair_generation(&workspace.id, "expired", 0, now, 1);
+        assert!(matches!(
+            storage.acquire_graph_repair(&expired, now).await.unwrap(),
+            GraphRepairAcquire::Acquired(_)
+        ));
+        let after_expiry = now + chrono::Duration::seconds(2);
+        assert!(
+            !storage
+                .record_graph_repair_progress(
+                    &workspace.id,
+                    &expired.generation_id,
+                    1,
+                    after_expiry + chrono::Duration::seconds(60),
+                    after_expiry,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .mark_graph_updating_if_current(
+                    &workspace.id,
+                    0,
+                    snapshot.updated_at,
+                    after_expiry,
+                    Some(&expired.generation_id),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .fail_graph_repair(
+                    &workspace.id,
+                    &expired.generation_id,
+                    0,
+                    "late failure",
+                    after_expiry,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .complete_graph_repair(&workspace.id, &expired.generation_id, 0, &[], after_expiry,)
+                .await
+                .unwrap()
+        );
+
+        let replacement = test_repair_generation(&workspace.id, "replacement", 0, after_expiry, 60);
+        assert!(matches!(
+            storage
+                .acquire_graph_repair(&replacement, after_expiry)
+                .await
+                .unwrap(),
+            GraphRepairAcquire::Acquired(_)
+        ));
+        let persisted = storage
+            .workspace_graph_repair(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.generation_id, replacement.generation_id);
+        assert_eq!(persisted.state, GraphRepairState::Active);
+    }
+
+    #[tokio::test]
+    async fn failed_repair_blocks_unowned_graph_writes_until_replaced() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let workspace = Workspace::new("C:/failed-repair", "failed-repair");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let snapshot = storage
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = snapshot.updated_at + chrono::Duration::milliseconds(1);
+        let failed = test_repair_generation(&workspace.id, "failed", 0, now, 60);
+        assert!(matches!(
+            storage.acquire_graph_repair(&failed, now).await.unwrap(),
+            GraphRepairAcquire::Acquired(_)
+        ));
+        let failed_at = now + chrono::Duration::milliseconds(1);
+        assert!(
+            storage
+                .fail_graph_repair(
+                    &workspace.id,
+                    &failed.generation_id,
+                    0,
+                    "projection failed",
+                    failed_at,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .mark_graph_updating_if_current(
+                    &workspace.id,
+                    0,
+                    snapshot.updated_at,
+                    failed_at + chrono::Duration::milliseconds(1),
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+
+        let replacement = test_repair_generation(
+            &workspace.id,
+            "retry",
+            0,
+            failed_at + chrono::Duration::milliseconds(2),
+            60,
+        );
+        assert!(matches!(
+            storage
+                .acquire_graph_repair(&replacement, replacement.started_at)
+                .await
+                .unwrap(),
+            GraphRepairAcquire::Acquired(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn source_revision_change_supersedes_repair_before_graph_mutation() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let workspace = Workspace::new("C:/repair-source-race", "repair-source-race");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let snapshot = storage
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = snapshot.updated_at + chrono::Duration::milliseconds(1);
+        let generation = test_repair_generation(&workspace.id, "source-race", 0, now, 60);
+        assert!(matches!(
+            storage
+                .acquire_graph_repair(&generation, now)
+                .await
+                .unwrap(),
+            GraphRepairAcquire::Acquired(_)
+        ));
+
+        let mut document = Document::new(&workspace.id, "src/new.rs");
+        document.indexed_at = now + chrono::Duration::milliseconds(1);
+        let content_revision = storage
+            .apply_document_reconciliation(&document, &[], &[], &[], false, true)
+            .await
+            .unwrap();
+        assert_eq!(content_revision, 1);
+        let attempted_at = document.indexed_at + chrono::Duration::milliseconds(1);
+        assert!(
+            !storage
+                .mark_graph_updating_if_current(
+                    &workspace.id,
+                    generation.target_content_revision,
+                    snapshot.updated_at,
+                    attempted_at,
+                    Some(&generation.generation_id),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .complete_graph_repair(
+                    &workspace.id,
+                    &generation.generation_id,
+                    generation.target_content_revision,
+                    &[],
+                    attempted_at,
+                )
+                .await
+                .unwrap()
+        );
+        let after = storage
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.content_revision, 1);
+        assert_eq!(after.graph_content_revision, 0);
+        assert_eq!(after.graph_state, GraphState::Stale);
+        assert!(storage.graph_nodes(&workspace.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_repair_acquisition_has_exactly_one_owner() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("repair-race.sqlite");
+        let storage = SqliteStorage::open(&database_path).await.unwrap();
+        let competitor = SqliteStorage::open(&database_path).await.unwrap();
+        let workspace = Workspace::new("C:/repair-race", "repair-race");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let now = Utc::now();
+        let first = test_repair_generation(&workspace.id, "first", 0, now, 60);
+        let second = test_repair_generation(&workspace.id, "second", 0, now, 60);
+        let (left, right) = tokio::join!(
+            storage.acquire_graph_repair(&first, now),
+            competitor.acquire_graph_repair(&second, now),
+        );
+        let outcomes = [left.unwrap(), right.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, GraphRepairAcquire::Acquired(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, GraphRepairAcquire::InProgress(_)))
+                .count(),
+            1
+        );
+    }
+
+    fn test_repair_generation(
+        workspace_id: &str,
+        generation_id: &str,
+        target_content_revision: i64,
+        started_at: DateTime<Utc>,
+        lease_seconds: i64,
+    ) -> GraphRepairGeneration {
+        GraphRepairGeneration {
+            workspace_id: workspace_id.into(),
+            generation_id: generation_id.into(),
+            mode: GraphRepairMode::IfNeeded,
+            target_content_revision,
+            state: GraphRepairState::Active,
+            started_at,
+            lease_expires_at: started_at + chrono::Duration::seconds(lease_seconds),
+            updated_at: started_at,
+            completed_at: None,
+            documents_considered: 0,
+            documents_repaired: 0,
+            documents_failed: 0,
+            last_error: None,
+        }
     }
 
     #[tokio::test]

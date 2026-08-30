@@ -76,6 +76,7 @@ impl WorkspaceScanner {
             .hidden(false)
             .max_filesize(Some(self.max_file_bytes))
             .overrides(overrides)
+            .filter_entry(|entry| entry.path().file_name().is_none_or(|name| name != ".git"))
             .build();
 
         for entry in walker {
@@ -203,7 +204,9 @@ mod tests {
     #[test]
     fn scan_honors_gitignore_and_skips_binary_files() {
         let directory = tempdir().unwrap();
+        fs::create_dir(directory.path().join(".git")).unwrap();
         fs::write(directory.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(directory.path().join(".git/config"), "[core]\n").unwrap();
         fs::write(directory.path().join("visible.rs"), "fn main() {}\n").unwrap();
         fs::write(directory.path().join("ignored.txt"), "not indexed\n").unwrap();
         fs::write(directory.path().join("binary.bin"), [1_u8, 0, 2]).unwrap();
@@ -225,6 +228,11 @@ mod tests {
             !files
                 .iter()
                 .any(|file| file.relative_path == Path::new("binary.bin"))
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.relative_path == Path::new(".git/config"))
         );
     }
 

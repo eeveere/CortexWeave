@@ -46,6 +46,16 @@ impl StructuralService {
             .ok_or_else(|| {
                 CortexError::NotFound(format!("workspace graph revision {workspace_id}"))
             })?;
+        if self
+            .storage
+            .workspace_graph_repair(workspace_id)
+            .await?
+            .is_some_and(|repair| repair.state.blocks_structural_reads())
+        {
+            return Err(CortexError::Analysis(format!(
+                "structural graph for workspace {workspace_id} is unavailable while graph repair is active, failed, or interrupted"
+            )));
+        }
         if snapshot.is_current() && !self.analysis_versions_are_current(workspace_id).await? {
             snapshot.graph_state = GraphState::Stale;
         }

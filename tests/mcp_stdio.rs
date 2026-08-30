@@ -84,6 +84,7 @@ fn serve_speaks_line_delimited_mcp_over_stdio() {
     assert_eq!(responses.len(), 4);
     assert_eq!(responses[0]["id"], 1);
     assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(responses[0]["result"]["serverInfo"]["version"], "0.4.1");
     assert_eq!(responses[1]["id"], 2);
     assert!(
         responses[1]["result"]["tools"]
@@ -91,6 +92,13 @@ fn serve_speaks_line_delimited_mcp_over_stdio() {
             .unwrap()
             .iter()
             .any(|tool| tool["name"] == "workspace_reindex")
+    );
+    assert!(
+        responses[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "graph_rebuild")
     );
     assert!(
         responses[1]["result"]["tools"]

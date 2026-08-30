@@ -1,11 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::Path,
     sync::Arc,
     time::{Instant, UNIX_EPOCH},
 };
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde::Serialize;
 use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
@@ -13,12 +13,16 @@ use uuid::Uuid;
 use crate::{
     CortexError, Result,
     config::IndexingConfig,
-    domain::{Document, EmbeddingRecord, GraphAnalysisExpectation, StoredChunk, Workspace},
+    domain::{
+        Document, EmbeddingRecord, GraphAnalysisExpectation, GraphRepairDisposition,
+        GraphRepairDocumentPlan, GraphRepairGeneration, GraphRepairMode, GraphRepairOutcome,
+        GraphRepairPlan, GraphRepairReason, GraphRepairState, StoredChunk, Workspace,
+    },
     embedding::EmbeddingProvider,
     graph::GraphIndexer,
     instrumentation::RuntimeMetrics,
     parsing::AnalyzerRegistry,
-    storage::SqliteStorage,
+    storage::{GraphRepairAcquire, SqliteStorage},
     workspace::{PathIdentity, WorkspaceScanner},
 };
 
@@ -28,6 +32,7 @@ use super::{
 };
 
 const MAX_ADAPTIVE_SEGMENTATION_ATTEMPTS: usize = 8;
+const GRAPH_REPAIR_LEASE_SECONDS: i64 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileStatus {
@@ -51,8 +56,24 @@ pub struct WorkspaceReindexOutcome {
     pub files_seen: usize,
     pub files_updated: usize,
     pub files_failed: usize,
+    pub failed_paths: Vec<String>,
     pub files_removed: usize,
     pub chunks_embedded: usize,
+    pub graph_repair: Option<GraphRepairOutcome>,
+}
+
+#[derive(Debug, Default)]
+struct GraphRepairProgress {
+    documents_analyzed: usize,
+    nodes_projected: usize,
+    edges_projected: usize,
+    resolved_relationships: usize,
+    unresolved_relationships: usize,
+    documents_failed: usize,
+    already_completed_elsewhere: bool,
+    reason: Option<GraphRepairReason>,
+    final_state: Option<GraphRepairState>,
+    error: Option<String>,
 }
 
 impl ReconcileOutcome {
@@ -158,7 +179,36 @@ impl IndexingService {
         let _path_guard = path_lock.lock().await;
         self.metrics.job_started();
         let result = self
-            .reconcile_file_inner(workspace, absolute_path, relative_path)
+            .reconcile_file_inner(workspace, absolute_path, relative_path, true)
+            .await;
+        self.metrics.job_finished(result.is_err());
+        if let Ok(outcome) = &result {
+            self.metrics
+                .record_chunks(outcome.added, outcome.modified, outcome.removed);
+        }
+        result
+    }
+
+    pub(crate) async fn reconcile_file_source_only(
+        &self,
+        workspace: &Workspace,
+        absolute_path: &Path,
+        relative_path: &Path,
+    ) -> Result<ReconcileOutcome> {
+        validate_reconcile_path(workspace, absolute_path, relative_path)?;
+        let lock_key = format!("{}:{}", workspace.id, normalize_path(relative_path));
+        let path_lock = {
+            let mut locks = self.path_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(lock_key)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _path_guard = path_lock.lock().await;
+        self.metrics.job_started();
+        let result = self
+            .reconcile_file_inner(workspace, absolute_path, relative_path, false)
             .await;
         self.metrics.job_finished(result.is_err());
         if let Ok(outcome) = &result {
@@ -173,6 +223,7 @@ impl IndexingService {
         workspace: &Workspace,
         absolute_path: &Path,
         relative_path: &Path,
+        reconcile_graph: bool,
     ) -> Result<ReconcileOutcome> {
         let _permit = self
             .permits
@@ -183,7 +234,9 @@ impl IndexingService {
         let metadata = match tokio::fs::metadata(absolute_path).await {
             Ok(metadata) => metadata,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return self.remove_document(workspace, &relative_path_string).await;
+                return self
+                    .remove_document(workspace, &relative_path_string, reconcile_graph)
+                    .await;
             }
             Err(source) => {
                 return Err(CortexError::Io {
@@ -193,12 +246,16 @@ impl IndexingService {
             }
         };
         if metadata.len() > self.max_file_bytes {
-            return self.remove_document(workspace, &relative_path_string).await;
+            return self
+                .remove_document(workspace, &relative_path_string, reconcile_graph)
+                .await;
         }
         let bytes = match tokio::fs::read(absolute_path).await {
             Ok(bytes) => bytes,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return self.remove_document(workspace, &relative_path_string).await;
+                return self
+                    .remove_document(workspace, &relative_path_string, reconcile_graph)
+                    .await;
             }
             Err(source) => {
                 return Err(CortexError::Io {
@@ -208,11 +265,17 @@ impl IndexingService {
             }
         };
         if bytes[..bytes.len().min(8_192)].contains(&0) {
-            return self.remove_document(workspace, &relative_path_string).await;
+            return self
+                .remove_document(workspace, &relative_path_string, reconcile_graph)
+                .await;
         }
         let source = match std::str::from_utf8(&bytes) {
             Ok(source) => source,
-            Err(_) => return self.remove_document(workspace, &relative_path_string).await,
+            Err(_) => {
+                return self
+                    .remove_document(workspace, &relative_path_string, reconcile_graph)
+                    .await;
+            }
         };
         let content_hash = blake3::hash(&bytes).to_hex().to_string();
         let analyzer = self.analyzers.for_path(relative_path);
@@ -272,7 +335,7 @@ impl IndexingService {
 
         if initial_tree_compatible
             && initial_embedding_space_compatible
-            && graph_compatible
+            && (!reconcile_graph || graph_compatible)
             && previous
                 .as_ref()
                 .is_some_and(|document| document.content_hash == content_hash)
@@ -495,10 +558,12 @@ impl IndexingService {
                 content_index_changed,
             )
             .await?;
-        let expected_analysis = self.graph_analysis_expectations(workspace, None).await?;
-        self.graph
-            .reconcile_document(&document, &structure_version, &analyzed, &expected_analysis)
-            .await?;
+        if reconcile_graph {
+            let expected_analysis = self.graph_analysis_expectations(workspace, None).await?;
+            self.graph
+                .reconcile_document(&document, &structure_version, &analyzed, &expected_analysis)
+                .await?;
+        }
 
         Ok(ReconcileOutcome {
             status: ReconcileStatus::Updated,
@@ -526,18 +591,19 @@ impl IndexingService {
         );
         let root = Path::new(&workspace.root_path);
         let discovered = scanner.scan(root)?;
+        let mut failed_paths: BTreeSet<_> = discovered.failed_relative_paths.into_iter().collect();
         let mut outcome = WorkspaceReindexOutcome {
             files_seen: discovered.files.len(),
             ..Default::default()
         };
         for file in discovered.files {
             let result = match self
-                .reconcile_file(workspace, &file.absolute_path, &file.relative_path)
+                .reconcile_file_source_only(workspace, &file.absolute_path, &file.relative_path)
                 .await
             {
                 Ok(result) => result,
                 Err(error) => {
-                    outcome.files_failed += 1;
+                    failed_paths.insert(normalize_path(&file.relative_path));
                     tracing::warn!(
                         path = %file.relative_path.display(),
                         error = %error,
@@ -552,6 +618,7 @@ impl IndexingService {
             outcome.chunks_embedded += result.embedded;
         }
         let current_scan = scanner.scan(root)?;
+        failed_paths.extend(current_scan.failed_relative_paths.iter().cloned());
         let current_paths: HashSet<String> = current_scan
             .files
             .into_iter()
@@ -562,34 +629,477 @@ impl IndexingService {
                 && !current_scan
                     .failed_relative_paths
                     .contains(&document.relative_path)
-            {
-                let expected_analysis = self
-                    .graph_analysis_expectations(workspace, Some(&document.relative_path))
-                    .await?;
-                if self
-                    .graph
-                    .delete_document(&workspace.id, &document.relative_path, &expected_analysis)
+                && self
+                    .storage
+                    .delete_document(&workspace.id, &document.relative_path)
                     .await?
+            {
+                outcome.files_removed += 1;
+            }
+        }
+        outcome.graph_repair = Some(
+            self.repair_graph(workspace, GraphRepairMode::IfNeeded)
+                .await?,
+        );
+        outcome.failed_paths = failed_paths.into_iter().collect();
+        outcome.files_failed = outcome.failed_paths.len();
+        Ok(outcome)
+    }
+
+    pub async fn graph_repair_plan(
+        &self,
+        workspace: &Workspace,
+        mode: GraphRepairMode,
+    ) -> Result<GraphRepairPlan> {
+        let revision = self
+            .storage
+            .workspace_graph_revision(&workspace.id)
+            .await?
+            .ok_or_else(|| {
+                CortexError::NotFound(format!("workspace graph revision {}", workspace.id))
+            })?;
+        let repair = self.storage.workspace_graph_repair(&workspace.id).await?;
+        let documents = self.storage.list_documents(&workspace.id).await?;
+        let nodes = self.storage.graph_nodes(&workspace.id).await?;
+        let facts = self.storage.graph_relationship_facts(&workspace.id).await?;
+        let edges = self.storage.graph_edges(&workspace.id).await?;
+        let unresolved = self.storage.unresolved_relationships(&workspace.id).await?;
+        let mut plans = Vec::with_capacity(documents.len());
+
+        for document in documents {
+            let analyzer = self.analyzers.for_path(Path::new(&document.relative_path));
+            let source_path = Path::new(&workspace.root_path).join(&document.relative_path);
+            let source_matches = tokio::fs::read(&source_path)
+                .await
+                .ok()
+                .is_some_and(|bytes| {
+                    blake3::hash(&bytes).to_hex().as_str() == document.content_hash
+                });
+            let state = self.storage.graph_analysis_state(&document.id).await?;
+            let manifest = self.storage.graph_projection_manifest(&document.id).await?;
+            let actual_counts = (
+                nodes
+                    .iter()
+                    .filter(|node| node.document_id.as_deref() == Some(&document.id))
+                    .count(),
+                facts
+                    .iter()
+                    .filter(|fact| fact.source_document_id == document.id)
+                    .count(),
+                edges
+                    .iter()
+                    .filter(|edge| edge.source_document_id.as_deref() == Some(&document.id))
+                    .count(),
+                unresolved
+                    .iter()
+                    .filter(|item| item.source_document_id == document.id)
+                    .count(),
+            );
+            let (disposition, reason) = if !source_matches {
+                (
+                    GraphRepairDisposition::RequiresSourceReconciliation,
+                    GraphRepairReason::SourceDrift,
+                )
+            } else if document.analyzer_id != analyzer.analyzer_id()
+                || document.analyzer_version != analyzer.analyzer_version()
+            {
+                (
+                    GraphRepairDisposition::RequiresSourceReconciliation,
+                    GraphRepairReason::AnalyzerMismatch,
+                )
+            } else if let Some(state) = state {
+                let manifest_matches = manifest.as_ref().is_some_and(|manifest| {
+                    manifest.workspace_id == document.workspace_id
+                        && manifest.content_revision == document.content_revision
+                        && manifest.analyzer_id == analyzer.analyzer_id()
+                        && manifest.analyzer_version == analyzer.analyzer_version()
+                        && manifest.structure_version == analyzer.structure_version()
+                        && (
+                            manifest.node_count,
+                            manifest.fact_count,
+                            manifest.edge_count,
+                            manifest.unresolved_count,
+                        ) == actual_counts
+                });
+                if state.content_revision != document.content_revision {
+                    (
+                        GraphRepairDisposition::Repair,
+                        GraphRepairReason::ContentRevisionMismatch,
+                    )
+                } else if state.analyzer_id != analyzer.analyzer_id()
+                    || state.analyzer_version != analyzer.analyzer_version()
                 {
-                    outcome.files_removed += 1;
+                    (
+                        GraphRepairDisposition::RequiresSourceReconciliation,
+                        GraphRepairReason::AnalyzerMismatch,
+                    )
+                } else if state.structure_version != analyzer.structure_version() {
+                    (
+                        GraphRepairDisposition::Repair,
+                        GraphRepairReason::StructureVersionMismatch,
+                    )
+                } else if state.last_error.is_some() {
+                    (
+                        GraphRepairDisposition::Repair,
+                        GraphRepairReason::PriorFailure,
+                    )
+                } else if manifest.is_none() {
+                    (
+                        GraphRepairDisposition::Repair,
+                        GraphRepairReason::MissingProjection,
+                    )
+                } else if !manifest_matches {
+                    (
+                        GraphRepairDisposition::Repair,
+                        GraphRepairReason::ProjectionMismatch,
+                    )
+                } else if mode == GraphRepairMode::Force {
+                    (
+                        GraphRepairDisposition::Repair,
+                        GraphRepairReason::ForceRequested,
+                    )
+                } else {
+                    (GraphRepairDisposition::Current, GraphRepairReason::Current)
+                }
+            } else {
+                (
+                    GraphRepairDisposition::Repair,
+                    GraphRepairReason::MissingDocumentAnalysis,
+                )
+            };
+            plans.push(GraphRepairDocumentPlan {
+                document_id: document.id,
+                relative_path: document.relative_path,
+                disposition,
+                reason,
+            });
+        }
+        plans.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        let reason = plans
+            .iter()
+            .find(|plan| plan.disposition != GraphRepairDisposition::Current)
+            .map(|plan| plan.reason.clone())
+            .unwrap_or_else(|| {
+                if let Some(repair) = repair {
+                    match repair.state {
+                        GraphRepairState::Active => GraphRepairReason::InProgressElsewhere,
+                        GraphRepairState::Failed => GraphRepairReason::PriorFailure,
+                        GraphRepairState::Interrupted => GraphRepairReason::InterruptedRepair,
+                        GraphRepairState::Completed if revision.is_current() => {
+                            GraphRepairReason::Current
+                        }
+                        GraphRepairState::Completed if revision.last_graph_error.is_some() => {
+                            GraphRepairReason::PriorFailure
+                        }
+                        GraphRepairState::Completed => GraphRepairReason::LegacyGraphMissing,
+                    }
+                } else if revision.is_current() {
+                    GraphRepairReason::Current
+                } else if revision.last_graph_error.is_some() {
+                    GraphRepairReason::PriorFailure
+                } else {
+                    GraphRepairReason::LegacyGraphMissing
+                }
+            });
+        Ok(GraphRepairPlan {
+            workspace_id: workspace.id.clone(),
+            mode,
+            reason,
+            revision_before: revision.content_revision,
+            graph_revision_before: revision.graph_content_revision,
+            documents: plans,
+        })
+    }
+
+    pub async fn repair_graph(
+        &self,
+        workspace: &Workspace,
+        mode: GraphRepairMode,
+    ) -> Result<GraphRepairOutcome> {
+        let plan = self.graph_repair_plan(workspace, mode).await?;
+        if plan.reason == GraphRepairReason::Current {
+            return Ok(GraphRepairOutcome {
+                workspace_id: plan.workspace_id.clone(),
+                mode,
+                reason: GraphRepairReason::Current,
+                revision_before: plan.revision_before,
+                revision_after: plan.revision_before,
+                graph_revision_before: plan.graph_revision_before,
+                graph_revision_after: plan.graph_revision_before,
+                documents_considered: plan.documents_considered(),
+                documents_analyzed: 0,
+                documents_unchanged: plan.documents_considered(),
+                documents_failed: 0,
+                nodes_projected: 0,
+                edges_projected: 0,
+                resolved_relationships: 0,
+                unresolved_relationships: 0,
+                embeddings_computed: 0,
+                source_revision_changed: false,
+                final_graph_state: GraphRepairState::Completed,
+                already_completed_elsewhere: false,
+                generation_id: None,
+                error: None,
+            });
+        }
+        let now = Utc::now();
+        let generation = GraphRepairGeneration {
+            workspace_id: workspace.id.clone(),
+            generation_id: Uuid::new_v4().to_string(),
+            mode,
+            target_content_revision: plan.revision_before,
+            state: GraphRepairState::Active,
+            started_at: now,
+            lease_expires_at: now + Duration::seconds(GRAPH_REPAIR_LEASE_SECONDS),
+            updated_at: now,
+            completed_at: None,
+            documents_considered: plan.documents_considered(),
+            documents_repaired: 0,
+            documents_failed: 0,
+            last_error: None,
+        };
+        let generation = match self.storage.acquire_graph_repair(&generation, now).await? {
+            GraphRepairAcquire::Acquired(generation) => generation,
+            GraphRepairAcquire::InProgress(active) => {
+                return Ok(self.graph_repair_outcome(
+                    &plan,
+                    &active,
+                    &GraphRepairProgress {
+                        reason: Some(GraphRepairReason::InProgressElsewhere),
+                        final_state: Some(GraphRepairState::Active),
+                        error: Some("a graph repair generation is already active".into()),
+                        ..Default::default()
+                    },
+                ));
+            }
+        };
+        let source_blockers = plan.documents_requiring_source_reconciliation();
+        if source_blockers != 0 {
+            let error =
+                "graph repair requires source reconciliation before projection can continue";
+            let failed = self
+                .storage
+                .fail_graph_repair(
+                    &workspace.id,
+                    &generation.generation_id,
+                    0,
+                    error,
+                    Utc::now(),
+                )
+                .await?;
+            return Ok(self.graph_repair_outcome(
+                &plan,
+                &generation,
+                &GraphRepairProgress {
+                    documents_failed: source_blockers,
+                    final_state: (!failed).then_some(GraphRepairState::Interrupted),
+                    error: Some(error.into()),
+                    ..Default::default()
+                },
+            ));
+        }
+
+        let expected_analysis = self.graph_analysis_expectations(workspace, None).await?;
+        let documents = self.storage.list_documents(&workspace.id).await?;
+        let by_id: HashMap<_, _> = documents
+            .into_iter()
+            .map(|document| (document.id.clone(), document))
+            .collect();
+        let mut progress = GraphRepairProgress::default();
+        for entry in plan
+            .documents
+            .iter()
+            .filter(|entry| entry.disposition == GraphRepairDisposition::Repair)
+        {
+            let document = by_id.get(&entry.document_id).ok_or_else(|| {
+                CortexError::Analysis(format!(
+                    "repair document {} disappeared",
+                    entry.relative_path
+                ))
+            })?;
+            let source_path = Path::new(&workspace.root_path).join(&document.relative_path);
+            let result = async {
+                let bytes =
+                    tokio::fs::read(&source_path)
+                        .await
+                        .map_err(|source| CortexError::Io {
+                            path: source_path.clone(),
+                            source,
+                        })?;
+                if blake3::hash(&bytes).to_hex().as_str() != document.content_hash {
+                    return Err(CortexError::Analysis(format!(
+                        "source changed while graph repair was running: {}",
+                        source_path.display()
+                    )));
+                }
+                let source = std::str::from_utf8(&bytes).map_err(|_| {
+                    CortexError::Analysis(format!(
+                        "source is no longer UTF-8: {}",
+                        source_path.display()
+                    ))
+                })?;
+                let analyzer = self.analyzers.for_path(Path::new(&document.relative_path));
+                let analyzed = analyzer.analyze(Path::new(&document.relative_path), source)?;
+                self.graph
+                    .reconcile_document_for_repair(
+                        document,
+                        &analyzer.structure_version(),
+                        &analyzed,
+                        &expected_analysis,
+                        &generation.generation_id,
+                    )
+                    .await
+            }
+            .await;
+            match result {
+                Ok(reconciliation) => {
+                    progress.documents_analyzed += 1;
+                    progress.resolved_relationships += reconciliation.resolved_relationships;
+                    progress.unresolved_relationships += reconciliation.unresolved_relationships;
+                    let manifest = self
+                        .storage
+                        .graph_projection_manifest(&document.id)
+                        .await?
+                        .ok_or_else(|| {
+                            CortexError::Analysis(
+                                "graph repair did not persist a projection manifest".into(),
+                            )
+                        })?;
+                    progress.nodes_projected += manifest.node_count;
+                    progress.edges_projected += manifest.edge_count;
+                    if !self
+                        .storage
+                        .record_graph_repair_progress(
+                            &workspace.id,
+                            &generation.generation_id,
+                            progress.documents_analyzed,
+                            Utc::now() + Duration::seconds(GRAPH_REPAIR_LEASE_SECONDS),
+                            Utc::now(),
+                        )
+                        .await?
+                    {
+                        progress.documents_failed = 1;
+                        progress.final_state = Some(GraphRepairState::Interrupted);
+                        progress.error = Some("graph repair lease was lost".into());
+                        return Ok(self.graph_repair_outcome(&plan, &generation, &progress));
+                    }
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    let failed = self
+                        .storage
+                        .fail_graph_repair(
+                            &workspace.id,
+                            &generation.generation_id,
+                            progress.documents_analyzed,
+                            &error,
+                            Utc::now(),
+                        )
+                        .await?;
+                    progress.documents_failed = 1;
+                    if !failed {
+                        progress.final_state = Some(GraphRepairState::Interrupted);
+                    }
+                    progress.error = Some(error);
+                    return Ok(self.graph_repair_outcome(&plan, &generation, &progress));
                 }
             }
         }
-        Ok(outcome)
+        let completed = self
+            .storage
+            .complete_graph_repair(
+                &workspace.id,
+                &generation.generation_id,
+                generation.target_content_revision,
+                &expected_analysis,
+                Utc::now(),
+            )
+            .await?;
+        if !completed {
+            let error = "graph repair could not verify and publish the complete projection";
+            let failed = self
+                .storage
+                .fail_graph_repair(
+                    &workspace.id,
+                    &generation.generation_id,
+                    progress.documents_analyzed,
+                    error,
+                    Utc::now(),
+                )
+                .await?;
+            progress.documents_failed = 1;
+            if !failed {
+                progress.final_state = Some(GraphRepairState::Interrupted);
+            }
+            progress.error = Some(error.into());
+            return Ok(self.graph_repair_outcome(&plan, &generation, &progress));
+        }
+        Ok(self.graph_repair_outcome(&plan, &generation, &progress))
+    }
+
+    fn graph_repair_outcome(
+        &self,
+        plan: &GraphRepairPlan,
+        generation: &GraphRepairGeneration,
+        progress: &GraphRepairProgress,
+    ) -> GraphRepairOutcome {
+        let completed = progress.error.is_none() && progress.final_state.is_none();
+        GraphRepairOutcome {
+            workspace_id: plan.workspace_id.clone(),
+            mode: plan.mode,
+            reason: progress
+                .reason
+                .clone()
+                .unwrap_or_else(|| plan.reason.clone()),
+            revision_before: plan.revision_before,
+            revision_after: plan.revision_before,
+            graph_revision_before: plan.graph_revision_before,
+            graph_revision_after: if completed {
+                plan.revision_before
+            } else {
+                plan.graph_revision_before
+            },
+            documents_considered: plan.documents_considered(),
+            documents_analyzed: progress.documents_analyzed,
+            documents_unchanged: plan
+                .documents_considered()
+                .saturating_sub(progress.documents_analyzed),
+            documents_failed: progress.documents_failed,
+            nodes_projected: progress.nodes_projected,
+            edges_projected: progress.edges_projected,
+            resolved_relationships: progress.resolved_relationships,
+            unresolved_relationships: progress.unresolved_relationships,
+            embeddings_computed: 0,
+            source_revision_changed: false,
+            final_graph_state: if completed {
+                GraphRepairState::Completed
+            } else {
+                progress.final_state.unwrap_or(GraphRepairState::Failed)
+            },
+            already_completed_elsewhere: progress.already_completed_elsewhere,
+            generation_id: Some(generation.generation_id.clone()),
+            error: progress.error.clone(),
+        }
     }
 
     async fn remove_document(
         &self,
         workspace: &Workspace,
         relative_path: &str,
+        reconcile_graph: bool,
     ) -> Result<ReconcileOutcome> {
-        let expected_analysis = self
-            .graph_analysis_expectations(workspace, Some(relative_path))
-            .await?;
-        let removed = self
-            .graph
-            .delete_document(&workspace.id, relative_path, &expected_analysis)
-            .await?;
+        let removed = if reconcile_graph {
+            let expected_analysis = self
+                .graph_analysis_expectations(workspace, Some(relative_path))
+                .await?;
+            self.graph
+                .delete_document(&workspace.id, relative_path, &expected_analysis)
+                .await?
+        } else {
+            self.storage
+                .delete_document(&workspace.id, relative_path)
+                .await?
+        };
         Ok(ReconcileOutcome {
             status: if removed {
                 ReconcileStatus::Removed
@@ -1936,6 +2446,7 @@ mod tests {
         );
         let outcome = partial.reindex_workspace(&workspace).await.unwrap();
         assert_eq!(outcome.files_failed, 1);
+        assert_eq!(outcome.failed_paths, vec!["a.rs"]);
         assert_eq!(outcome.files_updated, 1);
         let failing_after = storage
             .find_document(&workspace.id, "a.rs")

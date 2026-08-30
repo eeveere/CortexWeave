@@ -86,6 +86,11 @@ enum WorkspaceCommand {
 
 #[derive(Debug, Subcommand)]
 enum GraphCommand {
+    Rebuild {
+        workspace_id: String,
+        #[arg(long)]
+        force: bool,
+    },
     Status {
         workspace_id: String,
     },
@@ -409,6 +414,7 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
         }
         Command::Status { workspace_id } => {
             if let Some(workspace_id) = workspace_id {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
                 print_json(service.workspace_status(&workspace_id).await?)?;
             } else {
                 let mut statuses = Vec::new();
@@ -420,6 +426,7 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
         }
         Command::Readiness { workspace_id } => {
             if let Some(workspace_id) = workspace_id {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
                 print_json(service.workspace_readiness(&workspace_id).await?)?;
             } else {
                 let mut reports = Vec::new();
@@ -430,6 +437,10 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
             }
         }
         Command::Metrics { workspace_id } => {
+            let workspace_id = match workspace_id {
+                Some(selector) => Some(cli_workspace_id(&service, &selector).await?),
+                None => None,
+            };
             print_json(service.instrumentation(workspace_id.as_deref()).await?)?;
         }
         Command::Workspace { command } => match command {
@@ -440,132 +451,191 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
             WorkspaceCommand::List => print_json(service.list_workspaces().await?)?,
         },
         Command::Graph { command } => match command {
+            GraphCommand::Rebuild {
+                workspace_id,
+                force,
+            } => print_json(
+                service
+                    .workspace_graph_repair(
+                        &cli_workspace_id(&service, &workspace_id).await?,
+                        if force {
+                            cortexweave::domain::GraphRepairMode::Force
+                        } else {
+                            cortexweave::domain::GraphRepairMode::IfNeeded
+                        },
+                    )
+                    .await?,
+            )?,
             GraphCommand::Status { workspace_id } => {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
                 print_json(service.workspace_graph_status(&workspace_id).await?)?
             }
             GraphCommand::Find {
                 workspace_id,
                 symbol_or_path,
                 options,
-            } => print_json(
-                service
-                    .graph_find_symbol(&workspace_id, &symbol_or_path, &graph_read_options(options))
-                    .await?,
-            )?,
+            } => {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
+                print_json(
+                    service
+                        .graph_find_symbol(
+                            &workspace_id,
+                            &symbol_or_path,
+                            &graph_read_options(options),
+                        )
+                        .await?,
+                )?
+            }
             GraphCommand::Neighbors {
                 workspace_id,
                 node_id,
                 options,
-            } => print_json(
-                service
-                    .graph_neighbors(&workspace_id, &node_id, &graph_read_options(options))
-                    .await?,
-            )?,
+            } => {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
+                print_json(
+                    service
+                        .graph_neighbors(&workspace_id, &node_id, &graph_read_options(options))
+                        .await?,
+                )?
+            }
             GraphCommand::Callers {
                 workspace_id,
                 node_id,
                 options,
-            } => print_json(
-                service
-                    .graph_callers(&workspace_id, &node_id, &graph_read_options(options))
-                    .await?,
-            )?,
+            } => {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
+                print_json(
+                    service
+                        .graph_callers(&workspace_id, &node_id, &graph_read_options(options))
+                        .await?,
+                )?
+            }
             GraphCommand::Callees {
                 workspace_id,
                 node_id,
                 options,
-            } => print_json(
-                service
-                    .graph_callees(&workspace_id, &node_id, &graph_read_options(options))
-                    .await?,
-            )?,
+            } => {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
+                print_json(
+                    service
+                        .graph_callees(&workspace_id, &node_id, &graph_read_options(options))
+                        .await?,
+                )?
+            }
             GraphCommand::References {
                 workspace_id,
                 node_id,
                 options,
-            } => print_json(
-                service
-                    .graph_references(&workspace_id, &node_id, &graph_read_options(options))
-                    .await?,
-            )?,
+            } => {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
+                print_json(
+                    service
+                        .graph_references(&workspace_id, &node_id, &graph_read_options(options))
+                        .await?,
+                )?
+            }
             GraphCommand::Implementations {
                 workspace_id,
                 node_id,
                 options,
-            } => print_json(
-                service
-                    .graph_implementations(&workspace_id, &node_id, &graph_read_options(options))
-                    .await?,
-            )?,
+            } => {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
+                print_json(
+                    service
+                        .graph_implementations(
+                            &workspace_id,
+                            &node_id,
+                            &graph_read_options(options),
+                        )
+                        .await?,
+                )?
+            }
             GraphCommand::Tests {
                 workspace_id,
                 node_id,
                 options,
-            } => print_json(
-                service
-                    .graph_tests(&workspace_id, &node_id, &graph_read_options(options))
-                    .await?,
-            )?,
+            } => {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
+                print_json(
+                    service
+                        .graph_tests(&workspace_id, &node_id, &graph_read_options(options))
+                        .await?,
+                )?
+            }
             GraphCommand::Dependencies {
                 workspace_id,
                 node_id,
                 options,
-            } => print_json(
-                service
-                    .graph_dependencies(&workspace_id, &node_id, &graph_read_options(options))
-                    .await?,
-            )?,
+            } => {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
+                print_json(
+                    service
+                        .graph_dependencies(&workspace_id, &node_id, &graph_read_options(options))
+                        .await?,
+                )?
+            }
             GraphCommand::Dependents {
                 workspace_id,
                 node_id,
                 options,
-            } => print_json(
-                service
-                    .graph_dependents(&workspace_id, &node_id, &graph_read_options(options))
-                    .await?,
-            )?,
+            } => {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
+                print_json(
+                    service
+                        .graph_dependents(&workspace_id, &node_id, &graph_read_options(options))
+                        .await?,
+                )?
+            }
             GraphCommand::ImpactSymbol {
                 workspace_id,
                 symbol,
                 options,
-            } => print_json(
-                service
-                    .graph_impact_symbol(&workspace_id, &symbol, &graph_read_options(options))
-                    .await?,
-            )?,
+            } => {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
+                print_json(
+                    service
+                        .graph_impact_symbol(&workspace_id, &symbol, &graph_read_options(options))
+                        .await?,
+                )?
+            }
             GraphCommand::ImpactPath {
                 workspace_id,
                 path,
                 options,
-            } => print_json(
-                service
-                    .graph_impact_path(&workspace_id, &path, &graph_read_options(options))
-                    .await?,
-            )?,
+            } => {
+                let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
+                print_json(
+                    service
+                        .graph_impact_path(&workspace_id, &path, &graph_read_options(options))
+                        .await?,
+                )?
+            }
         },
         Command::Search(args) => {
+            let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
             let limit = args.limit.unwrap_or(service.config().retrieval.default_k);
             let results = match args.mode {
                 SearchMode::Semantic => {
                     service
-                        .semantic_search(&args.workspace_id, &args.query, limit)
+                        .semantic_search(&workspace_id, &args.query, limit)
                         .await?
                 }
                 SearchMode::Lexical => {
                     service
-                        .lexical_search(&args.workspace_id, &args.query, limit)
+                        .lexical_search(&workspace_id, &args.query, limit)
                         .await?
                 }
                 SearchMode::Hybrid => {
                     service
-                        .hybrid_search(&args.workspace_id, &args.query, limit)
+                        .hybrid_search(&workspace_id, &args.query, limit)
                         .await?
                 }
             };
             print_json(results)?;
         }
         Command::Context(args) => {
-            let mut request = ContextRequest::new(args.workspace_id);
+            let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+            let mut request = ContextRequest::new(workspace_id);
             request.query = Some(args.query);
             request.session_id = args.session_id;
             request.task_id = args.task_id;
@@ -580,7 +650,8 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
             print_json(service.semantic_context(request).await?)?;
         }
         Command::Resume(args) => {
-            let mut request = ResumeContextRequest::new(args.workspace_id);
+            let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+            let mut request = ResumeContextRequest::new(workspace_id);
             request.session_id = args.session_id;
             request.task_id = args.task_id;
             request.token_budget = args.token_budget.unwrap_or(request.token_budget);
@@ -588,21 +659,19 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
             print_json(service.resume_context(request).await?)?;
         }
         Command::WorkingSet(args) => {
+            let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
             print_json(
                 service
-                    .inspect_working_set(
-                        &args.workspace_id,
-                        &args.session_id,
-                        args.task_id.as_deref(),
-                    )
+                    .inspect_working_set(&workspace_id, &args.session_id, args.task_id.as_deref())
                     .await?,
             )?;
         }
         Command::ContextPin(args) => {
+            let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
             print_json(
                 service
                     .pin_context(
-                        &args.workspace_id,
+                        &workspace_id,
                         &args.session_id,
                         args.task_id.as_deref(),
                         &args.source_id,
@@ -612,10 +681,11 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
             )?;
         }
         Command::ContextUnpin(args) => {
+            let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
             print_json(
                 service
                     .unpin_context(
-                        &args.workspace_id,
+                        &workspace_id,
                         &args.session_id,
                         args.task_id.as_deref(),
                         &args.source_id,
@@ -626,8 +696,8 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
         }
         Command::Checkpoint { command } => match command {
             CheckpointCommand::Create(args) => {
-                let mut checkpoint =
-                    Checkpoint::new(args.workspace_id, args.session_id, args.content);
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                let mut checkpoint = Checkpoint::new(workspace_id, args.session_id, args.content);
                 checkpoint.task_id = args.task_id;
                 checkpoint.objective = args.objective;
                 checkpoint.completed = args.completed;
@@ -639,18 +709,19 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
                 print_json(service.create_checkpoint(checkpoint).await?)?;
             }
             CheckpointCommand::Latest(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
                 let checkpoint = match (args.session_id, args.task_id) {
                     (Some(session_id), None) => {
                         service
-                            .latest_checkpoint_for_session(&args.workspace_id, &session_id)
+                            .latest_checkpoint_for_session(&workspace_id, &session_id)
                             .await?
                     }
                     (None, Some(task_id)) => {
                         service
-                            .latest_checkpoint_for_task(&args.workspace_id, &task_id)
+                            .latest_checkpoint_for_task(&workspace_id, &task_id)
                             .await?
                     }
-                    (None, None) => service.latest_checkpoint(&args.workspace_id).await?,
+                    (None, None) => service.latest_checkpoint(&workspace_id).await?,
                     (Some(_), Some(_)) => {
                         unreachable!("clap enforces conflicting checkpoint scopes")
                     }
@@ -660,14 +731,14 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
         },
         Command::Memory { command } => match command {
             MemoryCommand::Add(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
                 let metadata: Value = args
                     .metadata
                     .as_deref()
                     .map(serde_json::from_str)
                     .transpose()?
                     .unwrap_or_else(|| json!({}));
-                let mut memory =
-                    MemoryRecord::new(args.workspace_id, args.kind.into(), args.content);
+                let mut memory = MemoryRecord::new(workspace_id, args.kind.into(), args.content);
                 memory.session_id = args.session_id;
                 memory.task_id = args.task_id;
                 memory.related_paths = args.related_paths;
@@ -676,10 +747,43 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
             }
         },
         Command::Reindex { workspace_id } => {
+            let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
             print_json(service.workspace_reindex(&workspace_id).await?)?
         }
     }
     Ok(())
+}
+
+async fn cli_workspace_id(service: &CortexWeaveService, selector: &str) -> Result<String> {
+    Ok(service
+        .resolve_workspace(parse_workspace_selector(selector), None)
+        .await?
+        .id)
+}
+
+fn parse_workspace_selector(value: &str) -> WorkspaceSelector {
+    if value
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
+        WorkspaceSelector::FileUri(value.to_owned())
+    } else if uuid::Uuid::parse_str(value).is_ok() {
+        WorkspaceSelector::Id(value.to_owned())
+    } else if looks_like_absolute_path(value) {
+        WorkspaceSelector::RootPath(PathBuf::from(value))
+    } else {
+        WorkspaceSelector::Name(value.to_owned())
+    }
+}
+
+fn looks_like_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    PathBuf::from(value).is_absolute()
+        || value.starts_with('/')
+        || value.starts_with(r"\\")
+        || (bytes.get(1) == Some(&b':')
+            && bytes.first().is_some_and(u8::is_ascii_alphabetic)
+            && matches!(bytes.get(2), Some(b'/' | b'\\')))
 }
 
 fn serve_workspace_hint(argument: Option<PathBuf>) -> Option<WorkspaceHint> {

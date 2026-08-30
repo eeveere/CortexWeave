@@ -60,6 +60,42 @@ impl GraphIndexer {
         analysis: &AnalysisResult,
         expected_analysis: &[GraphAnalysisExpectation],
     ) -> Result<GraphReconcileOutcome> {
+        self.reconcile_document_inner(
+            document,
+            structure_version,
+            analysis,
+            expected_analysis,
+            None,
+        )
+        .await
+    }
+
+    pub async fn reconcile_document_for_repair(
+        &self,
+        document: &Document,
+        structure_version: &str,
+        analysis: &AnalysisResult,
+        expected_analysis: &[GraphAnalysisExpectation],
+        repair_generation_id: &str,
+    ) -> Result<GraphReconcileOutcome> {
+        self.reconcile_document_inner(
+            document,
+            structure_version,
+            analysis,
+            expected_analysis,
+            Some(repair_generation_id),
+        )
+        .await
+    }
+
+    async fn reconcile_document_inner(
+        &self,
+        document: &Document,
+        structure_version: &str,
+        analysis: &AnalysisResult,
+        expected_analysis: &[GraphAnalysisExpectation],
+        repair_generation_id: Option<&str>,
+    ) -> Result<GraphReconcileOutcome> {
         let mut graph_snapshot = self
             .storage
             .workspace_graph_revision(&document.workspace_id)
@@ -80,6 +116,7 @@ impl GraphIndexer {
                     analysis,
                     expected_analysis,
                     target_revision,
+                    repair_generation_id,
                 )
                 .await;
             let mut batch = match prepared {
@@ -91,6 +128,7 @@ impl GraphIndexer {
                             &document.workspace_id,
                             target_revision,
                             graph_snapshot.updated_at,
+                            repair_generation_id,
                             &error.to_string(),
                             next_update_time(graph_snapshot.updated_at),
                         )
@@ -107,6 +145,7 @@ impl GraphIndexer {
                     target_revision,
                     graph_snapshot.updated_at,
                     update_started_at,
+                    repair_generation_id,
                 )
                 .await?
             {
@@ -232,6 +271,7 @@ impl GraphIndexer {
         analysis: &AnalysisResult,
         expected_analysis: &[GraphAnalysisExpectation],
         target_revision: i64,
+        repair_generation_id: Option<&str>,
     ) -> Result<GraphReconciliationBatch> {
         if document.analyzer_id.trim().is_empty() || structure_version.trim().is_empty() {
             return Err(CortexError::Analysis(
@@ -306,6 +346,7 @@ impl GraphIndexer {
             target_content_revision: target_revision,
             expected_graph_updated_at: None,
             update_started_at: None,
+            repair_generation_id: repair_generation_id.map(str::to_owned),
             delete_relative_path: None,
             source_document_id: Some(document.id.clone()),
             nodes,
@@ -383,6 +424,7 @@ impl GraphIndexer {
             target_content_revision: target_revision,
             expected_graph_updated_at: Some(expected_graph_updated_at),
             update_started_at: None,
+            repair_generation_id: None,
             delete_relative_path: Some(document.relative_path.clone()),
             source_document_id: None,
             nodes: Vec::new(),

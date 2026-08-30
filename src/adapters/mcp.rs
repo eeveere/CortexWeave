@@ -15,8 +15,8 @@ use tokio::task::JoinHandle;
 use crate::{
     CortexWeaveService,
     domain::{
-        Checkpoint, ContextRequest, ContextSourceType, CortexEvent, EventType, MemoryKind,
-        MemoryRecord, ResumeContextRequest, StructuralReadOptions,
+        Checkpoint, ContextRequest, ContextSourceType, CortexEvent, EventType, GraphRepairMode,
+        MemoryKind, MemoryRecord, ResumeContextRequest, StructuralReadOptions,
     },
     indexing::{WorkspaceWatcher, WorkspaceWatcherHandle},
     workspace::WorkspaceSelector,
@@ -225,6 +225,7 @@ impl McpServer {
             "semantic_get" => self.semantic_get(arguments).await,
             "graph_find" => self.graph_find(arguments).await,
             "graph_status" => self.graph_status(arguments).await,
+            "graph_rebuild" => self.graph_rebuild(arguments).await,
             "graph_neighbors" => {
                 self.graph_node_query(arguments, GraphNodeQuery::Neighbors)
                     .await
@@ -431,6 +432,20 @@ impl McpServer {
     async fn graph_status(&self, args: &Map<String, Value>) -> ToolResult {
         let workspace = self.resolve_workspace(args).await?;
         serialize_service(self.service.workspace_graph_status(&workspace.id).await)
+    }
+
+    async fn graph_rebuild(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        let mode = if optional_bool(args, "force", false)? {
+            GraphRepairMode::Force
+        } else {
+            GraphRepairMode::IfNeeded
+        };
+        serialize_service(
+            self.service
+                .workspace_graph_repair(&workspace.id, mode)
+                .await,
+        )
     }
 
     async fn graph_node_query(
@@ -802,6 +817,12 @@ fn tool_definitions() -> Vec<Value> {
             "Find exact graph symbols or a source path. Use returned node IDs with graph relation tools. Reads require a current graph unless allow_stale is explicitly true.",
             graph_properties(json!({ "symbol_or_path": string_schema() })),
             &["symbol_or_path"],
+        ),
+        tool(
+            "graph_rebuild",
+            "Rebuild graph projections for the resolved workspace without recomputing embeddings. Use force only to reproject an otherwise current graph.",
+            workspace_properties(json!({ "force": { "type": "boolean" } })),
+            &[],
         ),
         tool(
             "graph_neighbors",
@@ -1260,6 +1281,7 @@ mod tests {
             initialized["result"]["capabilities"]["tools"]["listChanged"],
             false
         );
+        assert_eq!(initialized["result"]["serverInfo"]["version"], "0.4.1");
         let listed = server
             .handle_json(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
             .await
@@ -1286,6 +1308,7 @@ mod tests {
             "workspace_list",
             "workspace_status",
             "workspace_reindex",
+            "graph_rebuild",
             "graph_status",
             "graph_find",
             "graph_callers",

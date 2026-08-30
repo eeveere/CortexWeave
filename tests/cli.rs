@@ -4,6 +4,19 @@ use serde_json::Value;
 use tempfile::tempdir;
 
 #[test]
+fn version_reports_the_release_identity() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cortexweave"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "cortexweave 0.4.1"
+    );
+}
+
+#[test]
 fn workspace_and_memory_commands_use_the_service_facade() {
     let directory = tempdir().unwrap();
     let root = directory.path().join("workspace");
@@ -47,12 +60,17 @@ fn workspace_and_memory_commands_use_the_service_facade() {
     let workspaces: Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(workspaces.as_array().unwrap().len(), 1);
 
-    let status = run(&config, &["status", workspace_id]);
+    let status = run(&config, &["status", "fixture"]);
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["workspace"]["name"], "fixture");
     assert_eq!(status["documents_indexed"], 0);
 
-    let readiness = run(&config, &["readiness", workspace_id]);
+    let rebuilt = run(&config, &["graph", "rebuild", "fixture"]);
+    let rebuilt: Value = serde_json::from_slice(&rebuilt.stdout).unwrap();
+    assert_eq!(rebuilt["final_graph_state"], "completed");
+    assert_eq!(rebuilt["embeddings_computed"], 0);
+
+    let readiness = run(&config, &["readiness", "fixture"]);
     let readiness: Value = serde_json::from_slice(&readiness.stdout).unwrap();
     assert_eq!(readiness["read_only"], true);
     assert_eq!(readiness["supported_fallback_files"], 1);
@@ -67,7 +85,7 @@ fn workspace_and_memory_commands_use_the_service_facade() {
         &[
             "memory",
             "add",
-            workspace_id,
+            "fixture",
             "Use BLAKE3 for deterministic change detection.",
             "--kind",
             "decision",
@@ -83,7 +101,7 @@ fn workspace_and_memory_commands_use_the_service_facade() {
         &config,
         &[
             "context",
-            workspace_id,
+            "fixture",
             "BLAKE3",
             "--token-budget",
             "256",
@@ -103,7 +121,7 @@ fn workspace_and_memory_commands_use_the_service_facade() {
             .any(|item| item["source_type"] == "memory")
     );
 
-    let resume = run(&config, &["resume", workspace_id, "--token-budget", "256"]);
+    let resume = run(&config, &["resume", "fixture", "--token-budget", "256"]);
     let resume: Value = serde_json::from_slice(&resume.stdout).unwrap();
     assert_eq!(resume["workspace_id"], workspace_id);
     assert_eq!(resume["packet"]["token_budget"], 256);
@@ -125,6 +143,7 @@ fn graph_command_exposes_bounded_structural_subcommands() {
         "implementations",
         "impact-symbol",
         "impact-path",
+        "rebuild",
     ] {
         assert!(help.contains(command), "missing graph command {command}");
     }
