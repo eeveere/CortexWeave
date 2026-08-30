@@ -8,7 +8,7 @@ durable structural code graph with provenance, and returns bounded, explainable
 context packets through a CLI and MCP over stdio.
 
 It is not an agent harness. CortexWeave does not invoke reasoning models,
-execute tools, or orchestrate agent loops. A harness such as Crush decides when
+execute tools, or orchestrate agent loops. A harness such as [Crush](https://github.com/charmbracelet/crush "Glamourous agentic coding for all 💘") decides when
 to call it and owns any subsequent tool use.
 
 ## What It Provides
