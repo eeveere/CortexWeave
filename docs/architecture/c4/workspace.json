@@ -1,0 +1,2423 @@
+{
+  "configuration" : { },
+  "description" : "Repository-grounded C4/Structurizr model for CortexWeave v0.5.0 as implemented.",
+  "documentation" : { },
+  "id" : 1,
+  "lastModifiedDate" : "2026-09-02T13:19:58Z",
+  "model" : {
+    "deploymentNodes" : [ {
+      "children" : [ {
+        "containerInstances" : [ {
+          "containerId" : "6",
+          "environment" : "Local development",
+          "id" : "35",
+          "instanceId" : 1,
+          "properties" : {
+            "structurizr.dsl.identifier" : "58e2cdcf-0f1f-4df2-a279-327ebd2a4bc5.3c177b35-e3ad-449e-9698-73a9f4c63549.01173304-0d47-43ae-9fe4-e10f03504595.9802c708-7d9c-4e68-9f11-23233b9628e1"
+          },
+          "tags" : "Container Instance"
+        } ],
+        "description" : "One process launched for CLI operation or MCP stdio serving.",
+        "environment" : "Local development",
+        "id" : "34",
+        "instances" : "1",
+        "name" : "CortexWeave Rust Process",
+        "properties" : {
+          "structurizr.dsl.identifier" : "58e2cdcf-0f1f-4df2-a279-327ebd2a4bc5.3c177b35-e3ad-449e-9698-73a9f4c63549.01173304-0d47-43ae-9fe4-e10f03504595"
+        },
+        "tags" : "Element,Deployment Node",
+        "technology" : "Rust / Tokio"
+      }, {
+        "containerInstances" : [ {
+          "containerId" : "32",
+          "environment" : "Local development",
+          "id" : "37",
+          "instanceId" : 1,
+          "properties" : {
+            "structurizr.dsl.identifier" : "58e2cdcf-0f1f-4df2-a279-327ebd2a4bc5.3c177b35-e3ad-449e-9698-73a9f4c63549.6b4f198c-b638-4686-8866-66c377f97ecc.3ece01f5-2f30-46c0-be51-f147a4c7aa8a"
+          },
+          "tags" : "Container Instance"
+        } ],
+        "description" : "Local CortexWeave database file.",
+        "environment" : "Local development",
+        "id" : "36",
+        "instances" : "1",
+        "name" : "SQLite Database File",
+        "properties" : {
+          "structurizr.dsl.identifier" : "58e2cdcf-0f1f-4df2-a279-327ebd2a4bc5.3c177b35-e3ad-449e-9698-73a9f4c63549.6b4f198c-b638-4686-8866-66c377f97ecc"
+        },
+        "tags" : "Element,Deployment Node",
+        "technology" : "SQLite"
+      } ],
+      "description" : "A developer machine running local-first CortexWeave.",
+      "environment" : "Local development",
+      "id" : "33",
+      "infrastructureNodes" : [ {
+        "description" : "Authoritative project source/documents under registered roots.",
+        "environment" : "Local development",
+        "id" : "38",
+        "name" : "Registered Workspace Filesystem",
+        "properties" : {
+          "structurizr.dsl.identifier" : "58e2cdcf-0f1f-4df2-a279-327ebd2a4bc5.3c177b35-e3ad-449e-9698-73a9f4c63549.cc25e383-de7d-4e10-9c79-f5d381e78b41"
+        },
+        "tags" : "Element,Infrastructure Node",
+        "technology" : "Filesystem"
+      }, {
+        "description" : "Distinct process; may run on the same workstation.",
+        "environment" : "Local development",
+        "id" : "39",
+        "name" : "Agent Harness / MCP Client Process",
+        "properties" : {
+          "structurizr.dsl.identifier" : "58e2cdcf-0f1f-4df2-a279-327ebd2a4bc5.3c177b35-e3ad-449e-9698-73a9f4c63549.60061067-a1b2-4221-85d2-54ae95676740"
+        },
+        "tags" : "Element,Infrastructure Node",
+        "technology" : "External process"
+      }, {
+        "description" : "OpenAI-compatible provider; may run locally but remains external to CortexWeave.",
+        "environment" : "Local development",
+        "id" : "40",
+        "name" : "Embedding Server Process",
+        "properties" : {
+          "structurizr.dsl.identifier" : "58e2cdcf-0f1f-4df2-a279-327ebd2a4bc5.3c177b35-e3ad-449e-9698-73a9f4c63549.0b10202f-67ce-4de1-a07e-c7037a5c2437"
+        },
+        "tags" : "Element,Infrastructure Node",
+        "technology" : "HTTP service"
+      } ],
+      "instances" : "1",
+      "name" : "Developer Workstation",
+      "properties" : {
+        "structurizr.dsl.identifier" : "58e2cdcf-0f1f-4df2-a279-327ebd2a4bc5.3c177b35-e3ad-449e-9698-73a9f4c63549"
+      },
+      "tags" : "Element,Deployment Node",
+      "technology" : "Windows/macOS/Linux"
+    } ],
+    "people" : [ {
+      "description" : "Invokes CortexWeave through its CLI and configures or operates an agent integration.",
+      "id" : "1",
+      "name" : "User / Operator",
+      "properties" : {
+        "structurizr.dsl.identifier" : "operator"
+      },
+      "relationships" : [ {
+        "description" : "Runs commands and receives diagnostic/index/search/context output",
+        "destinationId" : "7",
+        "id" : "41",
+        "sourceId" : "1",
+        "tags" : "Relationship",
+        "technology" : "CLI"
+      }, {
+        "description" : "Runs commands and receives diagnostic/index/search/context output",
+        "destinationId" : "6",
+        "id" : "42",
+        "linkedRelationshipId" : "41",
+        "sourceId" : "1",
+        "technology" : "CLI"
+      }, {
+        "description" : "Runs commands and receives diagnostic/index/search/context output",
+        "destinationId" : "5",
+        "id" : "43",
+        "linkedRelationshipId" : "41",
+        "sourceId" : "1",
+        "technology" : "CLI"
+      }, {
+        "description" : "Configures or operates the integration",
+        "destinationId" : "2",
+        "id" : "44",
+        "sourceId" : "1",
+        "tags" : "Relationship"
+      }, {
+        "description" : "Operates directly through CLI and configuration",
+        "destinationId" : "5",
+        "id" : "49",
+        "sourceId" : "1",
+        "tags" : "Relationship"
+      } ],
+      "tags" : "Element,Person"
+    } ],
+    "softwareSystems" : [ {
+      "description" : "External system that owns reasoning-model invocation, planning, developer-tool execution, agent loops, retries, and stopping behavior.",
+      "documentation" : { },
+      "id" : "2",
+      "name" : "Coding Agent / Agent Harness",
+      "properties" : {
+        "structurizr.dsl.identifier" : "agentHarness"
+      },
+      "relationships" : [ {
+        "description" : "Requests indexed context and records operational state",
+        "destinationId" : "8",
+        "id" : "45",
+        "sourceId" : "2",
+        "tags" : "Relationship",
+        "technology" : "MCP / stdio JSON-RPC"
+      }, {
+        "description" : "Requests indexed context and records operational state",
+        "destinationId" : "6",
+        "id" : "46",
+        "linkedRelationshipId" : "45",
+        "sourceId" : "2",
+        "technology" : "MCP / stdio JSON-RPC"
+      }, {
+        "description" : "Requests indexed context and records operational state",
+        "destinationId" : "5",
+        "id" : "47",
+        "linkedRelationshipId" : "45",
+        "sourceId" : "2",
+        "technology" : "MCP / stdio JSON-RPC"
+      }, {
+        "description" : "May invoke transport-neutral native Rust API",
+        "destinationId" : "9",
+        "id" : "48",
+        "sourceId" : "2",
+        "tags" : "Relationship",
+        "technology" : "Rust API"
+      }, {
+        "description" : "Uses as a context substrate, not as an agent harness",
+        "destinationId" : "5",
+        "id" : "50",
+        "sourceId" : "2",
+        "tags" : "Relationship"
+      } ],
+      "tags" : "Element,Software System,External"
+    }, {
+      "description" : "External authoritative filesystem containing project source and documents observed and indexed by CortexWeave.",
+      "documentation" : { },
+      "id" : "3",
+      "name" : "Registered Workspace",
+      "properties" : {
+        "structurizr.dsl.identifier" : "registeredWorkspace"
+      },
+      "relationships" : [ {
+        "description" : "Emits observed filesystem-change notifications while an MCP server owns the watcher",
+        "destinationId" : "15",
+        "id" : "76",
+        "sourceId" : "3",
+        "tags" : "Relationship",
+        "technology" : "notify"
+      }, {
+        "description" : "Emits observed filesystem-change notifications while an MCP server owns the watcher",
+        "destinationId" : "6",
+        "id" : "77",
+        "linkedRelationshipId" : "76",
+        "sourceId" : "3",
+        "technology" : "notify"
+      }, {
+        "description" : "Emits observed filesystem-change notifications while an MCP server owns the watcher",
+        "destinationId" : "5",
+        "id" : "78",
+        "linkedRelationshipId" : "76",
+        "sourceId" : "3",
+        "technology" : "notify"
+      } ],
+      "tags" : "Element,Software System,External,Authoritative"
+    }, {
+      "description" : "External OpenAI-compatible embedding provider that generates document and query vectors.",
+      "documentation" : { },
+      "id" : "4",
+      "name" : "Embedding Service",
+      "properties" : {
+        "structurizr.dsl.identifier" : "embeddingService"
+      },
+      "tags" : "Element,Software System,External"
+    }, {
+      "containers" : [ {
+        "components" : [ {
+          "description" : "Parses Clap commands, loads configuration at startup, invokes the facade, and renders results.",
+          "documentation" : { },
+          "group" : "Interfaces / Adapters",
+          "id" : "7",
+          "name" : "CLI Adapter",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.cliAdapter"
+          },
+          "relationships" : [ {
+            "description" : "Invokes application operations after parsing configuration and commands",
+            "destinationId" : "9",
+            "id" : "53",
+            "sourceId" : "7",
+            "tags" : "Relationship"
+          } ],
+          "tags" : "Element,Component,Adapter",
+          "technology" : "Rust / Clap"
+        }, {
+          "description" : "Implements newline-delimited JSON-RPC over stdio: initialization, tools/list, tools/call, bounded argument validation, workspace selection, response/error serialization, and watcher lifetime.",
+          "documentation" : { },
+          "group" : "Interfaces / Adapters",
+          "id" : "8",
+          "name" : "MCP Adapter",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.mcpAdapter"
+          },
+          "relationships" : [ {
+            "description" : "Dispatches validated MCP tool requests",
+            "destinationId" : "9",
+            "id" : "54",
+            "sourceId" : "8",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Starts and owns watchers only for the MCP process lifetime",
+            "destinationId" : "15",
+            "id" : "55",
+            "sourceId" : "8",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Returns MCP tool results and errors",
+            "destinationId" : "2",
+            "id" : "98",
+            "sourceId" : "8",
+            "tags" : "Relationship"
+          } ],
+          "tags" : "Element,Component,Adapter",
+          "technology" : "Rust / Tokio stdio"
+        }, {
+          "description" : "Transport-neutral application facade that composes services and owns application policy. Core services do not depend on MCP/JSON-RPC/stdio.",
+          "documentation" : { },
+          "group" : "Application Boundary",
+          "id" : "9",
+          "name" : "CortexWeaveService",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.facade"
+          },
+          "relationships" : [ {
+            "description" : "Registers, resolves, reports workspace state",
+            "destinationId" : "10",
+            "id" : "56",
+            "sourceId" : "9",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Requests explicit reindex and file reconciliation",
+            "destinationId" : "16",
+            "id" : "57",
+            "sourceId" : "9",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Requests semantic, lexical, or hybrid search",
+            "destinationId" : "23",
+            "id" : "58",
+            "sourceId" : "9",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Requests bounded context or resume packets",
+            "destinationId" : "24",
+            "id" : "59",
+            "sourceId" : "9",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Requests graph navigation and impact analysis",
+            "destinationId" : "22",
+            "id" : "60",
+            "sourceId" : "9",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Records and retrieves state, memory, and events",
+            "destinationId" : "25",
+            "id" : "61",
+            "sourceId" : "9",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Diagnoses typed evidence",
+            "destinationId" : "26",
+            "id" : "62",
+            "sourceId" : "9",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Normalizes decoded failures",
+            "destinationId" : "27",
+            "id" : "63",
+            "sourceId" : "9",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Starts, mutates, and reads explicit Episodes",
+            "destinationId" : "28",
+            "id" : "64",
+            "sourceId" : "9",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Previews and explicitly accepts Experience",
+            "destinationId" : "29",
+            "id" : "65",
+            "sourceId" : "9",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Searches and explains historical Experience",
+            "destinationId" : "30",
+            "id" : "66",
+            "sourceId" : "9",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Records reviewed assessments and proposes disputes",
+            "destinationId" : "31",
+            "id" : "67",
+            "sourceId" : "9",
+            "tags" : "Relationship"
+          } ],
+          "tags" : "Element,Component,Application",
+          "technology" : "Rust"
+        }, {
+          "description" : "Registers canonical workspace paths; resolves IDs, names, roots/subpaths, file URIs, default hints, and singleton selection.",
+          "documentation" : { },
+          "group" : "Workspace and Source Intelligence",
+          "id" : "10",
+          "name" : "Workspace Service and Resolver",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.workspaceService"
+          },
+          "relationships" : [ {
+            "description" : "Persists and resolves workspace identity",
+            "destinationId" : "32",
+            "id" : "68",
+            "sourceId" : "10",
+            "tags" : "Relationship",
+            "technology" : "SQL"
+          } ],
+          "tags" : "Element,Component,Application",
+          "technology" : "Rust"
+        }, {
+          "description" : "Walks a workspace under ignore rules and configured patterns; filters binary, unreadable, oversized, and unsupported files while recording scan failures.",
+          "documentation" : { },
+          "group" : "Workspace and Source Intelligence",
+          "id" : "11",
+          "name" : "Workspace Scanner",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.workspaceScanner"
+          },
+          "relationships" : [ {
+            "description" : "Reads eligible source files under ignore and pattern rules",
+            "destinationId" : "3",
+            "id" : "70",
+            "sourceId" : "11",
+            "tags" : "Relationship",
+            "technology" : "Filesystem"
+          } ],
+          "tags" : "Element,Component,SourceIntelligence",
+          "technology" : "Rust / ignore"
+        }, {
+          "description" : "Selects enabled language analyzers by path and supplies deterministic generic fallback.",
+          "documentation" : { },
+          "group" : "Workspace and Source Intelligence",
+          "id" : "12",
+          "name" : "Analyzer Registry",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.analyzerRegistry"
+          },
+          "relationships" : [ {
+            "description" : "Uses enabled language analyzer for supported paths",
+            "destinationId" : "13",
+            "id" : "74",
+            "sourceId" : "12",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Falls back deterministically for other text",
+            "destinationId" : "14",
+            "id" : "75",
+            "sourceId" : "12",
+            "tags" : "Relationship"
+          } ],
+          "tags" : "Element,Component,SourceIntelligence",
+          "technology" : "Rust"
+        }, {
+          "description" : "Grouped Rust, Python, JavaScript, TypeScript, C#, and Go analyzers emitting normalized chunks, symbols, relationships, stable keys, and metadata.",
+          "documentation" : { },
+          "group" : "Workspace and Source Intelligence",
+          "id" : "13",
+          "name" : "Tree-sitter Language Analyzers",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.treeSitterAnalyzers"
+          },
+          "tags" : "Element,Component,SourceIntelligence",
+          "technology" : "Rust / Tree-sitter"
+        }, {
+          "description" : "Deterministically chunks unsupported text without language-specific AST logic.",
+          "documentation" : { },
+          "group" : "Workspace and Source Intelligence",
+          "id" : "14",
+          "name" : "Generic Fallback Analyzer",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.genericAnalyzer"
+          },
+          "tags" : "Element,Component,SourceIntelligence",
+          "technology" : "Rust"
+        }, {
+          "description" : "MCP-lifetime watcher: notify callback sends path signals to a bounded channel; a worker debounces/coalesces and requests reconciliation or rescan.",
+          "documentation" : { },
+          "group" : "Indexing",
+          "id" : "15",
+          "name" : "Workspace Watcher",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.workspaceWatcher"
+          },
+          "relationships" : [ {
+            "description" : "Sends debounced/coalesced changed paths or requests rescan",
+            "destinationId" : "16",
+            "id" : "79",
+            "sourceId" : "15",
+            "tags" : "Relationship",
+            "technology" : "Tokio mpsc"
+          } ],
+          "tags" : "Element,Component,Indexing",
+          "technology" : "Rust / notify / Tokio mpsc"
+        }, {
+          "description" : "Serializes same-path work, bounds concurrent jobs, hashes and analyzes source, preserves compatible chunks/embeddings, detects source races, and applies reconciliation.",
+          "documentation" : { },
+          "group" : "Indexing",
+          "id" : "16",
+          "name" : "IndexingService / Reconciler",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.indexingService"
+          },
+          "relationships" : [ {
+            "description" : "Scans workspace during explicit reindex",
+            "destinationId" : "11",
+            "id" : "72",
+            "sourceId" : "16",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Selects analyzer for each relative path",
+            "destinationId" : "12",
+            "id" : "73",
+            "sourceId" : "16",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Segments and batches changed normalized chunks",
+            "destinationId" : "17",
+            "id" : "80",
+            "sourceId" : "16",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Atomically persists reconciled documents, chunks, and compatible embeddings",
+            "destinationId" : "32",
+            "id" : "84",
+            "sourceId" : "16",
+            "tags" : "Relationship",
+            "technology" : "SQL transaction"
+          }, {
+            "description" : "Projects normalized analysis after source reconciliation",
+            "destinationId" : "19",
+            "id" : "85",
+            "sourceId" : "16",
+            "tags" : "Relationship"
+          } ],
+          "tags" : "Element,Component,Indexing",
+          "technology" : "Rust / Tokio"
+        }, {
+          "description" : "Segments normalized chunks to provider limits; batches changed text and performs bounded adaptive capacity reduction.",
+          "documentation" : { },
+          "group" : "Indexing",
+          "id" : "17",
+          "name" : "Capacity-Aware Segmenter and Batcher",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.segmenterBatcher"
+          },
+          "relationships" : [ {
+            "description" : "Generates vectors for changed document segments",
+            "destinationId" : "18",
+            "id" : "81",
+            "sourceId" : "17",
+            "tags" : "Relationship"
+          } ],
+          "tags" : "Element,Component,Indexing",
+          "technology" : "Rust"
+        }, {
+          "description" : "Provider abstraction and OpenAI-compatible HTTP client; validates token limits, vector shape, model space, and dimensions.",
+          "documentation" : { },
+          "group" : "Indexing",
+          "id" : "18",
+          "name" : "Embedding Provider Adapter",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.embeddingAdapter"
+          },
+          "relationships" : [ {
+            "description" : "Requests document/query embeddings",
+            "destinationId" : "4",
+            "id" : "82",
+            "sourceId" : "18",
+            "tags" : "Relationship",
+            "technology" : "HTTP JSON"
+          } ],
+          "tags" : "Element,Component,Indexing",
+          "technology" : "Rust / reqwest"
+        }, {
+          "description" : "Projects normalized symbols and relationship facts, performs graph-only reprojection/repair with durable generation and revision state.",
+          "documentation" : { },
+          "group" : "Structural Intelligence",
+          "id" : "19",
+          "name" : "GraphIndexer and Repair",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.graphIndexer"
+          },
+          "relationships" : [ {
+            "description" : "Reconciles source file and symbol identities",
+            "destinationId" : "20",
+            "id" : "86",
+            "sourceId" : "19",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Resolves relationship targets deterministically",
+            "destinationId" : "21",
+            "id" : "87",
+            "sourceId" : "19",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Persists graph facts, edges, unresolved uncertainty, revisions, and repair state",
+            "destinationId" : "32",
+            "id" : "88",
+            "sourceId" : "19",
+            "tags" : "Relationship",
+            "technology" : "SQL transaction"
+          } ],
+          "tags" : "Element,Component,Structural,Derived",
+          "technology" : "Rust"
+        }, {
+          "description" : "Preserves stable graph-node identities while reconciling analyzed documents.",
+          "documentation" : { },
+          "group" : "Structural Intelligence",
+          "id" : "20",
+          "name" : "Symbol Registry",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.symbolRegistry"
+          },
+          "tags" : "Element,Component,Structural,Derived",
+          "technology" : "Rust"
+        }, {
+          "description" : "Deterministically resolves relationship targets and retains unresolved facts/candidates instead of guessing.",
+          "documentation" : { },
+          "group" : "Structural Intelligence",
+          "id" : "21",
+          "name" : "Symbol Resolver",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.symbolResolver"
+          },
+          "tags" : "Element,Component,Structural,Derived",
+          "technology" : "Rust"
+        }, {
+          "description" : "Provides current-state-gated symbol/path lookup, bounded relations/traversal, and impact analysis.",
+          "documentation" : { },
+          "group" : "Structural Intelligence",
+          "id" : "22",
+          "name" : "Structural Service",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.structuralService"
+          },
+          "relationships" : [ {
+            "description" : "Reads graph projections subject to freshness policy",
+            "destinationId" : "32",
+            "id" : "89",
+            "sourceId" : "22",
+            "tags" : "Relationship",
+            "technology" : "SQL"
+          } ],
+          "tags" : "Element,Component,Structural,Derived",
+          "technology" : "Rust"
+        }, {
+          "description" : "Performs compatible-vector semantic search, SQLite FTS lexical search, hybrid score combination, and optional structural candidate expansion.",
+          "documentation" : { },
+          "group" : "Retrieval and Context",
+          "id" : "23",
+          "name" : "RetrievalService",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.retrievalService"
+          },
+          "relationships" : [ {
+            "description" : "Embeds semantic query",
+            "destinationId" : "18",
+            "id" : "90",
+            "sourceId" : "23",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Expands structural candidates when intent/configuration permits",
+            "destinationId" : "22",
+            "id" : "91",
+            "sourceId" : "23",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Reads compatible vectors, chunk FTS, source metadata, and chunks",
+            "destinationId" : "32",
+            "id" : "92",
+            "sourceId" : "23",
+            "tags" : "Relationship",
+            "technology" : "SQL / FTS5"
+          } ],
+          "tags" : "Element,Component,Retrieval",
+          "technology" : "Rust"
+        }, {
+          "description" : "Acquires and deduplicates candidates; applies state/freshness/structural ranking and category/token budgets; returns ContextPacket with explanation. Current evidence remains authoritative.",
+          "documentation" : { },
+          "group" : "Retrieval and Context",
+          "id" : "24",
+          "name" : "ContextService",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.contextService"
+          },
+          "relationships" : [ {
+            "description" : "Acquires code/document candidates",
+            "destinationId" : "23",
+            "id" : "93",
+            "sourceId" : "24",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Acquires trusted memory, events, sessions/tasks, checkpoints, working-set, and pins",
+            "destinationId" : "25",
+            "id" : "94",
+            "sourceId" : "24",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Acquires bounded structural evidence",
+            "destinationId" : "22",
+            "id" : "95",
+            "sourceId" : "24",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Searches eligible historical Experience in a separate budget",
+            "destinationId" : "30",
+            "id" : "96",
+            "sourceId" : "24",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Returns bounded ContextPacket and explanation for serialization",
+            "destinationId" : "8",
+            "id" : "97",
+            "sourceId" : "24",
+            "tags" : "Relationship"
+          } ],
+          "tags" : "Element,Component,Context",
+          "technology" : "Rust"
+        }, {
+          "description" : "Owns explicit memories and trust/supersession, sessions/tasks, raw append-only Events, working sets/pins, and checkpoints as distinct durable domains.",
+          "documentation" : { },
+          "group" : "State and Memory",
+          "id" : "25",
+          "name" : "State and Memory Services",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.stateMemoryService"
+          },
+          "relationships" : [ {
+            "description" : "Persists memory, state, raw Events, pins, working set, and checkpoints",
+            "destinationId" : "32",
+            "id" : "101",
+            "sourceId" : "25",
+            "tags" : "Relationship",
+            "technology" : "SQL transaction"
+          } ],
+          "tags" : "Element,Component,State",
+          "technology" : "Rust"
+        }, {
+          "description" : "Decodes registered, bounded factual evidence contracts; unsupported payloads remain raw Events.",
+          "documentation" : { },
+          "group" : "Verified Experience",
+          "id" : "26",
+          "name" : "EvidenceService",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.evidenceService"
+          },
+          "relationships" : [ {
+            "description" : "Reads append-only raw Events for typed evidence diagnosis",
+            "destinationId" : "25",
+            "id" : "102",
+            "sourceId" : "26",
+            "tags" : "Relationship"
+          } ],
+          "tags" : "Element,Component,Experience",
+          "technology" : "Rust"
+        }, {
+          "description" : "Produces supported deterministic, canonical, workspace-scoped failure signatures without inventing claims.",
+          "documentation" : { },
+          "group" : "Verified Experience",
+          "id" : "27",
+          "name" : "FailureNormalizationService",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.failureNormalizationService"
+          },
+          "relationships" : [ {
+            "description" : "Normalizes only decoded supported evidence",
+            "destinationId" : "26",
+            "id" : "103",
+            "sourceId" : "27",
+            "tags" : "Relationship"
+          } ],
+          "tags" : "Element,Component,Experience",
+          "technology" : "Rust"
+        }, {
+          "description" : "Controls explicit versioned Episode lifecycle and ordered primary Event membership using caller request keys.",
+          "documentation" : { },
+          "group" : "Verified Experience",
+          "id" : "28",
+          "name" : "Episode Service",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.episodeService"
+          },
+          "relationships" : [ {
+            "description" : "Associates scoped raw Events to explicit Episodes",
+            "destinationId" : "25",
+            "id" : "104",
+            "sourceId" : "28",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Persists versioned Episodes, memberships, and request identities",
+            "destinationId" : "32",
+            "id" : "105",
+            "sourceId" : "28",
+            "tags" : "Relationship",
+            "technology" : "SQL transaction"
+          } ],
+          "tags" : "Element,Component,Experience",
+          "technology" : "Rust"
+        }, {
+          "description" : "Creates deterministic read-only previews and explicitly accepted immutable Experience aggregates.",
+          "documentation" : { },
+          "group" : "Verified Experience",
+          "id" : "29",
+          "name" : "ConsolidationService",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.consolidationService"
+          },
+          "relationships" : [ {
+            "description" : "Validates typed factual evidence",
+            "destinationId" : "26",
+            "id" : "106",
+            "sourceId" : "29",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Builds deterministic failure signatures",
+            "destinationId" : "27",
+            "id" : "107",
+            "sourceId" : "29",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Reads terminal Episodes and persists sealed immutable Experience on explicit acceptance",
+            "destinationId" : "32",
+            "id" : "108",
+            "sourceId" : "29",
+            "tags" : "Relationship",
+            "technology" : "SQL transaction"
+          } ],
+          "tags" : "Element,Component,Experience,Historical",
+          "technology" : "Rust"
+        }, {
+          "description" : "Searches eligible Experience with deterministic signature, lexical, path, and graph filters and explains matches.",
+          "documentation" : { },
+          "group" : "Verified Experience",
+          "id" : "30",
+          "name" : "ExperienceSearchService",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.experienceSearchService"
+          },
+          "relationships" : [ {
+            "description" : "Reads eligible Experience, FTS, snapshots, lifecycle, and history",
+            "destinationId" : "32",
+            "id" : "109",
+            "sourceId" : "30",
+            "tags" : "Relationship",
+            "technology" : "SQL / FTS5"
+          } ],
+          "tags" : "Element,Component,Experience,Historical",
+          "technology" : "Rust"
+        }, {
+          "description" : "Records reviewed append-only assessments and produces read-only recurrence dispute proposals.",
+          "documentation" : { },
+          "group" : "Verified Experience",
+          "id" : "31",
+          "name" : "ExperienceAssessmentService",
+          "properties" : {
+            "structurizr.dsl.identifier" : "cortexweave.application.experienceAssessmentService"
+          },
+          "relationships" : [ {
+            "description" : "Validates reviewed-assessment evidence",
+            "destinationId" : "26",
+            "id" : "110",
+            "sourceId" : "31",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Matches deterministic recurring failure signatures",
+            "destinationId" : "27",
+            "id" : "111",
+            "sourceId" : "31",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Finds eligible historical records for read-only dispute proposals",
+            "destinationId" : "30",
+            "id" : "112",
+            "sourceId" : "31",
+            "tags" : "Relationship"
+          }, {
+            "description" : "Appends assessments and assessment evidence",
+            "destinationId" : "32",
+            "id" : "113",
+            "sourceId" : "31",
+            "tags" : "Relationship",
+            "technology" : "SQL transaction"
+          } ],
+          "tags" : "Element,Component,Experience,Historical",
+          "technology" : "Rust"
+        } ],
+        "description" : "One Rust application/runtime containing the CLI and stdio MCP adapters, application facade, workspace/source intelligence, indexing, graph, retrieval/context, state, and verified Experience services.",
+        "documentation" : { },
+        "id" : "6",
+        "name" : "CortexWeave Application",
+        "properties" : {
+          "structurizr.dsl.identifier" : "cortexweave.application"
+        },
+        "relationships" : [ {
+          "description" : "Persists and resolves workspace identity",
+          "destinationId" : "32",
+          "id" : "69",
+          "linkedRelationshipId" : "68",
+          "sourceId" : "6",
+          "technology" : "SQL"
+        }, {
+          "description" : "Reads eligible source files under ignore and pattern rules",
+          "destinationId" : "3",
+          "id" : "71",
+          "linkedRelationshipId" : "70",
+          "sourceId" : "6",
+          "technology" : "Filesystem"
+        }, {
+          "description" : "Requests document/query embeddings",
+          "destinationId" : "4",
+          "id" : "83",
+          "linkedRelationshipId" : "82",
+          "sourceId" : "6",
+          "technology" : "HTTP JSON"
+        }, {
+          "description" : "Returns MCP tool results and errors",
+          "destinationId" : "2",
+          "id" : "99",
+          "linkedRelationshipId" : "98",
+          "sourceId" : "6"
+        } ],
+        "tags" : "Element,Container,CortexWeave,Application",
+        "technology" : "Rust / Tokio"
+      }, {
+        "description" : "Single durable store for workspace identity, source index and vectors, FTS projections, memory/state/events, structural graph/revisions, Episodes, Experiences, and assessment history. SQLite owns transaction boundaries and integrity constraints.",
+        "documentation" : { },
+        "id" : "32",
+        "name" : "CortexWeave Database",
+        "properties" : {
+          "structurizr.dsl.identifier" : "cortexweave.database"
+        },
+        "tags" : "Element,Container,Persistence,Authoritative",
+        "technology" : "SQLite / SQLx / FTS5"
+      } ],
+      "description" : "Local-first persistent context substrate that indexes registered workspaces, maintains source intelligence, agent state, structural knowledge, and verified historical Experience, and returns bounded explainable context.",
+      "documentation" : { },
+      "id" : "5",
+      "name" : "CortexWeave",
+      "properties" : {
+        "structurizr.dsl.identifier" : "cortexweave"
+      },
+      "relationships" : [ {
+        "description" : "Indexes observed source and documents",
+        "destinationId" : "3",
+        "id" : "51",
+        "sourceId" : "5",
+        "tags" : "Relationship"
+      }, {
+        "description" : "Generates document and query embeddings",
+        "destinationId" : "4",
+        "id" : "52",
+        "sourceId" : "5",
+        "tags" : "Relationship"
+      }, {
+        "description" : "Returns MCP tool results and errors",
+        "destinationId" : "2",
+        "id" : "100",
+        "linkedRelationshipId" : "98",
+        "sourceId" : "5"
+      } ],
+      "tags" : "Element,Software System,CortexWeave"
+    } ]
+  },
+  "name" : "CortexWeave v0.5 C4 Model",
+  "properties" : {
+    "structurizr.inspection.error" : "55",
+    "structurizr.inspection.info" : "0",
+    "structurizr.inspection.ignore" : "0",
+    "structurizr.inspection.warning" : "0"
+  },
+  "views" : {
+    "componentViews" : [ {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "containerId" : "6",
+      "description" : "C4 Level 3: major component groups inside the single Rust application.",
+      "elements" : [ {
+        "id" : "2",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "3",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "4",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "7",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "8",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "9",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "10",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "11",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "12",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "15",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "16",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "18",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "19",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "22",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "23",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "24",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "25",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "26",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "28",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "29",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "30",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "31",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "32",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "externalContainerBoundariesVisible" : false,
+      "key" : "CortexWeave-Application",
+      "name" : "Component View: CortexWeave - CortexWeave Application",
+      "order" : 3,
+      "relationships" : [ {
+        "id" : "101"
+      }, {
+        "id" : "102"
+      }, {
+        "id" : "104"
+      }, {
+        "id" : "105"
+      }, {
+        "id" : "106"
+      }, {
+        "id" : "108"
+      }, {
+        "id" : "109"
+      }, {
+        "id" : "110"
+      }, {
+        "id" : "112"
+      }, {
+        "id" : "113"
+      }, {
+        "id" : "45"
+      }, {
+        "id" : "48"
+      }, {
+        "id" : "53"
+      }, {
+        "id" : "54"
+      }, {
+        "id" : "55"
+      }, {
+        "id" : "56"
+      }, {
+        "id" : "57"
+      }, {
+        "id" : "58"
+      }, {
+        "id" : "59"
+      }, {
+        "id" : "60"
+      }, {
+        "id" : "61"
+      }, {
+        "id" : "62"
+      }, {
+        "id" : "64"
+      }, {
+        "id" : "65"
+      }, {
+        "id" : "66"
+      }, {
+        "id" : "67"
+      }, {
+        "id" : "68"
+      }, {
+        "id" : "70"
+      }, {
+        "id" : "72"
+      }, {
+        "id" : "73"
+      }, {
+        "id" : "76"
+      }, {
+        "id" : "79"
+      }, {
+        "id" : "82"
+      }, {
+        "id" : "84"
+      }, {
+        "id" : "85"
+      }, {
+        "id" : "88"
+      }, {
+        "id" : "89"
+      }, {
+        "id" : "90"
+      }, {
+        "id" : "91"
+      }, {
+        "id" : "92"
+      }, {
+        "id" : "93"
+      }, {
+        "id" : "94"
+      }, {
+        "id" : "95"
+      }, {
+        "id" : "96"
+      }, {
+        "id" : "97"
+      }, {
+        "id" : "98"
+      } ]
+    }, {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "containerId" : "6",
+      "description" : "Source discovery, normalized analysis, incremental reconciliation, embeddings, and derived graph projection.",
+      "elements" : [ {
+        "id" : "3",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "4",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "8",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "11",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "12",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "13",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "14",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "15",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "16",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "17",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "18",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "19",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "20",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "21",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "32",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "externalContainerBoundariesVisible" : false,
+      "key" : "CortexWeave-Indexing",
+      "name" : "Component View: CortexWeave - CortexWeave Application",
+      "order" : 4,
+      "relationships" : [ {
+        "id" : "55"
+      }, {
+        "id" : "70"
+      }, {
+        "id" : "72"
+      }, {
+        "id" : "73"
+      }, {
+        "id" : "74"
+      }, {
+        "id" : "75"
+      }, {
+        "id" : "76"
+      }, {
+        "id" : "79"
+      }, {
+        "id" : "80"
+      }, {
+        "id" : "81"
+      }, {
+        "id" : "82"
+      }, {
+        "id" : "84"
+      }, {
+        "id" : "85"
+      }, {
+        "id" : "86"
+      }, {
+        "id" : "87"
+      }, {
+        "id" : "88"
+      } ]
+    }, {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "containerId" : "6",
+      "description" : "Retrieval and context assembly. Current code/state/evidence remain authoritative; historical Experience is separately bounded supplemental input.",
+      "elements" : [ {
+        "id" : "2",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "4",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "8",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "9",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "18",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "22",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "23",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "24",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "25",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "30",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "32",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "externalContainerBoundariesVisible" : false,
+      "key" : "CortexWeave-Context",
+      "name" : "Component View: CortexWeave - CortexWeave Application",
+      "order" : 5,
+      "relationships" : [ {
+        "id" : "101"
+      }, {
+        "id" : "109"
+      }, {
+        "id" : "45"
+      }, {
+        "id" : "48"
+      }, {
+        "id" : "54"
+      }, {
+        "id" : "58"
+      }, {
+        "id" : "59"
+      }, {
+        "id" : "60"
+      }, {
+        "id" : "61"
+      }, {
+        "id" : "66"
+      }, {
+        "id" : "82"
+      }, {
+        "id" : "89"
+      }, {
+        "id" : "90"
+      }, {
+        "id" : "91"
+      }, {
+        "id" : "92"
+      }, {
+        "id" : "93"
+      }, {
+        "id" : "94"
+      }, {
+        "id" : "95"
+      }, {
+        "id" : "96"
+      }, {
+        "id" : "97"
+      }, {
+        "id" : "98"
+      } ]
+    }, {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "containerId" : "6",
+      "description" : "Derived structural intelligence: normalized analysis is projected, deterministically resolved, and read through freshness-gated navigation and impact operations.",
+      "elements" : [ {
+        "id" : "13",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "14",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "16",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "19",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "20",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "21",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "22",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "23",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "24",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "32",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "externalContainerBoundariesVisible" : false,
+      "key" : "CortexWeave-Structural",
+      "name" : "Component View: CortexWeave - CortexWeave Application",
+      "order" : 6,
+      "relationships" : [ {
+        "id" : "84"
+      }, {
+        "id" : "85"
+      }, {
+        "id" : "86"
+      }, {
+        "id" : "87"
+      }, {
+        "id" : "88"
+      }, {
+        "id" : "89"
+      }, {
+        "id" : "91"
+      }, {
+        "id" : "92"
+      }, {
+        "id" : "93"
+      }, {
+        "id" : "95"
+      } ]
+    }, {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "containerId" : "6",
+      "description" : "Verified Experience is a historical, immutable interpretation of explicit factual Events. It supplements but cannot displace current evidence in ContextService.",
+      "elements" : [ {
+        "id" : "2",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "8",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "9",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "24",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "25",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "26",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "27",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "28",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "29",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "30",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "31",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "32",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "externalContainerBoundariesVisible" : false,
+      "key" : "CortexWeave-Experience",
+      "name" : "Component View: CortexWeave - CortexWeave Application",
+      "order" : 7,
+      "relationships" : [ {
+        "id" : "101"
+      }, {
+        "id" : "102"
+      }, {
+        "id" : "103"
+      }, {
+        "id" : "104"
+      }, {
+        "id" : "105"
+      }, {
+        "id" : "106"
+      }, {
+        "id" : "107"
+      }, {
+        "id" : "108"
+      }, {
+        "id" : "109"
+      }, {
+        "id" : "110"
+      }, {
+        "id" : "111"
+      }, {
+        "id" : "112"
+      }, {
+        "id" : "113"
+      }, {
+        "id" : "45"
+      }, {
+        "id" : "48"
+      }, {
+        "id" : "54"
+      }, {
+        "id" : "59"
+      }, {
+        "id" : "61"
+      }, {
+        "id" : "62"
+      }, {
+        "id" : "63"
+      }, {
+        "id" : "64"
+      }, {
+        "id" : "65"
+      }, {
+        "id" : "66"
+      }, {
+        "id" : "67"
+      }, {
+        "id" : "94"
+      }, {
+        "id" : "96"
+      }, {
+        "id" : "97"
+      }, {
+        "id" : "98"
+      } ]
+    } ],
+    "configuration" : {
+      "styles" : {
+        "elements" : [ {
+          "background" : "#e0eefb",
+          "color" : "#173a5e",
+          "stroke" : "#2d6ea3",
+          "tag" : "Adapter"
+        }, {
+          "background" : "#ddf4f1",
+          "color" : "#12312e",
+          "stroke" : "#0f766e",
+          "tag" : "Application"
+        }, {
+          "border" : "Solid",
+          "strokeWidth" : 3,
+          "tag" : "Authoritative"
+        }, {
+          "background" : "#fce7c3",
+          "color" : "#62430f",
+          "stroke" : "#b8791b",
+          "tag" : "Context"
+        }, {
+          "background" : "#0f766e",
+          "color" : "#ffffff",
+          "stroke" : "#115e59",
+          "tag" : "CortexWeave"
+        }, {
+          "opacity" : 80,
+          "tag" : "Derived"
+        }, {
+          "background" : "#fbe8ea",
+          "color" : "#65232e",
+          "stroke" : "#a44a58",
+          "tag" : "Experience"
+        }, {
+          "background" : "#f3f4f6",
+          "color" : "#24313b",
+          "stroke" : "#6b7280",
+          "tag" : "External"
+        }, {
+          "opacity" : 78,
+          "tag" : "Historical"
+        }, {
+          "background" : "#dff2e3",
+          "color" : "#214b27",
+          "stroke" : "#39734a",
+          "tag" : "Indexing"
+        }, {
+          "background" : "#d8f0f1",
+          "color" : "#173c3e",
+          "shape" : "Cylinder",
+          "stroke" : "#287075",
+          "tag" : "Persistence"
+        }, {
+          "background" : "#1f4e79",
+          "color" : "#ffffff",
+          "shape" : "Person",
+          "tag" : "Person"
+        }, {
+          "background" : "#fff1d6",
+          "color" : "#62430f",
+          "stroke" : "#b8791b",
+          "tag" : "Retrieval"
+        }, {
+          "background" : "#eaf6e8",
+          "color" : "#214b27",
+          "stroke" : "#4e7b52",
+          "tag" : "SourceIntelligence"
+        }, {
+          "background" : "#e8eef5",
+          "color" : "#233142",
+          "stroke" : "#546a7b",
+          "tag" : "State"
+        }, {
+          "background" : "#efe7f7",
+          "color" : "#44215c",
+          "stroke" : "#79519d",
+          "tag" : "Structural"
+        } ],
+        "relationships" : [ {
+          "color" : "#526875",
+          "fontSize" : 18,
+          "tag" : "Relationship",
+          "thickness" : 2
+        } ]
+      },
+      "terminology" : { }
+    },
+    "containerViews" : [ {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "description" : "C4 Level 2: CortexWeave is one Rust application and one SQLite database; CLI/MCP/indexing/retrieval are internal components, not separately deployed containers.",
+      "elements" : [ {
+        "id" : "1",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "2",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "3",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "4",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "6",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "32",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "externalSoftwareSystemBoundariesVisible" : false,
+      "key" : "CortexWeave-Containers",
+      "name" : "Container View: CortexWeave",
+      "order" : 2,
+      "relationships" : [ {
+        "id" : "42"
+      }, {
+        "id" : "44"
+      }, {
+        "id" : "46"
+      }, {
+        "id" : "69"
+      }, {
+        "id" : "71"
+      }, {
+        "id" : "77"
+      }, {
+        "id" : "83"
+      }, {
+        "id" : "99"
+      } ],
+      "softwareSystemId" : "5"
+    } ],
+    "deploymentViews" : [ {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "description" : "Evidence-supported local developer-workstation topology; this is not a Docker or distributed deployment model.",
+      "elements" : [ {
+        "id" : "33",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "34",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "35",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "36",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "37",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "38",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "39",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "40",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "environment" : "Local development",
+      "key" : "CortexWeave-LocalDeployment",
+      "name" : "Deployment View: CortexWeave - Local development",
+      "order" : 14,
+      "softwareSystemId" : "5"
+    } ],
+    "dynamicViews" : [ {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "description" : "Initial explicit workspace reindex; source reconciliation precedes coherent graph repair.",
+      "elementId" : "6",
+      "elements" : [ {
+        "id" : "1",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "3",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "4",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "7",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "9",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "11",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "12",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "13",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "16",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "17",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "18",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "19",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "32",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "externalBoundariesVisible" : false,
+      "key" : "Indexing-Initial",
+      "name" : "Dynamic View: CortexWeave - CortexWeave Application",
+      "order" : 8,
+      "relationships" : [ {
+        "description" : "1. Requests reindex",
+        "id" : "41",
+        "order" : "1",
+        "response" : false
+      }, {
+        "description" : "2. Dispatches reindex command",
+        "id" : "53",
+        "order" : "2",
+        "response" : false
+      }, {
+        "description" : "3. Requests workspace reindex",
+        "id" : "57",
+        "order" : "3",
+        "response" : false
+      }, {
+        "description" : "4. Scans eligible files",
+        "id" : "72",
+        "order" : "4",
+        "response" : false
+      }, {
+        "description" : "5. Reads source files",
+        "id" : "70",
+        "order" : "5",
+        "response" : false
+      }, {
+        "description" : "6. Selects analyzer",
+        "id" : "73",
+        "order" : "6",
+        "response" : false
+      }, {
+        "description" : "7. Produces normalized analysis (or generic fallback)",
+        "id" : "74",
+        "order" : "7",
+        "response" : false
+      }, {
+        "description" : "8. Segments changed chunks",
+        "id" : "80",
+        "order" : "8",
+        "response" : false
+      }, {
+        "description" : "9. Batches changed text",
+        "id" : "81",
+        "order" : "9",
+        "response" : false
+      }, {
+        "description" : "10. Generates document vectors",
+        "id" : "82",
+        "order" : "10",
+        "response" : false
+      }, {
+        "description" : "11. Atomically persists source index",
+        "id" : "84",
+        "order" : "11",
+        "response" : false
+      }, {
+        "description" : "12. Runs graph repair/reprojection",
+        "id" : "85",
+        "order" : "12",
+        "response" : false
+      }, {
+        "description" : "13. Publishes graph projection/revision when complete",
+        "id" : "88",
+        "order" : "13",
+        "response" : false
+      } ]
+    }, {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "description" : "Incremental source change while an MCP server is running; watcher ownership is limited to that MCP process.",
+      "elementId" : "6",
+      "elements" : [ {
+        "id" : "3",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "12",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "13",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "15",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "16",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "17",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "18",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "19",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "32",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "externalBoundariesVisible" : false,
+      "key" : "Indexing-Incremental",
+      "name" : "Dynamic View: CortexWeave - CortexWeave Application",
+      "order" : 9,
+      "relationships" : [ {
+        "description" : "1. Emits filesystem notification",
+        "id" : "76",
+        "order" : "1",
+        "response" : false
+      }, {
+        "description" : "2. Debounces/coalesces path and requests reconciliation",
+        "id" : "79",
+        "order" : "2",
+        "response" : false
+      }, {
+        "description" : "3. Selects analyzer for changed path",
+        "id" : "73",
+        "order" : "3",
+        "response" : false
+      }, {
+        "description" : "4. Produces normalized analysis",
+        "id" : "74",
+        "order" : "4",
+        "response" : false
+      }, {
+        "description" : "5. Embeds changed chunks only",
+        "id" : "80",
+        "order" : "5",
+        "response" : false
+      }, {
+        "description" : "6. Requests vectors",
+        "id" : "81",
+        "order" : "6",
+        "response" : false
+      }, {
+        "description" : "7. Applies source reconciliation transaction",
+        "id" : "84",
+        "order" : "7",
+        "response" : false
+      }, {
+        "description" : "8. Reconciles graph projection",
+        "id" : "85",
+        "order" : "8",
+        "response" : false
+      }, {
+        "description" : "9. Persists graph facts/revision state",
+        "id" : "88",
+        "order" : "9",
+        "response" : false
+      } ]
+    }, {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "description" : "semantic_context: current candidate sources are ranked/budgeted first; eligible Experience is historical supplemental context.",
+      "elementId" : "6",
+      "elements" : [ {
+        "id" : "2",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "8",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "9",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "18",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "22",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "23",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "24",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "25",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "30",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "32",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "externalBoundariesVisible" : false,
+      "key" : "Context-Semantic",
+      "name" : "Dynamic View: CortexWeave - CortexWeave Application",
+      "order" : 10,
+      "relationships" : [ {
+        "description" : "1. Requests semantic_context",
+        "id" : "45",
+        "order" : "1",
+        "response" : false
+      }, {
+        "description" : "2. Dispatches validated request",
+        "id" : "54",
+        "order" : "2",
+        "response" : false
+      }, {
+        "description" : "3. Requests bounded ContextPacket",
+        "id" : "59",
+        "order" : "3",
+        "response" : false
+      }, {
+        "description" : "4. Acquires code/document candidates",
+        "id" : "93",
+        "order" : "4",
+        "response" : false
+      }, {
+        "description" : "5. Embeds query when semantic search applies",
+        "id" : "90",
+        "order" : "5",
+        "response" : false
+      }, {
+        "description" : "6. Reads compatible vectors and lexical candidates",
+        "id" : "92",
+        "order" : "6",
+        "response" : false
+      }, {
+        "description" : "7. Acquires current state, trusted memory, Events, pins/checkpoints",
+        "id" : "94",
+        "order" : "7",
+        "response" : false
+      }, {
+        "description" : "8. Acquires bounded structural evidence",
+        "id" : "95",
+        "order" : "8",
+        "response" : false
+      }, {
+        "description" : "9. Searches eligible Experience only when requested/eligible",
+        "id" : "96",
+        "order" : "9",
+        "response" : false
+      }, {
+        "description" : "10. Returns ContextPacket after current-first ranking and historical budgeting",
+        "id" : "97",
+        "order" : "10",
+        "response" : false
+      }, {
+        "description" : "11. Returns bounded explainable context",
+        "id" : "98",
+        "order" : "11",
+        "response" : false
+      } ]
+    }, {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "description" : "Graph-only repair/reprojection preserves compatible source index state and publishes graph state only through durable repair/revision rules.",
+      "elementId" : "6",
+      "elements" : [ {
+        "id" : "1",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "7",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "9",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "12",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "16",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "19",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "20",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "21",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "32",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "externalBoundariesVisible" : false,
+      "key" : "Graph-Repair",
+      "name" : "Dynamic View: CortexWeave - CortexWeave Application",
+      "order" : 11,
+      "relationships" : [ {
+        "description" : "1. Requests graph rebuild",
+        "id" : "41",
+        "order" : "1",
+        "response" : false
+      }, {
+        "description" : "2. Dispatches repair request",
+        "id" : "53",
+        "order" : "2",
+        "response" : false
+      }, {
+        "description" : "3. Requests graph repair plan",
+        "id" : "57",
+        "order" : "3",
+        "response" : false
+      }, {
+        "description" : "4. Acquires durable repair lease/generation",
+        "id" : "84",
+        "order" : "4",
+        "response" : false
+      }, {
+        "description" : "5. Verifies source/analyzer expectations",
+        "id" : "73",
+        "order" : "5",
+        "response" : false
+      }, {
+        "description" : "6. Reprojects normalized analysis",
+        "id" : "85",
+        "order" : "6",
+        "response" : false
+      }, {
+        "description" : "7. Preserves stable node identities",
+        "id" : "86",
+        "order" : "7",
+        "response" : false
+      }, {
+        "description" : "8. Resolves current relationship surface",
+        "id" : "87",
+        "order" : "8",
+        "response" : false
+      }, {
+        "description" : "9. Persists coherent projection and revision state",
+        "id" : "88",
+        "order" : "9",
+        "response" : false
+      } ]
+    }, {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "description" : "Verified Experience is created only from a caller-controlled terminal Episode and explicit matching acceptance.",
+      "elementId" : "6",
+      "elements" : [ {
+        "id" : "2",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "8",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "9",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "26",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "27",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "28",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "29",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "32",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "externalBoundariesVisible" : false,
+      "key" : "Experience-Consolidation",
+      "name" : "Dynamic View: CortexWeave - CortexWeave Application",
+      "order" : 12,
+      "relationships" : [ {
+        "description" : "1. Records factual Events and controls an Episode",
+        "id" : "45",
+        "order" : "1",
+        "response" : false
+      }, {
+        "description" : "2. Dispatches episode/consolidation requests",
+        "id" : "54",
+        "order" : "2",
+        "response" : false
+      }, {
+        "description" : "3. Creates/associates/closes versioned Episode",
+        "id" : "64",
+        "order" : "3",
+        "response" : false
+      }, {
+        "description" : "4. Persists ordered Event membership",
+        "id" : "105",
+        "order" : "4",
+        "response" : false
+      }, {
+        "description" : "5. Requests deterministic preview",
+        "id" : "65",
+        "order" : "5",
+        "response" : false
+      }, {
+        "description" : "6. Validates typed factual evidence",
+        "id" : "106",
+        "order" : "6",
+        "response" : false
+      }, {
+        "description" : "7. Builds supported signature",
+        "id" : "107",
+        "order" : "7",
+        "response" : false
+      }, {
+        "description" : "8. Reads terminal frontier and returns preview",
+        "id" : "108",
+        "order" : "8",
+        "response" : false
+      }, {
+        "description" : "9. Explicitly accepts matching fingerprint/proposal hash",
+        "id" : "45",
+        "order" : "9",
+        "response" : false
+      }, {
+        "description" : "10. Dispatches acceptance",
+        "id" : "54",
+        "order" : "10",
+        "response" : false
+      }, {
+        "description" : "11. Recomputes and accepts",
+        "id" : "65",
+        "order" : "11",
+        "response" : false
+      }, {
+        "description" : "12. Persists sealed immutable Experience transactionally",
+        "id" : "108",
+        "order" : "12",
+        "response" : false
+      } ]
+    }, {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "description" : "A fresh session may receive eligible historical Experience only as bounded supplemental context after current evidence.",
+      "elementId" : "6",
+      "elements" : [ {
+        "id" : "2",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "8",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "9",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "24",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "25",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "30",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "32",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "externalBoundariesVisible" : false,
+      "key" : "Experience-Reuse",
+      "name" : "Dynamic View: CortexWeave - CortexWeave Application",
+      "order" : 13,
+      "relationships" : [ {
+        "description" : "1. Sends current task and active failure context",
+        "id" : "45",
+        "order" : "1",
+        "response" : false
+      }, {
+        "description" : "2. Dispatches semantic_context",
+        "id" : "54",
+        "order" : "2",
+        "response" : false
+      }, {
+        "description" : "3. Requests current-first ContextPacket",
+        "id" : "59",
+        "order" : "3",
+        "response" : false
+      }, {
+        "description" : "4. Selects current task and active Event evidence",
+        "id" : "94",
+        "order" : "4",
+        "response" : false
+      }, {
+        "description" : "5. Searches matching eligible history",
+        "id" : "96",
+        "order" : "5",
+        "response" : false
+      }, {
+        "description" : "6. Filters lifecycle/signature/path/graph and assessment history",
+        "id" : "109",
+        "order" : "6",
+        "response" : false
+      }, {
+        "description" : "7. Returns packet labeled historical supplemental only after authority checks and separate budget",
+        "id" : "97",
+        "order" : "7",
+        "response" : false
+      }, {
+        "description" : "8. Returns context; harness retains reasoning/tool authority",
+        "id" : "98",
+        "order" : "8",
+        "response" : false
+      } ]
+    } ],
+    "systemContextViews" : [ {
+      "automaticLayout" : {
+        "edgeSeparation" : 50,
+        "nodeSeparation" : 50,
+        "rankDirection" : "LeftRight",
+        "rankSeparation" : 100,
+        "vertices" : true
+      },
+      "description" : "CortexWeave in its external operating context.",
+      "elements" : [ {
+        "id" : "1",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "2",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "3",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "4",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "5",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "enterpriseBoundaryVisible" : true,
+      "key" : "CortexWeave-SystemContext",
+      "name" : "System Context View: CortexWeave",
+      "order" : 1,
+      "relationships" : [ {
+        "id" : "100"
+      }, {
+        "id" : "43"
+      }, {
+        "id" : "44"
+      }, {
+        "id" : "47"
+      }, {
+        "id" : "49"
+      }, {
+        "id" : "50"
+      }, {
+        "id" : "51"
+      }, {
+        "id" : "52"
+      }, {
+        "id" : "78"
+      } ],
+      "softwareSystemId" : "5"
+    } ]
+  }
+}

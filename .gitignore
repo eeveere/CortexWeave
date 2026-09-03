@@ -1,12 +1,27 @@
 /target/
 /.cortexweave/
+/.cortexweave-backup-*/
+/.crush/
 /.crushrc
+/docs/architecture/c4/.structurizr/
 *.db
 *.db-shm
 *.db-wal
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# Machine-local configuration and diagnostics.
+*.local.toml
+*.local.json
+*.local.yaml
+*.local.yml
+*.log
+*.pid
+
+# Local credentials belong in a root-level private directory or an env file.
+/.credentials/
+/.secrets/
 .env
 .env.*
 !.env.example
@@ -18,5 +33,6 @@
 /CortexWeave v0.4 Structural Intelligence Plan.md
 /CortexWeave v0.5 Verified Experience and Memory Consolidation Plan.md
 /CortexWeave v0.4.1 Upgrade Repair and Operational Hardening Plan.md
+/CortexWeave v0.5.1 Test Evidence and Vitest Integration Plan.md
 
 /Small Models, Smart Systems_ A Roadmap Toward Frontier-Level Agentic Results.md

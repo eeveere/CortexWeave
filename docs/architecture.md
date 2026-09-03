@@ -1,14 +1,16 @@
-# CortexWeave v0.1 Architecture
+# CortexWeave Architecture
 
 For the v0.2 context-selection pipeline, see [Context Orchestration](context.md).
+For the v0.5 verified historical-learning path, see
+[Verified Experience Core](verified-experience.md).
 
 ## Purpose
 
-CortexWeave is a local-first cognitive substrate for coding agents. Version 0.1
-persists workspace structure, explicit memories, and operational events; keeps
-workspace content indexed as files change; and exposes retrieval through a
-service API. It does not invoke reasoning models, plan tasks, execute tools, or
-run verification loops.
+CortexWeave is a local-first cognitive substrate for coding agents. It persists
+workspace structure, explicit Memories, operational Events, and immutable
+verified Experience; keeps workspace content indexed as files change; and
+exposes retrieval through a service API. It does not invoke reasoning models,
+plan tasks, execute tools, or run verification loops.
 
 ## Dependency Direction
 
@@ -37,9 +39,11 @@ place another adapter over it without rewriting MCP behavior.
 `CortexWeaveService` is the public application facade. It owns references to
 small, independently testable services rather than a single mutable application
 state lock. Its operations cover workspace registration and status, indexing,
-retrieval, memories, memory trust review and consolidation, sessions, tasks, and
-events. Memory analysis is transport-neutral and returns reviewable proposals;
-only a separate reviewed call changes trust or supersession state.
+ retrieval, memories, memory trust review and consolidation, sessions, tasks,
+ events, explicit episodes, Experience consolidation, historical search, and
+ reviewed Experience assessments. Memory analysis is transport-neutral and
+ returns reviewable proposals; only a separate reviewed call changes trust or
+ supersession state.
 
 Workspace selection is also an application concern. The facade resolves UUIDs,
 unique names, canonical roots, file URIs, nested paths, and adapter hints from a
@@ -64,6 +68,11 @@ CLI exposes the combined snapshot through `metrics`.
   from a conversation turn.
 - **Events** are time-ordered facts about activity, including file changes,
   sessions, tasks, tools, compilers, and tests.
+- **Episodes** are caller-created, session-scoped ordered memberships over
+  existing Events. They never infer a task boundary from proximity in time.
+- **Experience** is an immutable, evidence-backed historical interpretation of
+  one terminal Episode. It is not an explicit Memory, current source fact, or
+  causal claim about an attempted change.
 
 Every retrieval result identifies its source domain. Workspace, session, and
 task identifiers are UUID-backed strings at service boundaries. Session and task
@@ -161,6 +170,13 @@ result carries the graph revision, applied limits, paths, confidence, and
 truncation state; a concurrent graph revision change makes the read retryable
 instead of mixing snapshots.
 
+Experience retrieval is a separate transport-neutral application service. It
+searches only the current workspace and explains exact or compatible failure
+signature matches, lifecycle, verification, and historical snapshots. Context
+assembly selects ordinary current evidence first; an eligible Experience is
+then an independently bounded `historical_supplemental` item and cannot evict
+current source, task, or active Event evidence.
+
 ## Concurrency and Failure Model
 
 Services share immutable configuration and thread-safe ports through `Arc`.
@@ -176,11 +192,12 @@ without exposing partially updated document trees.
 
 The service operations have no MCP-specific inputs or outputs. The application
 facade directly exposes workspace registration/status/reindexing, retrieval and
-item lookup, explicit memory, session/task lifecycle, and event ingest using
-domain and Serde types. MCP can be removed while CLI, tests, and a future
-harness continue to use the same core. Likewise, the indexing service consumes
-normalized analyzer output and contains no Rust, Python, TypeScript,
-JavaScript, C#, or Go syntax.
+item lookup, explicit Memory, session/task/Episode lifecycle, event ingest,
+Experience consolidation/search/review, and context assembly using domain and
+Serde types. MCP can be removed while CLI, tests, and a future harness continue
+to use the same core. Likewise, the indexing service consumes normalized
+analyzer output and contains no Rust, Python, TypeScript, JavaScript, C#, or Go
+syntax.
 
 The native harness contract adds typed preparation, caller-owned sufficiency
 policy, and policy-gated exact hydration around that facade. It does not execute
@@ -193,14 +210,15 @@ records a durable reason plus source provenance before returning evidence.
 `cortexweave serve` starts a line-delimited JSON-RPC MCP server over stdio.
 Its stdout carries protocol messages only; structured logs are sent to stderr.
 The adapter implements initialization, tool discovery, tool calls, and ping.
-It exposes semantic search/item lookup, memory operations, workspace status and
-reindexing, workspace discovery, plus straightforward session and event
-operations. Existing `workspace_id` UUID inputs remain compatible. An optional
-`workspace` input accepts a UUID, unique name, absolute path, or file URI; calls
-may omit both when an explicit launch hint or singleton registration resolves
-unambiguously. Conflicting inputs fail before the operation executes. On startup it
-arms a filesystem watcher for every registered workspace so an agent sees fresh
-indexed source without a manual reindex.
+It exposes semantic search/item lookup, Memory, Episode, and Experience
+operations, workspace status and reindexing, workspace discovery, plus
+straightforward session and event operations. Existing `workspace_id` UUID
+inputs remain compatible. An optional `workspace` input accepts a UUID, unique
+name, absolute path, or file URI; calls may omit both when an explicit launch
+hint or singleton registration resolves unambiguously. Conflicting inputs fail
+before the operation executes. On startup it arms a filesystem watcher for every
+registered workspace so an agent sees fresh indexed source without a manual
+reindex.
 
 The adapter translates JSON values into facade calls and translates their
 domain results back into MCP tool results. Tool execution failures are returned

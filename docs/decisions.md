@@ -1,4 +1,4 @@
-# CortexWeave v0.1 Decisions
+# CortexWeave Decisions
 
 ## D001: Application Services Are the Integration Boundary
 
@@ -1054,3 +1054,864 @@ tools remain fact-only and may return an empty result for dynamic member calls
 such as Python attribute dispatch. This gives context packets honest graph
 provenance without weakening the conservative analyzer contract or claiming an
 edge the graph does not contain.
+
+## D069: Episodes Are Exact Session-Bound Operational Domains
+
+**Status:** Accepted
+
+An episode is a first-class domain owned by one workspace and one session, with
+an optional task whose persisted workspace and session must match exactly. A
+primary member event must have the same workspace, an explicit matching
+session, and a null-safe exact task match. Unscoped watcher events, task-only
+events, and other session-less activity remain inspectable but cannot become
+primary members of the initial explicit episode domain.
+
+One event has at most one primary episode membership. Membership order is a
+persisted ordinal, not timestamp order. A bounded batch advances an optimistic
+episode version and inserts all memberships in one SQLite transaction. Durable
+request identity makes a repeated batch idempotent and makes reuse of a request
+key with different content a conflict. Only `Open` episodes accept members;
+terminal lifecycle transitions are irreversible.
+
+## D070: Experiences Are Immutable Interpretations with Monotonic Review
+
+**Status:** Accepted
+
+An accepted experience and its attempts, verification, evidence strength,
+evidence links, and historical snapshots are one immutable interpretation of a
+terminal episode. No experience operation updates raw events, memories,
+checkpoints, code, or graph state. Later review appends an assessment rather
+than rewriting history.
+
+`Disputed`, `Refuted`, and `Superseded` assessments permanently exclude that
+experience from ordinary retrieval and context. A later `Confirmed` assessment
+may add supporting evidence but does not silently reactivate it; a new accepted
+experience is the active replacement. Superseding-experience links are
+workspace-scoped and cycle-free in SQLite. Complete workspace deletion may
+cascade the whole domain, but no narrower application operation deletes a
+closed episode or accepted experience.
+
+## D071: Historical Code Meaning Uses Immutable Snapshot Identity
+
+**Status:** Accepted
+
+A historical code snapshot records normalized relative path, workspace content
+revision, document content revision and hash, optional chunk stable key and
+content hash, optional symbol logical key and label, and source range. A graph
+snapshot adds graph content revision, schema and state, analyzer and structure
+identities, node stable key and type, and resolution provenance. Present UUIDs
+may be observed provenance but never the historical identity.
+
+This duplication is deliberate and bounded. Documents, chunks, nodes, facts,
+and edges are current derived state: reconciliation can update or delete them,
+and graph repair can reproject them without changing source revision. An
+experience therefore never relies on a cascading foreign key to a mutable code
+or graph row to explain what was observed historically.
+
+## D072: Automatic Evidence Is Bounded, Structured, and Non-Causal
+
+**Status:** Accepted
+
+The initial evidence sources are typed events, immutable code snapshots, and
+immutable graph snapshots. Explicit user acceptance is a registered event with
+an `ExplicitlyAcceptedBy` relation, not a duplicate source kind. Memory and
+checkpoint sources remain deferred until a release-path extractor requires
+them. Relations are a closed domain enum; automatic extraction has no
+`CausedBy`, and `ResolvedBy` requires an explicit provenance-bearing assertion
+plus compatible verification.
+
+Evidence strength stores a bounded level, one or more typed bases, rule and
+version identity, and visible reasons. A numeric ranking contribution is only a
+derived value. Temporal association can describe attempts followed by
+verification, but it cannot assert that an edit caused a pass or was necessary.
+Unversioned v0.4.1 payloads are legacy evidence unless a complete registered
+decoder validates their shape and required provenance.
+
+## D073: Consolidation Separates Input Idempotency from Output Determinism
+
+**Status:** Accepted
+
+The v1 consolidation input fingerprint is a BLAKE3 digest over a UTF-8 domain
+separator, a zero byte, and canonical JSON identity: workspace, episode scope,
+creator, terminal status/version, ordered membership ordinals, event IDs, event
+types and canonical payload hashes, plus the complete extractor, decoder,
+normalizer, verifier, canonicalizer, and renderer identity catalogs. Canonical
+objects sort keys by UTF-8 bytes, arrays preserve order, registry identities
+sort by ID then version, and request keys, generated IDs, association/display
+timestamps are excluded. Event payload hashes use their own domain separator.
+
+The material proposal has a second domain-separated canonical hash covering
+the signature, attempts, outcome, verification, strength, snapshots, links,
+and deterministic summary. SQLite
+uniqueness on `(workspace_id, consolidation_fingerprint)` converges concurrent
+identical requests. The existing experience is returned only when the proposal
+hash also matches; a mismatch is a deterministic-extractor invariant failure.
+This prevents either retry duplication or silent acceptance of two outputs for
+one versioned input.
+
+## D074: Current Evidence Has One-Way Budget Authority over Experience
+
+**Status:** Accepted
+
+Experience is a separate historical context source. Automatic inclusion
+requires either a typed active failure signature or explicit experience
+enablement, exact workspace scope, active lifecycle, a compatible verified
+`Success` or `PartialSuccess`, and at least `Moderate` structured strength.
+Ordinary context admits at most three experiences; the hard service ceiling is
+ten.
+
+The initial packet fractions are 50% code, 20% structural, 10% memory, 5%
+event, 5% state, and 10% experience. Experience cannot reclaim unused budget
+from any other category. Higher-authority categories may reclaim unused
+experience allocation. This deliberately narrows the v0.4.1 general fallback
+pass so historical experience cannot displace current source, current graph
+evidence, active state, or current diagnostics. Every selected experience is
+labeled historical and retains an experience-specific selection reason.
+
+## D075: Experience Policy Lives Behind Transport-Neutral Services
+
+**Status:** Accepted
+
+Evidence decoders and failure normalizers are pluggable domain/application
+interfaces. Episode lifecycle, consolidation, retrieval, explanation, and
+context eligibility live in application services, while SQLite owns
+transactions and cross-workspace constraints. The indexing core remains free
+of compiler-, test-, language-, episode-, and experience-specific inference.
+
+The native facade is implemented and tested before CLI or MCP exposure.
+Adapters may resolve workspace selectors, parse and cap requests, serialize
+bounded results, and map transport errors; they do not decode evidence, form
+episodes, infer outcomes, compute fingerprints, rank experiences, or decide
+context eligibility. No core or application type depends on MCP, JSON-RPC,
+stdio, or a future dedicated harness.
+
+## D076: Decoded Evidence Is a Scoped Producer Report, Not Established Truth
+
+**Status:** Accepted
+
+The stored event envelope supplies the direct durable facts available to an
+evidence decoder: event identity and type, workspace, explicit session,
+optional task, recorded time, contract, and version. Payload values remain
+producer assertions. Decoding proves their schema, bounds, path form, and
+internal consistency; it does not authenticate the producer, establish causal
+meaning, or prove task success.
+
+Process-backed contracts retain the integer exit code and expose only a
+mechanically derived `ExitedZero` or `ExitedNonzero` process outcome. They do
+not expose a generic `Success` result. A generic verifier's reported pass/fail,
+its verifier identity and version, its invocation labels, and its declared
+subject remain assertions until a later registered verifier rule validates
+their compatibility. User-acceptance actor and subject values likewise remain
+reported labels unless trusted ingress policy authenticates them.
+
+Compiler and Cargo-test reports require a typed declared verification subject.
+Cargo-test subjects may be workspace, package, target, or test; compiler
+subjects may be workspace, package, or target. Payloads cannot inject symbol
+keys. A later failure normalizer may add symbol identity only through a current,
+deterministic structural capability with visible provenance. Source-change
+paths are normalized workspace-relative values, while their content hashes and
+revisions remain explicitly producer-reported until persistence validates or
+snapshots them.
+
+Free-form messages, diagnostic text, assertion text, actor labels, tool labels,
+and operation labels can contain sensitive or unstable producer data. They are
+bounded for storage and diagnostics but are not signature components. Failure
+signatures use a versioned allowlist of normalized stable fields, reject
+absolute paths, and must never incorporate raw command lines, temporary roots,
+environment values, or secrets merely because a decoder accepted the text.
+
+## D077: Episode Ambiguity Is Rejected, Not Repaired
+
+**Status:** Accepted
+
+Explicit primary membership is the only v0.5 consolidation boundary. Nearby
+timestamps, matching payloads, repeated diagnostics, task changes, and a shared
+session do not move or merge events. An event already owned by one episode
+causes a typed conflict when offered to another. An event with a different
+task, no exact session, or another workspace is rejected without searching for
+a more convenient episode.
+
+Session termination does not implicitly close, abandon, or invalidate open
+episodes. A caller may close or abandon the explicit episode afterward using
+its expected version. An event that arrives after an episode becomes terminal
+cannot be appended even when its provenance otherwise matches; the caller must
+leave it raw or create a new explicit episode. An abandoned episode remains
+terminal and a later attempt always receives a new identity.
+
+The initial hard ceiling is 100 primary events per episode, not merely per
+mutation request. SQLite-owned mutation transactions check the accumulated
+count before inserting, and an over-cap batch rolls back its request
+reservation and optimistic version. Concurrent add/add and add/close races
+permit exactly one expected-version mutation to commit; the losing operation
+returns a conflict and no committed member is silently omitted.
+
+## D078: Failure Signatures Are Versioned, Constrained Equivalence Classes
+
+**Status:** Accepted
+
+Failure normalization is a transport-neutral application service that accepts
+only already-decoded evidence. Its contract-addressed registry never selects a
+normalizer by payload shape. Canonical signatures use a versioned,
+length-delimited encoding and a domain-separated BLAKE3 key over an explicit
+allowlist: domain, normalizer identity/version, workspace scope, constrained
+target/path scope, and bounded normalized components. Source locations and raw
+message prose are excluded; path scope must be workspace-relative.
+
+Rust compiler v1 normalization requires exactly one structured error with an
+`E` diagnostic code. `E0308` also requires explicit, paired, bounded
+`expected_type` and `actual_type` fields, preserving direction rather than
+merging distinct mismatches or scraping diagnostic prose. The existing
+v0.4 structural surface supplies no deterministic diagnostic-to-symbol map, so
+the normalizer requires workspace-relative path scope, emits that limitation
+as a diagnostic, and does not infer a symbol. Missing structured detail is
+unsupported, never guessed.
+
+Cargo test v1 normalization requires one reported failure and a stable test
+name or assertion class; raw failure message text is deliberately excluded.
+Generic verifier failures require a nonzero exit, an explicit failed result,
+and an exact registered verifier rule matching ID, version, tool, operation,
+and allowed subject kind. This prevents arbitrary commands or producer labels
+from becoming durable signature material.
+
+## D079: Experiences Are Immutable Historical Aggregates, Not Memories or Causal Claims
+
+**Status:** Accepted
+
+The Experience domain is distinct from explicit memory. It preserves a bounded,
+workspace-scoped interpretation of one explicit episode: its optional normalized
+failure signature, ordered attempts and exact event evidence, verification
+assessment, structured strength basis, historical code/graph snapshots, and a
+deterministic summary. The summary is renderer-versioned and recomputed before
+persistence; it only describes an observed associated sequence and explicitly
+does not attribute causation to an individual attempt.
+
+Experience writes use a dedicated aggregate transaction. SQLite enforces
+workspace-scoped episode/event ownership, ordinal uniqueness, fingerprint
+uniqueness, append-only assessments, immutable rows, and the FTS projection.
+Snapshots store their own content and graph material rather than foreign keys
+to mutable chunks or graph nodes, so historical records remain intelligible
+after current code changes. Repeating an exact fingerprint is idempotent only
+when its proposal hash matches; a different proposal is a conflict.
+
+The already-released episode migration is `0007`; the additive Experience and
+FTS schema is therefore `0008`. No released migration is edited and no legacy
+event, memory, source, or graph row is rewritten or interpreted during upgrade.
+
+## D080: Experience Outcomes Are Scoped Verification Claims
+
+**Status:** Accepted
+
+An Experience is immutable episode history, not an explicit memory and not a
+causal claim. A conclusive outcome is valid only when ordered, rule-versioned
+verification observations support it. `Success` means that at least one named
+subject passed a deterministic verifier or was explicitly accepted; it proves
+nothing outside those subjects and does not prove that any recorded attempt
+caused the result. `Failure` requires a scoped failed observation.
+`PartialSuccess` requires a positive observation and a failed observation for
+distinct criteria. A pass and failure for the same criterion is conflicting
+and remains inconclusive.
+
+Every attempt owns one or more exact change/tool evidence links. A conclusive
+attempt result owns one following verification link whose decoded material
+supports that result. Only the final attempt's result frontier contributes the
+terminal verification observations used for the overall outcome; an earlier
+failed attempt does not make a later verified pass conflicting. `StillFailing`
+is backed by the same normalized failure,
+`VerificationChangedFailure` by a different normalized failure, and
+`Inconclusive` by the absence of a conclusive scoped observation. Phase 5 owns
+those deterministic comparisons; the persisted relations make the result
+auditable without asserting causation.
+
+Later review never updates the Experience. It appends `Confirmed`, `Disputed`,
+`Refuted`, or `Superseded` assessments. Negative lifecycle states are
+monotonic: a later confirmation does not reactivate the record. A superseded
+assessment names exactly one `replacement_experience_id`; SQLite prevents a
+second replacement and replacement cycles. Ordinary retrieval must exclude
+disputed, refuted, and superseded records by default, while historical reads
+retain the immutable record and its assessment trail.
+
+The aggregate write primitive remains crate-internal until the deterministic
+consolidator can decode payload contracts, validate verifier rules and scope,
+compare failure signatures, and construct the proposal. Public reads and
+reviewed assessment append/read operations remain available. This prevents a
+caller-constructed `Success` record from crossing the evidence truth boundary.
+
+## D081: Consolidation Is an Alternating Evidence State Machine
+
+**Status:** Accepted
+
+The built-in v1 consolidator scans one explicit terminal episode in membership
+order. It selects the first supported normalized failure, groups each maximal
+run of source/tool actions into one attempt, and assigns the first following
+material result to that attempt. It never skips an undecodable material event,
+an unsupported failed result, or an incompatible result to reach a more useful
+later outcome. Those cases return typed no-result reasons.
+
+Only the final attempt's complete result frontier determines the Experience
+outcome. V1 verification compatibility is exact by verifier family or
+registered rule identity/version, subject kind, and subject value. It assumes
+no workspace/package/target/test containment. Opposing terminal results for
+one exact subject are conflicting; positive and failed results for distinct
+subjects may be partial success when the frontier also covers the initial
+failure subject. Earlier attempt results remain exact historical evidence but
+are not terminal observations.
+
+Preview and acceptance are separate. Acceptance reruns the built-in extractor,
+requires the previewed input fingerprint and material proposal hash, and passes
+only an internally materialized record to the crate-private transaction. Only
+warning-free deterministic proposals from closed episodes are automatically
+accepted. Unauthenticated user acceptance, abandoned episodes, or unavailable
+historical source snapshots remain review-required and read-only in Phase 5.
+
+Canonical JSON v1 hashes semantic `serde_json::Value` data: object keys sort by
+UTF-8 bytes, arrays retain order, strings use deterministic JSON escaping, and
+numbers use the deterministic `serde_json::Number` representation. It does not
+claim to preserve an original number lexeme that was discarded before event
+storage. The input fingerprint covers all episode members and the complete
+extractor/decoder/normalizer/verifier/renderer identity catalog; the separate
+proposal hash covers material output without generated IDs or timestamps.
+
+## D082: Consolidation Acceptance Rechecks the Immutable Episode Frontier
+
+**Status:** Accepted
+
+The public consolidation API can preview only an explicit episode/version and
+can accept only that preview's fingerprint and proposal hash.  The storage
+transaction rechecks the episode version immediately before inserting the
+immutable Experience.  Episode membership mutation increments that version,
+and events are append-only at SQLite level, so the preview cannot be accepted
+against a changed membership or rewritten payload.
+
+Historical source content is a stronger claim than a source-change event.  V1
+therefore marks a proposal that contains a source change as review-required
+until a future validated snapshot capture can prove the reported historical
+revision and hash.  It never substitutes present workspace contents for an
+unavailable historical snapshot.
+
+## D083: Experience Describes Verified-After Association, Not Effect
+
+**Status:** Accepted
+
+An automatic Experience may state only that a bounded attempt-action sequence
+was associated with and followed by exact terminal verifier evidence.  It does
+not state that an edit fixed, caused, resolved, or was necessary for the
+result.  It also does not project historical verification into proven current
+state.  Deterministic summary renderer version 2 uses the terms `associated
+attempt` and `verified-after relationship`, names exact subjects, and expressly
+limits the outcome to the stored episode interpretation.
+
+The first result after each action run belongs to that attempt as
+`attempt_verification`.  Only the complete final consecutive result frontier
+forms overall verification observations.  Earlier attempt results remain
+auditable historical relations and cannot conflict with a later frontier.
+Verifier compatibility is exact by versioned rule identity, subject kind, and
+subject value; registered generic results must also match the rule's tool,
+operation, and allowed subject kind.  No containment or target coverage is
+inferred from names.
+
+## D084: Acceptance Revalidates Canonical Input Inside an Immediate Transaction
+
+**Status:** Accepted
+
+Preview computes a canonical identity for every ordered episode member:
+ordinal, event ID, stored event type, and a domain-separated BLAKE3 hash of the
+canonical JSON payload.  The acceptance transaction re-reads and compares that
+exact identity before any Experience material is inserted.  Episode version is
+still checked as the coarse mutation frontier; exact identity is the defense in
+depth proof that the immutable input accepted is the input previewed.
+
+SQLite begins consolidation acceptance with `BEGIN IMMEDIATE`, rather than a
+deferred transaction.  This serializes competing writers before their reads,
+which prevents read-then-upgrade lock failures and makes the later writer's
+unique-fingerprint lookup the idempotent convergence point.  It does not relax
+the proposal-hash conflict check.
+
+Canonical JSON implementation and canonicalization version are shared across
+input hashing and transaction validation.  The version is stored immutably on
+every Experience alongside extractor and summary-renderer identities, so a
+future interpretation revision remains traceable rather than silently mixed.
+
+## D085: Experience Retrieval Is Deterministic, Scoped, and Historical
+
+**Status:** Accepted
+
+Experience search is limited to one explicit workspace and has no semantic
+embedding, global, popularity, reuse, or graph-neighbor source. It gathers a
+bounded union of exact failure-key, verified compatible-component, FTS,
+exact-path, exact historical graph-key, and recent identifiers. Full immutable
+records are then filtered and scored in the application service, where derived
+lifecycle and all score components are inspectable.
+
+Exact signature score dominates every possible combination of weaker signals.
+Compatible components require all requested component pairs to match; lexical,
+path, and graph signals do not create scope or causal equivalence. Stable
+tie-breaking is score, immutable creation time, then ID. Active lifecycle is
+the default; negative assessed records require an explicit lifecycle filter.
+
+Historical code references are returned with their original revision, hash,
+path, and stable-key provenance plus separate present-state document and graph
+statuses. The service never silently substitutes a current symbol or source
+for the historical reference.
+
+## D086: Retrieval Selectors Do Not Fall Back and Resolution Facts Stay Separate
+
+**Status:** Accepted
+
+A search with any positive selector—exact signature, compatible components,
+lexical text, path, or graph stable key—merges only candidates produced by
+those selectors. Recent Experiences are a browse source only when no selector
+is supplied. The bounded merged union is scored in full; identifier order may
+not truncate it before exact-signature dominance is applied. Canonical
+signature identity is revalidated at the request boundary.
+
+Historical document freshness and graph-symbol resolution are independent.
+Document status is current, content-changed, or deleted. Graph status is
+not-captured, current, missing, or unavailable, and current requires a current
+workspace graph revision. All graph snapshots linked to a code snapshot are
+reported. These present-state facts annotate immutable historical provenance;
+they never rewrite it.
+
+## D087: Historical Experience Is a Bounded Supplemental Context Source
+
+**Status:** Accepted
+
+An active normalized failure signature may request Experience-aware context.
+The Experience pool is separate from ordinary context candidates and admits
+only active, strong-or-moderate records with deterministic terminal
+verification (`verified_passed` or `verified_failed`) and a non-inconclusive
+terminal outcome. Its ranking is deterministic: exact signature evidence
+dominates compatible components, then verification strength and outcome;
+creation time is not an authority signal.
+
+Ordinary context is assembled first using its unchanged candidate pool and
+full packet budget. Historical Experience uses only remaining packet capacity,
+within its own configurable candidate and token ceilings. It is rendered with
+an explicit historical/non-current qualifier and may explain a prior verified
+episode, but cannot replace, suppress, or claim the state of present code or
+active task evidence.
+
+Experience member events are deduplicated against already selected Event
+context, and Experience IDs are selected at most once. Missing, ineligible,
+over-budget, deduplicated, disabled, or unavailable history is represented in
+the optional packet explanation; ordinary context continues without fabricated
+historical content.
+
+## D088: Experience Has One Admission Path and Explicit Historical Authority
+
+**Status:** Accepted
+
+`ContextSourceType::Experience` is a packet provenance label, not a generic
+working-set source. Generic source lookup and existence validation deliberately
+return no Experience candidate, so an Experience cannot be activated, pinned,
+or injected through temporal retrieval. Its only context admission path is the
+bounded Experience search initiated by an explicit active failure signature.
+
+Every selected Experience explanation records
+`historical_supplemental` authority alongside lifecycle, outcome, verification
+status, evidence strength, and the deterministic Experience search score
+components. The ordinary packet item order remains authoritative: current and
+ordinary sources are selected first, and historical selections are appended
+only from unused capacity.
+
+Deduplication tracks member event IDs across ordinary Event items and every
+selected Experience, not merely within one candidate. One immutable historical
+event therefore cannot consume multiple source categories or multiple
+Experience selections in the same packet.
+
+## D089: Experience Eligibility Changes Only Through Reviewed Assessments
+
+**Status:** Accepted
+
+Experience assessment rows remain immutable and append-only. A lifecycle-changing
+operation must pass through the application review boundary with a bounded
+reviewer identity, reason, and one or more workspace-scoped immutable evidence
+events. Supersession names a distinct replacement in the same workspace; SQLite
+continues to own the write transaction and reject replacement cycles.
+
+Deterministic analysis may inspect current evidence and issue a dispute proposal
+only when every referenced recurring event decodes and normalizes to the exact
+signature of an active, previously `verified_passed` success. A proposal is
+read-only. It cannot append an assessment or change context eligibility.
+
+Normal Experience search and context admission project active lifecycle only.
+Historical inspection must set `include_historical` explicitly (or request a
+specific lifecycle); returned hits state whether they were admitted by the
+active default, an explicit lifecycle filter, or historical inspection. Detail
+inspection always returns the immutable assessment history and final lifecycle,
+so an excluded prior experience has an auditable lifecycle explanation rather
+than silently disappearing.
+
+## D090: Recurrence Requires New Evidence and Historical Rows Resist Narrow Deletion
+
+**Status:** Accepted
+
+An exact matching failure is a dispute candidate only when every supplied
+recurrence event was recorded strictly after the prior Experience was created.
+Replaying the Experience's original failure evidence therefore cannot manufacture
+a later recurrence. Signature equality, registered decoding, active lifecycle,
+successful outcome, and `verified_passed` status remain independently required.
+
+The SQLite assessment append primitive is crate-private; external callers must
+use the reviewed application operation. Assessment and assessment-evidence rows
+reject direct update and narrow deletion while their workspace exists. The
+immutability triggers are workspace-aware so an explicit deletion of the entire
+workspace can still cascade through the complete episode and Experience domain.
+
+Experience detail and historical search project normal-context eligibility as
+an explicit boolean, lifecycle, and lifecycle-specific reason. This makes the
+answer to “why is this not normal context?” a returned fact rather than an
+inference from absence.
+
+## D091: The Native Service Is the Complete Experience Lifecycle Contract
+
+**Status:** Accepted
+
+The public `CortexWeaveService` directly owns the complete v0.5 Experience
+lifecycle: workspace registration, session/task and episode operations, typed
+event recording, preview/accept consolidation, Experience search and detail,
+and context assembly. A fresh session recovers only persisted, scoped state;
+it does not receive an implicit transcript from a prior session.
+
+Experience-aware context remains supplemental even in this end-to-end path. A
+fresh active task and current failure event are selected before the one bounded
+historical Experience. The historical item retains explicit provenance and
+authority, and a repeated acceptance returns the same immutable Experience
+identity. This contract uses only domain and application-service types; no
+adapter, transport, model, or harness runtime type is part of the lifecycle.
+
+## D092: Experience Policy Has One Transport-Neutral Application Boundary
+
+**Status:** Accepted
+
+Experience domain and application modules contain no CLI, MCP, JSON-RPC,
+stdio, or adapter dependency. Their use of structured JSON is limited to the
+versioned immutable event-payload contract and canonical hashing; it is not a
+transport request shape. Context obtains persistence through storage methods
+and contains no production SQL. The repository stores normalized domain values
+without branching on Rust, Cargo, diagnostic codes, or analyzer identities.
+
+CLI and MCP remain argument/serialization surfaces. They must not derive
+Experience outcomes, verification status, lifecycle, ranking, or context
+eligibility, and later Experience exposure must invoke the same
+`CortexWeaveService` operations proven by the native full-cycle contract. The
+architecture regression test enforces these dependency and policy boundaries.
+
+## D093: Experience Mutations Require Explicit Caller Review Inputs
+
+**Status:** Accepted
+
+The CLI and MCP expose episode lifecycle, Experience inspection, deterministic
+consolidation, and assessment operations only as thin calls to
+`CortexWeaveService`. Episode membership and terminal mutations require an
+expected version plus caller-supplied idempotency key. Experience consolidation
+requires the exact fingerprint and proposal hash returned by a prior read-only
+preview; no adapter treats a terminal episode as implicit authorization.
+
+Reviewed assessment input requires a caller-supplied identity, reason, and
+bounded immutable Event evidence. That identity is recorded provenance, not
+adapter authentication, and the adapters make no claim that a connected agent
+followed Experience policy. Dispute detection remains a read-only proposal;
+neither CLI nor MCP may silently apply dispute, refutation, or supersession.
+
+MCP bounds episode event input at 100, assessment evidence at 64, and Experience
+search output at 50. Context accepts an optional canonical active failure
+signature so historical Experience retrieval remains explicitly requested and
+supplemental to ordinary context.
+
+## D094: Experience Observability Is Process-Local and Non-Directive
+
+**Status:** Accepted
+
+v0.5 operational metrics report persisted episode, Experience, and assessment
+counts alongside process-local counters for consolidation outcomes, normalized
+failure signatures, requested Experience search components, context category
+utilization, and bounded operation latency. The counters are observational:
+they do not adjust search scores, context budgets, consolidation eligibility, or
+any automatic action.
+
+Doctor verifies that all episode and Experience tables, assessment tables, and
+the Experience FTS projection are queryable; it also checks for missing FTS
+rows and SQLite foreign-key violations. This verifies persistence integrity
+without interpreting a historical Experience as a statement about current code.
+
+Evaluation reports use a versioned, timestamp-free serialization with integer
+microsecond latency so the same metrics produce the same artifact bytes.
+
+## D095: Release Evaluation Uses Typed Offline Fixtures
+
+**Status:** Accepted
+
+The v0.5 release-blocking evaluator is an integration harness over the public
+service facade, temporary SQLite storage, and a deterministic in-process
+embedding provider. It does not call an external model or embedding endpoint.
+
+Its fixtures generate typed producer payloads, construct explicit episodes, and
+judge exact failure-signature equality, Experience retrieval relevance,
+workspace isolation, ambiguous terminal evidence, repeated acceptance, current
+context authority, and source rename/delete recovery. The harness reports only
+observable, labeled outcomes; it does not tune ranking or consolidation policy.
+
+## D096: The Paired Experiment Forks One Verified State
+
+**Status:** Accepted
+
+The v0.5 real-repository experiment creates one truthful, verified Task A
+Experience, then seals the repaired repository and SQLite database. Baseline
+and assisted Task B lanes each restore that same fork point sequentially at the
+same canonical workspace path. They use the same v0.5 binary and configuration;
+the only intended context treatment is omission or inclusion of the canonical
+active Task B failure signature. This avoids changing binaries or policy while
+reproducing the v0.4 no-Experience context condition.
+
+Current source, task, and failure evidence remain authoritative in both lanes.
+An assisted packet is valid only when it selects exactly the intended active,
+verified Experience as `historical_supplemental` without displacing that current
+evidence. Bad selection or authority inversion blocks v0.5; a correct null
+result does not. Raw traces are sealed before a separate interpretation pass,
+and experiment metrics never tune ranking, budgets, or consolidation policy.
+
+## D097: Active Failure Scope Does Not Become an Implicit Historical Filter
+
+**Status:** Accepted
+
+Experience-aware context uses the active normalized failure signature for full
+exact identity and compatible-component retrieval. It does not also copy the
+signature's current path or graph stable key into the search request's explicit
+hard-filter fields. Exact identity continues to include scope, while compatible
+history may come from another path or symbol within the same workspace.
+
+Callers of explicit Experience search may still request exact path or graph-key
+filters. Context assembly does not invent those filters because doing so makes
+the documented compatible-match path unreachable. This changes no current
+evidence authority or budget: ordinary current context is still assembled
+first, and any admitted Experience remains historical supplemental context.
+
+## D098: Accepted Experience Aggregates Are Sealed at the SQLite Boundary
+
+**Status:** Accepted
+
+An accepted Experience and its attempts, verification observations, evidence
+links, strength bases, code snapshots, and graph snapshots form one sealed
+historical aggregate. SQLite must reject updates, narrow deletes, and component
+inserts after that aggregate is sealed; application visibility or repository
+method privacy is not an immutability boundary. Acceptance persists and seals
+the complete aggregate in one SQLite transaction, and migrated aggregates begin
+sealed. Later reviewed assessments remain a separate append-only lifecycle
+history and do not reopen the accepted aggregate.
+
+Events are append-only under the same storage-level meaning: an existing
+workspace permits neither update nor narrow deletion. The only intentional
+erasure boundary for Events, Experiences, their components, and assessment
+history is deletion of the owning workspace and its complete foreign-key
+cascade. Direct-SQL regression tests must prove both the narrow-write rejection
+and the full-workspace cascade.
+
+## D099: Exact Failure Identity Requires a Structured Discriminator
+
+**Status:** Accepted
+
+A stable normalized compatibility class is not automatically an exact failure
+identity. A versioned normalizer must state whether its structured fields
+preserve the material distinctions required by its supported failure class.
+Only an exact-capable result may drive `StillFailing`, exact Experience search,
+or exact recurrence. A coarser result may remain useful for explicitly labeled
+compatible retrieval, but it cannot be promoted to exact equality by hash
+equality alone.
+
+Rust diagnostic-code, target, and path scope without a code-specific message,
+symbol, type, or other deterministic discriminator is not exact. A test name
+without a stable failing assertion or case discriminator and a registered
+verifier's generic `nonzero` class have the same limitation. Unsupported exact
+inputs remain raw evidence or compatible-only observations; normalizers do not
+recover precision by hashing free-form prose. Signature-version migrations and
+adversarial same-scope/different-failure pairs must keep these classes visible
+and prevent silent equality across the boundary.
+
+## D100: Recurrence Ordering Uses a SQLite-Owned Ingress Frontier
+
+**Status:** Accepted
+
+Producer-supplied Event timestamps describe reported occurrence time; they are
+not proof of persistence or causal order. SQLite assigns durable monotonic order
+to Event ingress and Experience acceptance. A recurrence is "later" only when
+its SQLite-owned order is beyond the accepted Experience's stored frontier and
+all other exact-signature, lifecycle, outcome, and verification requirements
+also pass.
+
+The order and the Experience frontier are committed with their owning writes,
+not reconstructed from UUIDs, wall-clock timestamps, or SQLite implementation
+details such as a transient row identifier. Migrated history whose order cannot
+be proved conservatively produces no automatic recurrence proposal. The
+proposal remains read-only even when ordering is proven.
+
+## D101: Experience Context Applies Authority Before Every Bound
+
+**Status:** Accepted
+
+Experience-aware context uses one lexicographic admission order at candidate
+sourcing, truncation, and final selection. Exact identity dominates compatible
+matching; compatible specificity is explicit; deterministic verification
+status, evidence strength, and outcome then dominate optional lexical relevance.
+Stable identity is the final tie-breaker. Additive bonuses and creation time may
+not let a weaker historical record outrank a stronger one or be admitted merely
+because it is newer.
+
+Every candidate bound must preserve that same order; a recency-limited search
+must not discard an older authoritative candidate before context policy runs.
+Lifecycle eligibility and the detail used to render and deduplicate a selected
+Experience must come from one internally consistent read snapshot. A disputed,
+refuted, or superseded row visible to that snapshot cannot enter ordinary
+context through a stale earlier search hit.
+
+## D102: Assessment Writes Are Idempotent and History Reads Are Bounded
+
+**Status:** Accepted
+
+Reviewed Experience assessment mutations require a caller-supplied idempotency
+key and a canonical request identity enforced in the SQLite transaction. An
+identical retry returns the original immutable assessment; reuse of the key for
+different review content is a conflict. This prevents transport retries from
+manufacturing multiple apparently independent historical reviews.
+
+Assessment history may remain complete and append-only at rest, but lifecycle
+projection may not load that history or issue one evidence query per assessment.
+SQLite provides an indexed, bounded lifecycle projection independent of history
+length. Detail and history interfaces return stable, maximum-sized pages with
+explicit continuation state; context and search consume the projection rather
+than an unbounded assessment vector. CLI and MCP serialize only those bounded
+application results.
+
+## D103: Context Projections Have Service-Level Hard Ceilings
+
+**Status:** Accepted
+
+A caller-selected token budget is a limit within the allowed range, not a way to
+remove the range. Semantic and resume context enforce one application-level
+maximum token budget, and every rendered context item also has a byte ceiling
+before token selection. CLI and MCP may impose the same or a tighter transport
+limit, but the native facade cannot construct an unbounded packet merely
+because an adapter omitted validation.
+
+Path and language scopes have bounded counts and bounded normalized values and
+are deduplicated before candidate filtering. Raw Events may remain faithful
+stored provenance, including legacy or unsupported payloads, while typed
+evidence eligibility and every Event-to-context projection remain independently
+bounded. Oversize input or output intent fails visibly or produces an explicitly
+truncated non-authoritative rendering; it is never silently interpreted as
+eligible evidence. This supersedes the MCP-only hard-ceiling portion of D029 and
+D033 without moving selection policy into an adapter.
+
+## D104: Normalized Test Evidence and External Runner Capture
+
+**Status:** Proposed for v0.5.1; not implemented.
+
+The [v0.5.1 plan](<../CortexWeave v0.5.1 Test Evidence and Vitest Integration Plan.md>)
+proposes a versioned, runner-neutral test-run contract with Vitest and Python
+unittest as its two qualified producers. This scope was expanded at the user's
+request; implementation details remain proposed. Small externally invoked
+helpers own process execution and framework-specific observation. Native services
+own validation, verification scope, failure normalization, and consolidation. CLI
+and MCP remain thin adapters; core/application code never starts the runner.
+
+Automatic verification initially covers complete bounded Vitest files and
+unittest modules or explicitly selected complete TestCase classes, with stable
+inventory and verification inputs. Missing/skipped tests, execution errors,
+expected failures, unexpected successes, partial runs, retries, subtest runs
+under the initial profile, cached/replayed outcomes, or changed scope cannot become a
+supported passing repair. Subtest observations remain distinct from parent
+outcomes. Compound command exits and typecheck/lint/format results cannot replace
+actual test-stage evidence. A runner-qualified test identity remains
+compatible-only; a new factual failed-attempt label avoids asserting exact recurrence or a proven
+different failure from coarse observations.
+
+Capture imports use minimal SQLite-owned receipts to keep retries from creating
+independent evidence. New contract/extractor versions preserve accepted v0.5
+history and do not silently reconsolidate accepted episodes. The complete
+proposal, supported-version qualification, and review gates are in the plan;
+this entry records a proposed architecture direction rather than acceptance
+of unimplemented behavior. Release qualification requires both real capture
+workflows, the emCP scored pair, PiHype fresh-session reuse, and preservation of
+the existing Rust/Cargo evidence paths.
+
+## D105: Repository-Scoped Historical Experience for Shuttle
+
+**Status:** User-confirmed first-harness requirement; detailed architecture
+proposed, not implemented.
+
+The [Shuttle plan](dedicated-harness-plan.md) requires verified Experience to
+be available between linked worktrees of one local Git repository. Shuttle is
+a separate Rust/Ratatui application; CortexWeave remains the substrate and owns
+repository membership, historical retrieval policy, provenance, and SQLite
+transactions. Cross-project knowledge growth is a future objective, outside
+this initial repository boundary.
+
+The proposed extension places a durable repository identity above existing
+workspace identities. A trusted integration supplies validated local Git
+common-directory/worktree relationships. Matching remotes, names, or commits
+alone do not enroll clones, forks, submodules, or other projects. Membership,
+sharing policy, and location revalidation are explicit and versioned.
+
+Current files, graph, vectors, working sets, tasks, sessions, Events, and episode
+membership retain their existing workspace ownership. Eligible Experience may
+be retrieved through an explicit repository scope, retaining the original
+workspace/session/task/episode and immutable evidence. Existing callers keep
+workspace-only defaults. The new service policy resolves the bounded authorized
+pool and applies lifecycle and current-evidence authority before selection;
+the harness does not merge databases or implement a parallel ranking policy.
+
+Stored exact failure keys include workspace identity and remain unchanged.
+Sibling-worktree matches need separately explained, versioned compatibility
+rules; they cannot manufacture exact recurrence by substituting workspace IDs.
+Context and native selected-source records must distinguish consuming workspace
+from origin workspace. Historical paths and snapshots cannot silently resolve
+as current evidence on the consumer's branch. Membership and lifecycle changes
+must affect subsequent reads and invalidate relevant caches.
+
+Prepared context must distinguish active-workspace code hydration candidates from
+historical references. The current `from_context` helper copies all selected
+sources, and hydration rejects foreign-workspace entries; correcting origin IDs
+alone is insufficient. The proposed conversion supplies only current local code
+candidates without weakening service scope checks. A mixed local-code/sibling-
+Experience packet must hydrate its local code successfully while rejecting an
+explicit foreign chunk request. Historical detail remains a separate bounded,
+authorized read and cannot rebase source snapshots onto current files.
+
+Worktree retirement preserves inactive workspace history and immutable evidence.
+Explicit deletion of the owning CortexWeave workspace keeps its existing
+destructive semantics. Sibling retrieval is qualified against divergent branch
+code, isolated clones, path aliases/case, detached HEAD, membership revocation,
+disputed history, concurrent state changes, aggregate limits, and removal of the
+origin worktree. Repository-scoped explicit Memory and cross-project promotion
+require separate scope and trust decisions.
+
+This entry records the required outcome and proposed design boundary. It does
+not claim that the current workspace-isolation contract has already changed.
+
+## D106: Native Delivery Receipts Support External Harness Recovery
+
+**Status:** Proposed prerequisite in the user-approved Shuttle plan revision;
+not implemented.
+
+Before Shuttle permits its first live-model writes, its adapter needs retry-safe
+native creation of sessions, tasks and episodes, and delivery of factual Events.
+Persist caller request keys scoped by operation and validated owner. Repeating
+the same key and canonical request returns the original identity/receipt; changed
+content conflicts. CortexWeave owns receipt persistence and the domain mutation
+in one SQLite transaction. Reuse existing episode/consolidation idempotency and
+qualified capture-import contracts where applicable; do not bypass services with
+adapter SQL or create another domain record after an uncertain acknowledgement.
+
+The harness separately owns durable action intent, permission scope, execution
+state, result artifacts, ordered delivery outbox, progress budgets, verification
+snapshots and user-acceptance receipts. There is no atomic transaction spanning
+its database, a host process and CortexWeave. An action with unknown completion
+must not be replayed automatically; retrying domain delivery is not permission
+to repeat its underlying execution. CortexWeave does not acquire a process
+executor, action scheduler, or controller state machine through this extension.
+
+Qualification injects crashes before dispatch, after the started marker, after
+durable results, after native commit but before acknowledgement, and during
+acceptance/finalization. Recovery must preserve original identities, avoid duplicate
+evidence, distinguish unknown effects from failed commands, and reconcile the
+same snapshot-bound acceptance without inventing a new verifier observation.
+The detailed controller policy stays in the separate harness plan/repository.

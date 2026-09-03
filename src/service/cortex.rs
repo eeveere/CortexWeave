@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 
 use chrono::{DateTime, Utc};
@@ -12,11 +13,16 @@ use crate::{
     AppConfig, CortexError, Result,
     domain::{
         Checkpoint, ContextCandidatePool, ContextPacket, ContextPin, ContextRequest,
-        ContextSourceType, CortexEvent, Document, EventType, GraphRepairMode, GraphRepairOutcome,
-        ImpactReport, MemoryOrigin, MemoryRecord, MemorySupersession, MemoryTrust,
-        MemoryTrustReview, ResumeContext, ResumeContextRequest, Session, StructuralReadOptions,
-        StructuralResult, Task, TaskStatus, TemporalContextItem, TemporalQuery, WorkingSetEntry,
-        WorkingSetSnapshot, Workspace,
+        ContextSourceType, CortexEvent, DecodedEvidence, Document, Episode, EpisodeEvent,
+        EpisodeEventAssociationRequest, EpisodeListRequest, EpisodeStartRequest, EpisodeStatus,
+        EpisodeTerminalRequest, EventType, EvidenceDecodeResult, ExperienceAssessment,
+        ExperienceAssessmentReviewRequest, ExperienceDisputeProposal,
+        ExperienceDisputeProposalRequest, ExperienceExplanation, ExperienceRecord,
+        ExperienceSearchHit, ExperienceSearchRequest, FailureNormalizationResult, GraphRepairMode,
+        GraphRepairOutcome, ImpactReport, MAX_EPISODE_EVENTS, MemoryOrigin, MemoryRecord,
+        MemorySupersession, MemoryTrust, MemoryTrustReview, ResumeContext, ResumeContextRequest,
+        Session, StructuralReadOptions, StructuralResult, Task, TaskStatus, TemporalContextItem,
+        TemporalQuery, WorkingSetEntry, WorkingSetSnapshot, Workspace,
     },
     embedding::{
         EmbeddingLimits, EmbeddingProvider, OpenAiCompatibleEmbeddingProvider, TokenCount,
@@ -27,16 +33,20 @@ use crate::{
     parsing::AnalyzerRegistry,
     retrieval::{RetrievalResult, RetrievalService},
     service::{
-        ContextService, HarnessContext, HarnessContextRequest, HarnessHydrationRequest,
-        HarnessSelectedSource, HydratedContextSource, HydrationAuthorization,
-        HydrationScoreProvenance, MemoryConsolidationReport, MemoryConsolidationRequest,
-        MemorySupersessionReviewRequest, MemoryTrustReviewRequest, StructuralService,
+        ConsolidationService, ContextService, EvidenceService, ExperienceAssessmentService,
+        ExperienceSearchService, FailureNormalizationService, HarnessContext,
+        HarnessContextRequest, HarnessHydrationRequest, HarnessSelectedSource,
+        HydratedContextSource, HydrationAuthorization, HydrationScoreProvenance,
+        MemoryConsolidationReport, MemoryConsolidationRequest, MemorySupersessionReviewRequest,
+        MemoryTrustReviewRequest, StructuralService,
     },
     storage::SqliteStorage,
     workspace::{PathIdentity, WorkspaceScanner, WorkspaceSelector},
 };
 
 const MAX_COLLECTION_LIMIT: usize = 100;
+const MAX_EPISODE_TITLE_BYTES: usize = 512;
+const MAX_EPISODE_REQUEST_KEY_BYTES: usize = 256;
 
 struct EmbeddingTokenCounter {
     provider: Arc<dyn EmbeddingProvider>,
@@ -174,6 +184,11 @@ pub struct CortexWeaveService {
     retrieval: Arc<RetrievalService>,
     structural: Arc<StructuralService>,
     context: Arc<ContextService>,
+    evidence: Arc<EvidenceService>,
+    failure_normalization: Arc<FailureNormalizationService>,
+    consolidation: Arc<ConsolidationService>,
+    experience_search: Arc<ExperienceSearchService>,
+    experience_assessment: Arc<ExperienceAssessmentService>,
     metrics: Arc<RuntimeMetrics>,
 }
 
@@ -230,6 +245,20 @@ impl CortexWeaveService {
                 provider: Arc::clone(&embeddings),
             }),
         )?);
+        let evidence = Arc::new(EvidenceService::standard()?);
+        let failure_normalization = Arc::new(FailureNormalizationService::standard()?);
+        let consolidation = Arc::new(ConsolidationService::new(
+            Arc::clone(&storage),
+            Arc::clone(&evidence),
+            Arc::clone(&failure_normalization),
+        ));
+        let experience_search = Arc::new(ExperienceSearchService::new(Arc::clone(&storage)));
+        let experience_assessment = Arc::new(ExperienceAssessmentService::new(
+            Arc::clone(&storage),
+            Arc::clone(&evidence),
+            Arc::clone(&failure_normalization),
+            Arc::clone(&experience_search),
+        ));
         Ok(Self {
             config: Arc::new(config),
             storage,
@@ -239,6 +268,11 @@ impl CortexWeaveService {
             retrieval,
             structural,
             context,
+            evidence,
+            failure_normalization,
+            consolidation,
+            experience_search,
+            experience_assessment,
             metrics,
         })
     }
@@ -277,6 +311,53 @@ impl CortexWeaveService {
 
     pub fn context(&self) -> &ContextService {
         &self.context
+    }
+
+    pub fn evidence(&self) -> &EvidenceService {
+        &self.evidence
+    }
+
+    pub fn failure_normalization(&self) -> &FailureNormalizationService {
+        &self.failure_normalization
+    }
+
+    pub async fn preview_experience(
+        &self,
+        request: &crate::domain::ConsolidationRequest,
+    ) -> Result<crate::domain::ConsolidationPreview> {
+        let started = Instant::now();
+        let preview = self.consolidation.preview(request).await?;
+        self.metrics
+            .record_consolidation_preview(&preview, started.elapsed());
+        Ok(preview)
+    }
+
+    pub async fn accept_experience(
+        &self,
+        request: &crate::domain::ConsolidationAcceptanceRequest,
+    ) -> Result<crate::domain::ConsolidationAcceptance> {
+        let started = Instant::now();
+        let acceptance = self.consolidation.accept(request).await?;
+        self.metrics
+            .record_consolidation_acceptance(&acceptance, started.elapsed());
+        Ok(acceptance)
+    }
+
+    /// Normalizes already-decoded evidence without mutating events or durable state.
+    pub fn normalize_decoded_failure(
+        &self,
+        evidence: &DecodedEvidence,
+    ) -> FailureNormalizationResult {
+        let result = self.failure_normalization.normalize(evidence);
+        self.metrics.record_failure_normalization(&result);
+        result
+    }
+
+    /// Returns a typed evidence diagnostic for an event without changing the
+    /// event or any persisted state. Legacy event payloads remain raw events
+    /// and are reported as unsupported rather than silently inferred.
+    pub fn diagnose_event_evidence(&self, event: &CortexEvent) -> EvidenceDecodeResult {
+        self.evidence.diagnose(event)
     }
 
     pub fn storage_handle(&self) -> Arc<SqliteStorage> {
@@ -840,7 +921,11 @@ impl CortexWeaveService {
     }
 
     pub async fn semantic_context(&self, request: ContextRequest) -> Result<ContextPacket> {
-        self.context.assemble_context_packet(request).await
+        let started = Instant::now();
+        let packet = self.context.assemble_context_packet(request).await?;
+        self.metrics
+            .record_context_packet(&packet, started.elapsed());
+        Ok(packet)
     }
 
     pub async fn prepare_harness_context(
@@ -1437,6 +1522,290 @@ impl CortexWeaveService {
         self.storage.recent_events(workspace_id, limit).await
     }
 
+    pub async fn start_episode(&self, request: EpisodeStartRequest) -> Result<Episode> {
+        let started = Instant::now();
+        validate_episode_title(request.title.as_deref())?;
+        self.require_workspace(&request.workspace_id).await?;
+        let session = self
+            .storage
+            .get_session(&request.session_id)
+            .await?
+            .ok_or_else(|| CortexError::NotFound(format!("session {}", request.session_id)))?;
+        if session.workspace_id != request.workspace_id {
+            return Err(CortexError::Analysis(
+                "episode session belongs to a different workspace".into(),
+            ));
+        }
+        if session.ended_at.is_some() {
+            return Err(CortexError::Analysis(
+                "cannot start an episode on an ended session".into(),
+            ));
+        }
+        if let Some(task_id) = &request.task_id {
+            let task = self
+                .storage
+                .get_task(task_id)
+                .await?
+                .ok_or_else(|| CortexError::NotFound(format!("task {task_id}")))?;
+            if task.workspace_id != request.workspace_id
+                || task.session_id.as_deref() != Some(&request.session_id)
+            {
+                return Err(CortexError::Analysis(
+                    "episode task must belong to the episode workspace and session".into(),
+                ));
+            }
+        }
+        let episode = Episode::new(
+            request.workspace_id,
+            request.session_id,
+            request.task_id,
+            request.episode_type,
+            request.title,
+            request.created_by,
+        );
+        self.storage.insert_episode(&episode).await?;
+        self.metrics.record_episode_mutation(started.elapsed());
+        Ok(episode)
+    }
+
+    pub async fn add_episode_events(
+        &self,
+        request: EpisodeEventAssociationRequest,
+    ) -> Result<Episode> {
+        let started = Instant::now();
+        validate_episode_event_association_request(&request)?;
+        let episode = self
+            .require_episode(&request.workspace_id, &request.episode_id)
+            .await?;
+        for event_id in &request.event_ids {
+            let event = self
+                .storage
+                .event(&request.workspace_id, event_id)
+                .await?
+                .ok_or_else(|| CortexError::NotFound(format!("event {event_id}")))?;
+            if event.session_id.as_deref() != Some(&episode.session_id)
+                || event.task_id != episode.task_id
+            {
+                return Err(CortexError::Analysis(format!(
+                    "event {event_id} does not exactly match episode session/task provenance"
+                )));
+            }
+        }
+        let request_hash = episode_mutation_hash(
+            "add_events",
+            &request.workspace_id,
+            &request.episode_id,
+            request.expected_version,
+            &request.event_ids,
+        );
+        let episode = self
+            .storage
+            .associate_episode_events(&request, &request_hash, Utc::now())
+            .await?;
+        self.metrics.record_episode_mutation(started.elapsed());
+        Ok(episode)
+    }
+
+    pub async fn close_episode(&self, request: EpisodeTerminalRequest) -> Result<Episode> {
+        let started = Instant::now();
+        let episode = self
+            .transition_episode(request, EpisodeStatus::Closed)
+            .await?;
+        self.metrics.record_episode_mutation(started.elapsed());
+        Ok(episode)
+    }
+
+    pub async fn abandon_episode(&self, request: EpisodeTerminalRequest) -> Result<Episode> {
+        let started = Instant::now();
+        let episode = self
+            .transition_episode(request, EpisodeStatus::Abandoned)
+            .await?;
+        self.metrics.record_episode_mutation(started.elapsed());
+        Ok(episode)
+    }
+
+    pub async fn get_episode(
+        &self,
+        workspace_id: &str,
+        episode_id: &str,
+    ) -> Result<Option<Episode>> {
+        self.require_workspace(workspace_id).await?;
+        self.storage.episode(workspace_id, episode_id).await
+    }
+
+    pub async fn list_episodes(&self, request: EpisodeListRequest) -> Result<Vec<Episode>> {
+        if request.limit > MAX_COLLECTION_LIMIT {
+            return Err(CortexError::Analysis(format!(
+                "episode list limit cannot exceed {MAX_COLLECTION_LIMIT}"
+            )));
+        }
+        if request.limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.require_workspace(&request.workspace_id).await?;
+        if let Some(session_id) = &request.session_id {
+            let session = self
+                .storage
+                .get_session(session_id)
+                .await?
+                .ok_or_else(|| CortexError::NotFound(format!("session {session_id}")))?;
+            if session.workspace_id != request.workspace_id {
+                return Err(CortexError::Analysis(
+                    "episode list session belongs to a different workspace".into(),
+                ));
+            }
+        }
+        if let Some(task_id) = &request.task_id {
+            let task = self
+                .storage
+                .get_task(task_id)
+                .await?
+                .ok_or_else(|| CortexError::NotFound(format!("task {task_id}")))?;
+            if task.workspace_id != request.workspace_id {
+                return Err(CortexError::Analysis(
+                    "episode list task belongs to a different workspace".into(),
+                ));
+            }
+            if request
+                .session_id
+                .as_deref()
+                .is_some_and(|session_id| task.session_id.as_deref() != Some(session_id))
+            {
+                return Err(CortexError::Analysis(
+                    "episode list task and session provenance do not match".into(),
+                ));
+            }
+        }
+        self.storage.list_episodes(&request).await
+    }
+
+    pub async fn episode_events(
+        &self,
+        workspace_id: &str,
+        episode_id: &str,
+        limit: usize,
+    ) -> Result<Vec<EpisodeEvent>> {
+        if limit > MAX_COLLECTION_LIMIT {
+            return Err(CortexError::Analysis(format!(
+                "episode event limit cannot exceed {MAX_COLLECTION_LIMIT}"
+            )));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.require_episode(workspace_id, episode_id).await?;
+        self.storage
+            .episode_events(workspace_id, episode_id, limit)
+            .await
+    }
+
+    pub async fn get_experience(
+        &self,
+        workspace_id: &str,
+        experience_id: &str,
+    ) -> Result<Option<ExperienceRecord>> {
+        self.require_workspace(workspace_id).await?;
+        self.storage.experience(workspace_id, experience_id).await
+    }
+
+    pub async fn search_experiences(
+        &self,
+        request: &ExperienceSearchRequest,
+    ) -> Result<Vec<ExperienceSearchHit>> {
+        self.require_workspace(&request.workspace_id).await?;
+        let started = Instant::now();
+        let hits = self.experience_search.search(request).await?;
+        self.metrics
+            .record_experience_search(request, started.elapsed());
+        Ok(hits)
+    }
+
+    pub async fn experience_get(
+        &self,
+        workspace_id: &str,
+        experience_id: &str,
+    ) -> Result<Option<ExperienceExplanation>> {
+        self.require_workspace(workspace_id).await?;
+        self.experience_search
+            .get(workspace_id, experience_id)
+            .await
+    }
+
+    pub async fn review_experience_assessment(
+        &self,
+        request: ExperienceAssessmentReviewRequest,
+    ) -> Result<ExperienceAssessment> {
+        self.require_workspace(&request.workspace_id).await?;
+        self.experience_assessment.review(request).await
+    }
+
+    pub async fn propose_experience_disputes(
+        &self,
+        request: &ExperienceDisputeProposalRequest,
+    ) -> Result<Vec<ExperienceDisputeProposal>> {
+        self.require_workspace(&request.workspace_id).await?;
+        self.experience_assessment.propose_disputes(request).await
+    }
+
+    pub async fn experience_assessments(
+        &self,
+        workspace_id: &str,
+        experience_id: &str,
+    ) -> Result<Vec<ExperienceAssessment>> {
+        self.require_workspace(workspace_id).await?;
+        self.storage
+            .experience_assessments(workspace_id, experience_id)
+            .await
+    }
+
+    pub async fn experience_assessment_history(
+        &self,
+        workspace_id: &str,
+        experience_id: &str,
+        after: Option<&crate::domain::ExperienceAssessmentCursor>,
+        limit: usize,
+    ) -> Result<crate::domain::ExperienceAssessmentPage> {
+        self.require_workspace(workspace_id).await?;
+        self.storage
+            .experience_assessment_page(workspace_id, experience_id, after, limit)
+            .await
+    }
+
+    async fn transition_episode(
+        &self,
+        request: EpisodeTerminalRequest,
+        status: EpisodeStatus,
+    ) -> Result<Episode> {
+        validate_episode_terminal_request(&request)?;
+        self.require_episode(&request.workspace_id, &request.episode_id)
+            .await?;
+        let operation = match status {
+            EpisodeStatus::Closed => "close",
+            EpisodeStatus::Abandoned => "abandon",
+            EpisodeStatus::Open | EpisodeStatus::Invalid => {
+                unreachable!("terminal status required")
+            }
+        };
+        let request_hash = episode_mutation_hash(
+            operation,
+            &request.workspace_id,
+            &request.episode_id,
+            request.expected_version,
+            &[],
+        );
+        self.storage
+            .transition_episode(&request, status, &request_hash, Utc::now())
+            .await
+    }
+
+    async fn require_episode(&self, workspace_id: &str, episode_id: &str) -> Result<Episode> {
+        self.require_workspace(workspace_id).await?;
+        self.storage
+            .episode(workspace_id, episode_id)
+            .await?
+            .ok_or_else(|| CortexError::NotFound(format!("episode {episode_id}")))
+    }
+
     async fn require_workspace(&self, workspace_id: &str) -> Result<Workspace> {
         self.storage
             .get_workspace(workspace_id)
@@ -1489,6 +1858,82 @@ impl CortexWeaveService {
         }
         Ok(())
     }
+}
+
+fn validate_episode_title(title: Option<&str>) -> Result<()> {
+    if title.is_some_and(|title| {
+        title.trim().is_empty() || title.len() > MAX_EPISODE_TITLE_BYTES || title.contains('\0')
+    }) {
+        return Err(CortexError::Analysis(format!(
+            "episode title must be non-empty, contain no NUL, and be at most {MAX_EPISODE_TITLE_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_episode_event_association_request(
+    request: &EpisodeEventAssociationRequest,
+) -> Result<()> {
+    validate_episode_request_key(&request.request_key)?;
+    if request.event_ids.is_empty() || request.event_ids.len() > MAX_EPISODE_EVENTS {
+        return Err(CortexError::Analysis(format!(
+            "episode event association requires between 1 and {MAX_EPISODE_EVENTS} event IDs"
+        )));
+    }
+    let unique_ids = request.event_ids.iter().collect::<BTreeSet<_>>();
+    if unique_ids.len() != request.event_ids.len() {
+        return Err(CortexError::Analysis(
+            "episode event association IDs must be unique and preserve caller order".into(),
+        ));
+    }
+    if request.event_ids.iter().any(|event_id| {
+        event_id.trim().is_empty()
+            || event_id.len() > MAX_EPISODE_REQUEST_KEY_BYTES
+            || event_id.contains('\0')
+    }) {
+        return Err(CortexError::Analysis(
+            "episode event IDs must be bounded non-empty identifiers".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_episode_terminal_request(request: &EpisodeTerminalRequest) -> Result<()> {
+    validate_episode_request_key(&request.request_key)
+}
+
+fn validate_episode_request_key(request_key: &str) -> Result<()> {
+    if request_key.trim().is_empty()
+        || request_key.len() > MAX_EPISODE_REQUEST_KEY_BYTES
+        || request_key.contains('\0')
+    {
+        return Err(CortexError::Analysis(format!(
+            "episode request key must be non-empty, contain no NUL, and be at most {MAX_EPISODE_REQUEST_KEY_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn episode_mutation_hash(
+    operation: &str,
+    workspace_id: &str,
+    episode_id: &str,
+    expected_version: u64,
+    event_ids: &[String],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cortexweave.episode_mutation.v1\0");
+    for value in [operation, workspace_id, episode_id] {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(&expected_version.to_le_bytes());
+    hasher.update(&(event_ids.len() as u64).to_le_bytes());
+    for event_id in event_ids {
+        hasher.update(&(event_id.len() as u64).to_le_bytes());
+        hasher.update(event_id.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 fn validate_memory_integrity(memory: &MemoryRecord) -> Result<()> {
@@ -1757,7 +2202,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        domain::{Checkpoint, EventType, MemoryKind, Workspace},
+        domain::{
+            Checkpoint, EpisodeCreator, EpisodeEventAssociationRequest, EpisodeListRequest,
+            EpisodeStartRequest, EpisodeStatus, EpisodeTerminalRequest, EpisodeType, EventType,
+            EvidenceDecodeResult, MemoryKind, Workspace,
+        },
         embedding::{TokenCountAccuracy, provider::MockEmbeddingProvider},
     };
 
@@ -2297,6 +2746,608 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn facade_diagnoses_typed_evidence_without_mutating_raw_events() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let service = resolver_service(storage);
+        let directory = tempdir().unwrap();
+        let workspace = service
+            .register_workspace(directory.path().to_string_lossy(), "evidence")
+            .await
+            .unwrap();
+        let session = service
+            .start_session(&workspace.id, json!({}))
+            .await
+            .unwrap();
+        let task = service
+            .start_task(
+                &workspace.id,
+                Some(session.id.clone()),
+                "diagnose",
+                json!({}),
+            )
+            .await
+            .unwrap();
+
+        let legacy = CortexEvent::new(
+            &workspace.id,
+            EventType::CompilerResult,
+            json!({ "ok": false }),
+        );
+        assert!(matches!(
+            service.diagnose_event_evidence(&legacy),
+            EvidenceDecodeResult::Unsupported { .. }
+        ));
+
+        let mut typed = CortexEvent::new(
+            &workspace.id,
+            EventType::CompilerResult,
+            json!({
+                "contract": "cortexweave.rust_compiler_result",
+                "version": 1,
+                "subject": { "kind": "target", "value": "cortexweave" },
+                "exit_code": 1,
+                "diagnostics": [{
+                    "level": "error",
+                    "code": "E0308",
+                    "message": "mismatched types",
+                    "path": "src/lib.rs",
+                    "start_line": 1,
+                    "start_column": 1
+                }]
+            }),
+        );
+        typed.session_id = Some(session.id.clone());
+        typed.task_id = Some(task.id.clone());
+        let before = typed.clone();
+        assert!(matches!(
+            service.diagnose_event_evidence(&typed),
+            EvidenceDecodeResult::Decoded { .. }
+        ));
+        assert_eq!(typed, before);
+
+        service.record_event(typed).await.unwrap();
+        let stored = service.recent_events(&workspace.id, 1).await.unwrap();
+        assert_eq!(stored[0].payload, before.payload);
+    }
+
+    #[tokio::test]
+    async fn episodes_preserve_exact_scope_order_lifecycle_and_idempotency() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let service = resolver_service(storage);
+        let directory = tempdir().unwrap();
+        let workspace = service
+            .register_workspace(directory.path().to_string_lossy(), "episodes")
+            .await
+            .unwrap();
+        let session = service
+            .start_session(&workspace.id, json!({}))
+            .await
+            .unwrap();
+        let task = service
+            .start_task(
+                &workspace.id,
+                Some(session.id.clone()),
+                "episode scope",
+                json!({}),
+            )
+            .await
+            .unwrap();
+
+        let episode = service
+            .start_episode(EpisodeStartRequest {
+                workspace_id: workspace.id.clone(),
+                session_id: session.id.clone(),
+                task_id: Some(task.id.clone()),
+                episode_type: EpisodeType::Debugging,
+                title: Some("repair a failing check".into()),
+                created_by: EpisodeCreator::User,
+            })
+            .await
+            .unwrap();
+
+        let mut first_event = CortexEvent::new(&workspace.id, EventType::CompilerResult, json!({}));
+        first_event.session_id = Some(session.id.clone());
+        first_event.task_id = Some(task.id.clone());
+        service.record_event(first_event.clone()).await.unwrap();
+        let mut second_event = CortexEvent::new(&workspace.id, EventType::TestResult, json!({}));
+        second_event.session_id = Some(session.id.clone());
+        second_event.task_id = Some(task.id.clone());
+        service.record_event(second_event.clone()).await.unwrap();
+
+        let add = EpisodeEventAssociationRequest {
+            workspace_id: workspace.id.clone(),
+            episode_id: episode.id.clone(),
+            expected_version: 0,
+            request_key: "episode-add-1".into(),
+            event_ids: vec![second_event.id.clone(), first_event.id.clone()],
+        };
+        let associated = service.add_episode_events(add.clone()).await.unwrap();
+        assert_eq!(associated.version, 1);
+        assert_eq!(
+            service
+                .episode_events(&workspace.id, &episode.id, 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|member| member.event_id)
+                .collect::<Vec<_>>(),
+            vec![second_event.id.clone(), first_event.id.clone()]
+        );
+        assert_eq!(
+            service.add_episode_events(add).await.unwrap().version,
+            1,
+            "the same durable request is idempotent"
+        );
+
+        let reuse_error = service
+            .add_episode_events(EpisodeEventAssociationRequest {
+                workspace_id: workspace.id.clone(),
+                episode_id: episode.id.clone(),
+                expected_version: 1,
+                request_key: "episode-add-1".into(),
+                event_ids: vec![first_event.id.clone()],
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(reuse_error, CortexError::Conflict(_)));
+
+        let closed = service
+            .close_episode(EpisodeTerminalRequest {
+                workspace_id: workspace.id.clone(),
+                episode_id: episode.id.clone(),
+                expected_version: 1,
+                request_key: "episode-close-1".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(closed.status, EpisodeStatus::Closed);
+        assert_eq!(closed.version, 2);
+        assert!(closed.ended_at.is_some());
+        assert_eq!(
+            service
+                .close_episode(EpisodeTerminalRequest {
+                    workspace_id: workspace.id.clone(),
+                    episode_id: episode.id.clone(),
+                    expected_version: 1,
+                    request_key: "episode-close-1".into(),
+                })
+                .await
+                .unwrap()
+                .version,
+            2
+        );
+        assert!(matches!(
+            service
+                .add_episode_events(EpisodeEventAssociationRequest {
+                    workspace_id: workspace.id.clone(),
+                    episode_id: episode.id.clone(),
+                    expected_version: 2,
+                    request_key: "episode-add-after-close".into(),
+                    event_ids: vec![first_event.id.clone()],
+                })
+                .await,
+            Err(CortexError::Conflict(_))
+        ));
+
+        let listed = service
+            .list_episodes(EpisodeListRequest {
+                workspace_id: workspace.id.clone(),
+                session_id: Some(session.id),
+                task_id: Some(task.id),
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed, vec![closed]);
+    }
+
+    #[tokio::test]
+    async fn episodes_reject_scope_mismatch_and_concurrent_stale_membership() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let service = Arc::new(resolver_service(storage));
+        let directory = tempdir().unwrap();
+        let workspace = service
+            .register_workspace(directory.path().to_string_lossy(), "episode-concurrency")
+            .await
+            .unwrap();
+        let session = service
+            .start_session(&workspace.id, json!({}))
+            .await
+            .unwrap();
+        let task = service
+            .start_task(
+                &workspace.id,
+                Some(session.id.clone()),
+                "concurrent episode",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let episode = service
+            .start_episode(EpisodeStartRequest {
+                workspace_id: workspace.id.clone(),
+                session_id: session.id.clone(),
+                task_id: Some(task.id.clone()),
+                episode_type: EpisodeType::Implementation,
+                title: None,
+                created_by: EpisodeCreator::NativeHarness,
+            })
+            .await
+            .unwrap();
+
+        let mut scoped = CortexEvent::new(&workspace.id, EventType::TaskUpdated, json!({}));
+        scoped.session_id = Some(session.id.clone());
+        scoped.task_id = Some(task.id.clone());
+        service.record_event(scoped.clone()).await.unwrap();
+        let mut second = CortexEvent::new(&workspace.id, EventType::TaskUpdated, json!({}));
+        second.session_id = Some(session.id.clone());
+        second.task_id = Some(task.id.clone());
+        service.record_event(second.clone()).await.unwrap();
+        let unscoped = CortexEvent::new(&workspace.id, EventType::FileModified, json!({}));
+        service.record_event(unscoped.clone()).await.unwrap();
+
+        assert!(matches!(
+            service
+                .add_episode_events(EpisodeEventAssociationRequest {
+                    workspace_id: workspace.id.clone(),
+                    episode_id: episode.id.clone(),
+                    expected_version: 0,
+                    request_key: "reject-unscoped".into(),
+                    event_ids: vec![unscoped.id],
+                })
+                .await,
+            Err(CortexError::Analysis(_))
+        ));
+
+        let first_request = EpisodeEventAssociationRequest {
+            workspace_id: workspace.id.clone(),
+            episode_id: episode.id.clone(),
+            expected_version: 0,
+            request_key: "concurrent-first".into(),
+            event_ids: vec![scoped.id.clone()],
+        };
+        let second_request = EpisodeEventAssociationRequest {
+            workspace_id: workspace.id.clone(),
+            episode_id: episode.id.clone(),
+            expected_version: 0,
+            request_key: "concurrent-second".into(),
+            event_ids: vec![second.id.clone()],
+        };
+        let (first, second) = tokio::join!(
+            service.add_episode_events(first_request),
+            service.add_episode_events(second_request)
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert!(matches!(
+            first.as_ref().err().or(second.as_ref().err()),
+            Some(CortexError::Conflict(_))
+        ));
+        let members = service
+            .episode_events(&workspace.id, &episode.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].ordinal, 0);
+        assert_eq!(
+            service
+                .get_episode(&workspace.id, &episode.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+
+        let close_race = service
+            .start_episode(EpisodeStartRequest {
+                workspace_id: workspace.id.clone(),
+                session_id: session.id.clone(),
+                task_id: Some(task.id.clone()),
+                episode_type: EpisodeType::Verification,
+                title: None,
+                created_by: EpisodeCreator::NativeHarness,
+            })
+            .await
+            .unwrap();
+        let mut close_race_event =
+            CortexEvent::new(&workspace.id, EventType::TestResult, json!({}));
+        close_race_event.session_id = Some(session.id);
+        close_race_event.task_id = Some(task.id);
+        service
+            .record_event(close_race_event.clone())
+            .await
+            .unwrap();
+        let add = EpisodeEventAssociationRequest {
+            workspace_id: workspace.id.clone(),
+            episode_id: close_race.id.clone(),
+            expected_version: 0,
+            request_key: "race-add".into(),
+            event_ids: vec![close_race_event.id],
+        };
+        let close = EpisodeTerminalRequest {
+            workspace_id: workspace.id.clone(),
+            episode_id: close_race.id.clone(),
+            expected_version: 0,
+            request_key: "race-close".into(),
+        };
+        let (add, close) = tokio::join!(
+            service.add_episode_events(add),
+            service.close_episode(close)
+        );
+        assert_eq!(usize::from(add.is_ok()) + usize::from(close.is_ok()), 1);
+        let raced = service
+            .get_episode(&workspace.id, &close_race.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let raced_members = service
+            .episode_events(&workspace.id, &close_race.id, 10)
+            .await
+            .unwrap();
+        match raced.status {
+            EpisodeStatus::Closed => {
+                assert!(add.is_err());
+                assert!(raced_members.is_empty());
+            }
+            EpisodeStatus::Open => {
+                assert!(close.is_err());
+                assert_eq!(raced_members.len(), 1);
+            }
+            EpisodeStatus::Abandoned | EpisodeStatus::Invalid => unreachable!("race only closes"),
+        }
+    }
+
+    #[tokio::test]
+    async fn episode_torture_cases_reject_ambiguity_without_guessing() {
+        let service = resolver_service(SqliteStorage::in_memory().await.unwrap());
+        let directory = tempdir().unwrap();
+        let first_root = directory.path().join("first");
+        let second_root = directory.path().join("second");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        let first_workspace = service
+            .register_workspace(first_root.to_string_lossy(), "first")
+            .await
+            .unwrap();
+        let second_workspace = service
+            .register_workspace(second_root.to_string_lossy(), "second")
+            .await
+            .unwrap();
+        let session = service
+            .start_session(&first_workspace.id, json!({}))
+            .await
+            .unwrap();
+        let alpha = service
+            .start_task(
+                &first_workspace.id,
+                Some(session.id.clone()),
+                "alpha",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let beta = service
+            .start_task(
+                &first_workspace.id,
+                Some(session.id.clone()),
+                "beta",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let alpha_episode = service
+            .start_episode(EpisodeStartRequest {
+                workspace_id: first_workspace.id.clone(),
+                session_id: session.id.clone(),
+                task_id: Some(alpha.id.clone()),
+                episode_type: EpisodeType::Debugging,
+                title: Some("alpha failure and attempts".into()),
+                created_by: EpisodeCreator::User,
+            })
+            .await
+            .unwrap();
+        let duplicate_candidate = service
+            .start_episode(EpisodeStartRequest {
+                workspace_id: first_workspace.id.clone(),
+                session_id: session.id.clone(),
+                task_id: Some(alpha.id.clone()),
+                episode_type: EpisodeType::Investigation,
+                title: None,
+                created_by: EpisodeCreator::User,
+            })
+            .await
+            .unwrap();
+        let beta_episode = service
+            .start_episode(EpisodeStartRequest {
+                workspace_id: first_workspace.id.clone(),
+                session_id: session.id.clone(),
+                task_id: Some(beta.id.clone()),
+                episode_type: EpisodeType::Debugging,
+                title: Some("unrelated beta failure".into()),
+                created_by: EpisodeCreator::User,
+            })
+            .await
+            .unwrap();
+
+        let mut alpha_events = Vec::new();
+        for event_type in [
+            EventType::CompilerResult,
+            EventType::FileModified,
+            EventType::CompilerResult,
+            EventType::FileModified,
+            EventType::TestResult,
+        ] {
+            let mut event = CortexEvent::new(&first_workspace.id, event_type, json!({}));
+            event.session_id = Some(session.id.clone());
+            event.task_id = Some(alpha.id.clone());
+            alpha_events.push(service.record_event(event).await.unwrap());
+        }
+        let mut beta_failure =
+            CortexEvent::new(&first_workspace.id, EventType::CompilerResult, json!({}));
+        beta_failure.session_id = Some(session.id.clone());
+        beta_failure.task_id = Some(beta.id.clone());
+        service.record_event(beta_failure.clone()).await.unwrap();
+
+        service
+            .add_episode_events(EpisodeEventAssociationRequest {
+                workspace_id: first_workspace.id.clone(),
+                episode_id: alpha_episode.id.clone(),
+                expected_version: 0,
+                request_key: "alpha-sequence".into(),
+                event_ids: alpha_events.iter().map(|event| event.id.clone()).collect(),
+            })
+            .await
+            .unwrap();
+        service
+            .add_episode_events(EpisodeEventAssociationRequest {
+                workspace_id: first_workspace.id.clone(),
+                episode_id: beta_episode.id.clone(),
+                expected_version: 0,
+                request_key: "beta-failure".into(),
+                event_ids: vec![beta_failure.id.clone()],
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service
+                .add_episode_events(EpisodeEventAssociationRequest {
+                    workspace_id: first_workspace.id.clone(),
+                    episode_id: alpha_episode.id.clone(),
+                    expected_version: 1,
+                    request_key: "task-switch".into(),
+                    event_ids: vec![beta_failure.id],
+                })
+                .await,
+            Err(CortexError::Analysis(_))
+        ));
+        assert!(matches!(
+            service
+                .add_episode_events(EpisodeEventAssociationRequest {
+                    workspace_id: first_workspace.id.clone(),
+                    episode_id: duplicate_candidate.id.clone(),
+                    expected_version: 0,
+                    request_key: "duplicate-primary".into(),
+                    event_ids: vec![alpha_events[0].id.clone()],
+                })
+                .await,
+            Err(CortexError::Conflict(_))
+        ));
+
+        let abandoned = service
+            .start_episode(EpisodeStartRequest {
+                workspace_id: first_workspace.id.clone(),
+                session_id: session.id.clone(),
+                task_id: Some(alpha.id.clone()),
+                episode_type: EpisodeType::Investigation,
+                title: None,
+                created_by: EpisodeCreator::User,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .abandon_episode(EpisodeTerminalRequest {
+                    workspace_id: first_workspace.id.clone(),
+                    episode_id: abandoned.id,
+                    expected_version: 0,
+                    request_key: "abandon".into(),
+                })
+                .await
+                .unwrap()
+                .status,
+            EpisodeStatus::Abandoned
+        );
+        let replacement = service
+            .start_episode(EpisodeStartRequest {
+                workspace_id: first_workspace.id.clone(),
+                session_id: session.id.clone(),
+                task_id: Some(alpha.id.clone()),
+                episode_type: EpisodeType::Investigation,
+                title: Some("replacement episode".into()),
+                created_by: EpisodeCreator::User,
+            })
+            .await
+            .unwrap();
+
+        service
+            .close_episode(EpisodeTerminalRequest {
+                workspace_id: first_workspace.id.clone(),
+                episode_id: alpha_episode.id.clone(),
+                expected_version: 1,
+                request_key: "close-alpha".into(),
+            })
+            .await
+            .unwrap();
+        let mut late_verifier =
+            CortexEvent::new(&first_workspace.id, EventType::TestResult, json!({}));
+        late_verifier.session_id = Some(session.id.clone());
+        late_verifier.task_id = Some(alpha.id.clone());
+        service.record_event(late_verifier.clone()).await.unwrap();
+        assert!(matches!(
+            service
+                .add_episode_events(EpisodeEventAssociationRequest {
+                    workspace_id: first_workspace.id.clone(),
+                    episode_id: alpha_episode.id,
+                    expected_version: 2,
+                    request_key: "late-verifier".into(),
+                    event_ids: vec![late_verifier.id],
+                })
+                .await,
+            Err(CortexError::Conflict(_))
+        ));
+
+        let second_session = service
+            .start_session(&second_workspace.id, json!({}))
+            .await
+            .unwrap();
+        let mut foreign_event =
+            CortexEvent::new(&second_workspace.id, EventType::CompilerResult, json!({}));
+        foreign_event.session_id = Some(second_session.id);
+        service.record_event(foreign_event.clone()).await.unwrap();
+        assert!(matches!(
+            service
+                .add_episode_events(EpisodeEventAssociationRequest {
+                    workspace_id: first_workspace.id.clone(),
+                    episode_id: replacement.id.clone(),
+                    expected_version: 0,
+                    request_key: "cross-workspace".into(),
+                    event_ids: vec![foreign_event.id],
+                })
+                .await,
+            Err(CortexError::NotFound(_))
+        ));
+
+        service.end_session(&session.id).await.unwrap();
+        assert_eq!(
+            service
+                .close_episode(EpisodeTerminalRequest {
+                    workspace_id: first_workspace.id.clone(),
+                    episode_id: beta_episode.id,
+                    expected_version: 1,
+                    request_key: "close-after-session".into(),
+                })
+                .await
+                .unwrap()
+                .status,
+            EpisodeStatus::Closed
+        );
+        assert_eq!(
+            service
+                .close_episode(EpisodeTerminalRequest {
+                    workspace_id: first_workspace.id,
+                    episode_id: replacement.id,
+                    expected_version: 0,
+                    request_key: "close-replacement".into(),
+                })
+                .await
+                .unwrap()
+                .status,
+            EpisodeStatus::Closed
         );
     }
 

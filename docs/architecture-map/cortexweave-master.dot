@@ -1,0 +1,52 @@
+digraph CortexWeave {
+  graph [rankdir=LR, splines=ortho, bgcolor="#fbfaf5", pad=0.45, nodesep=0.55, ranksep=1.05, fontname="Arial"];
+  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=16, margin="0.22,0.16", color="#233142", fillcolor="#ffffff", penwidth=1.6];
+  edge [fontname="Arial", fontsize=12, color="#465a69", arrowsize=0.8, penwidth=1.5];
+
+  subgraph cluster_external { label="EXTERNAL ACTORS / INPUTS"; color="#81909a"; style="rounded,dashed";
+    cli [label="CLI user\nClap commands", fillcolor="#edf5ff"]; mcpclient [label="MCP client / coding agent\nJSON-RPC over stdio", fillcolor="#edf5ff"]; fs [label="Registered workspace\nfiles + notify events", fillcolor="#f6f0e6"]; embed [label="OpenAI-compatible\nembedding service\nEXTERNAL", fillcolor="#fff3df"];
+  }
+  subgraph cluster_interface { label="INTERFACE / APPLICATION BOUNDARY"; color="#456b88"; style="rounded";
+    main [label="CLI adapter\nsrc/main.rs\nconfig → facade", fillcolor="#e9f3fb"];
+    mcp [label="MCP adapter\nsrc/adapters/mcp.rs\nprotocol, workspace resolution, tools", fillcolor="#e9f3fb"];
+    facade [label="CortexWeaveService\nsrc/service/cortex.rs\ntransport-neutral application facade", fillcolor="#d8ebf8", penwidth=2.4];
+    watch [label="Workspace watcher [IMPLEMENTED]\nnotify → bounded mpsc → debounce", fillcolor="#e9f3fb"];
+  }
+  subgraph cluster_intelligence { label="SOURCE INTELLIGENCE / INDEXING"; color="#4e775f"; style="rounded";
+    scan [label="Workspace scanner\nignore rules + patterns\nUTF-8/binary/size filters", fillcolor="#eef7ee"];
+    registry [label="Analyzer registry\nLanguageAnalyzer contract\nGeneric fallback", fillcolor="#eef7ee"];
+    treesitter [label="Tree-sitter analyzers\nRust · Python · JS · TS · C# · Go", fillcolor="#eef7ee"];
+    recon [label="Incremental reconciler\nhash + stable keys + segment policy\nper-path lock + semaphore", fillcolor="#d9efd9", penwidth=2.3];
+    batches [label="Capacity-aware batcher\nadaptive segmentation (≤ 8 retries)", fillcolor="#eef7ee"];
+  }
+  subgraph cluster_graph { label="STRUCTURAL INTELLIGENCE"; color="#7a5e90"; style="rounded";
+    graph [label="Graph indexer\nsymbol/fact projection\nrevision + repair generation", fillcolor="#eee5f5"];
+    resolver [label="Deterministic symbol resolver\nresolved edges + durable uncertainty", fillcolor="#eee5f5"];
+    structural [label="Structural service\nfind, relations, impact\ncurrent-state gate", fillcolor="#eee5f5"];
+  }
+  subgraph cluster_retrieval { label="RETRIEVAL / CONTEXT"; color="#99733c"; style="rounded";
+    retrieve [label="Retrieval service\nsemantic + FTS lexical + hybrid\noptional structural expansion", fillcolor="#fff4dc", penwidth=2.1];
+    context [label="Context service\nbounded ranked packet + explanation\ncurrent authority first", fillcolor="#fff4dc", penwidth=2.1];
+    state [label="Session / task / working set\npins · checkpoints · trusted memory · events", fillcolor="#fff8e9"];
+  }
+  subgraph cluster_history { label="VERIFIED EXPERIENCE (v0.5)"; color="#9b4d57"; style="rounded";
+    evidence [label="Evidence + failure normalization\nregistered typed contracts only", fillcolor="#fbecee"];
+    episode [label="Explicit episode lifecycle\nversion + request-key mutation", fillcolor="#fbecee"];
+    experience [label="Deterministic consolidation\npreview → explicit acceptance\nimmutable Experience", fillcolor="#f8dfe3", penwidth=2.1];
+    esearch [label="Experience search + assessment\nsignature / lexical / lifecycle\nhistorical supplement only", fillcolor="#fbecee"];
+  }
+  subgraph cluster_store { label="PERSISTENCE / CROSS-CUTTING"; color="#3d6268"; style="rounded";
+    db [label="SQLite / SQLx [AUTHORITATIVE]\nworkspace · source/chunks/vectors · FTS\ngraph · state · events/episodes/Experience\nFKs, triggers, transactions", shape=cylinder, fillcolor="#dceff0", penwidth=2.6];
+    metrics [label="Runtime metrics + tracing\nprocess-local observations", fillcolor="#f3f7f7"];
+    planned [label="DEFERRED / NOT RUNTIME\nauto episode grouping · background/model consolidation\nGit/diff adapter · global promotion · agent harness", style="rounded,dashed", fillcolor="#fafafa"];
+  }
+  cli -> main [label="commands"]; mcpclient -> mcp [label="newline JSON-RPC"];
+  main -> facade [label="service calls"]; mcp -> facade [label="tool dispatch"]; mcp -> watch [style=dashed,label="serve lifetime"]; fs -> watch [style=dashed,label="notify events"]; watch -> recon [style=dashed,label="coalesced paths"];
+  facade -> scan [label="reindex"]; fs -> scan [label="source files"]; scan -> registry [label="eligible path"]; registry -> treesitter [label="enabled language"]; treesitter -> recon [label="chunks / symbols / relationships"]; registry -> recon [label="generic fallback"];
+  recon -> batches [label="changed text"]; batches -> embed [label="embedding request"]; embed -> batches [label="vectors"]; batches -> recon [label="compatible vectors"];
+  recon -> graph [label="normalized analysis"]; graph -> resolver [label="relationship targets"]; resolver -> graph [label="edges / unresolved"];
+  facade -> retrieve [label="search"]; facade -> context [label="context / resume"]; retrieve -> embed [label="query embedding"]; retrieve -> structural [label="structural candidates"]; context -> retrieve [label="code candidates"]; context -> esearch [label="active failure signature"];
+  facade -> evidence [label="diagnose/normalize"]; facade -> episode [label="start/add/close"]; evidence -> experience [label="typed evidence/signature"]; episode -> experience [label="terminal event sequence"]; facade -> experience [label="preview/accept"]; facade -> esearch [label="search/review/dispute"];
+  graph -> structural [label="durable projection"]; state -> context [label="ranked state sources"];
+  recon -> db [label="atomic document reconciliation", penwidth=2.6]; graph -> db [label="projection/revision"]; retrieve -> db [label="vectors + chunk_fts", dir=both]; structural -> db [label="graph reads", dir=both]; state -> db [label="read/write", dir=both]; evidence -> db [label="append events", dir=both]; episode -> db [label="versioned membership", dir=both]; experience -> db [label="sealed immutable aggregate", dir=both]; esearch -> db [label="Experience FTS/history", dir=both]; facade -> metrics [style=dotted,label="observations"]; metrics -> db [style=dotted,label="persisted counts"];
+}

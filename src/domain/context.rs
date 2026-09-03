@@ -5,6 +5,10 @@ use uuid::Uuid;
 use super::{Session, SourceSegment, StructuralEvidence, Task};
 
 pub const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 6_000;
+pub const MAX_CONTEXT_TOKEN_BUDGET: usize = 65_536;
+pub const MAX_CONTEXT_SCOPE_ITEMS: usize = 64;
+pub const MAX_CONTEXT_SCOPE_VALUE_BYTES: usize = 512;
+pub const MAX_CONTEXT_ITEM_BYTES: usize = 262_144;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -13,6 +17,7 @@ pub enum ContextSourceType {
     Document,
     Memory,
     Event,
+    Experience,
     TaskState,
     SessionState,
     Other(String),
@@ -25,6 +30,7 @@ impl ContextSourceType {
             Self::Document => "document".into(),
             Self::Memory => "memory".into(),
             Self::Event => "event".into(),
+            Self::Experience => "experience".into(),
             Self::TaskState => "task_state".into(),
             Self::SessionState => "session_state".into(),
             Self::Other(value) => format!("other:{value}"),
@@ -37,6 +43,7 @@ impl ContextSourceType {
             "document" => Self::Document,
             "memory" => Self::Memory,
             "event" => Self::Event,
+            "experience" => Self::Experience,
             "task_state" => Self::TaskState,
             "session_state" => Self::SessionState,
             other => Self::Other(other.strip_prefix("other:").unwrap_or(other).to_owned()),
@@ -79,6 +86,9 @@ pub enum ContextSelectionReason {
     CurrentCheckpoint,
     RecentModification,
     Pinned,
+    ExperienceExactFailureSignature,
+    ExperienceCompatibleFailureSignature,
+    ExperienceVerifiedOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,6 +102,8 @@ pub struct ContextRequest {
     pub include_documents: bool,
     pub include_memories: bool,
     pub include_events: bool,
+    #[serde(default)]
+    pub active_failure_signature: Option<super::FailureSignature>,
     pub path_scope: Vec<String>,
     pub language_scope: Vec<String>,
     pub include_explanation: bool,
@@ -196,6 +208,7 @@ impl ContextRequest {
             include_documents: true,
             include_memories: true,
             include_events: true,
+            active_failure_signature: None,
             path_scope: Vec::new(),
             language_scope: Vec::new(),
             include_explanation: false,
@@ -345,6 +358,48 @@ pub struct ContextPacket {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextExplanation {
     pub selected: Vec<ContextSelectionExplanation>,
+    pub experience: ExperienceContextExplanation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperienceContextDegradation {
+    NotRequested,
+    Disabled,
+    SearchUnavailable,
+    NoEligibleResult,
+    BudgetExhausted,
+    Deduplicated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExperienceContextExplanation {
+    pub candidate_count: usize,
+    pub selected_experience_ids: Vec<String>,
+    #[serde(default)]
+    pub selections: Vec<ExperienceContextSelectionExplanation>,
+    #[serde(default)]
+    pub deduplicated_candidate_count: usize,
+    #[serde(default)]
+    pub over_budget_candidate_count: usize,
+    pub degradation: Option<ExperienceContextDegradation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperienceContextAuthority {
+    HistoricalSupplemental,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExperienceContextSelectionExplanation {
+    pub experience_id: String,
+    pub authority: ExperienceContextAuthority,
+    pub lifecycle: super::ExperienceLifecycle,
+    pub outcome: super::ExperienceOutcome,
+    pub verification_status: super::VerificationStatus,
+    pub evidence_strength: super::EvidenceStrength,
+    pub search_scores: super::ExperienceSearchScores,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -527,6 +582,7 @@ mod tests {
             ContextSourceType::Document,
             ContextSourceType::Memory,
             ContextSourceType::Event,
+            ContextSourceType::Experience,
             ContextSourceType::TaskState,
             ContextSourceType::SessionState,
             ContextSourceType::Other("future_source".into()),

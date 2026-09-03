@@ -3,6 +3,9 @@
 Pass a TOML file with the global `--config` option. Omitting it uses the defaults
 in `AppConfig`. `cortexweave.example.toml` is a complete starting point.
 
+For the meaning of historical Experience selection and authority, see
+[Verified Experience Core](verified-experience.md).
+
 ## Server
 
 - `server.mcp_transport`: `stdio` in v0.1. MCP messages use stdout and logs use
@@ -126,12 +129,33 @@ eligible until unpinned, even when their working-set activation has decayed.
 
 ## Context Candidates
 
+Experience settings control bounded historical supplemental context; they do
+not enable automatic Memory creation, tool use, or current-state claims.
+
 - `context.candidate_pool_limit`: positive maximum number of deduplicated
   source-aware candidates retained before later context ranking and token
   selection, capped at `10000`.
 - `context.structural_expansion_limit`: positive maximum number of
   language-neutral container, neighboring-symbol, and direct-child candidates
   expanded from each relevant code chunk, capped at `64`.
+- `context.experience.enabled`: enables bounded historical Experience context
+  only when the request supplies an active normalized failure signature.
+- `context.experience.candidate_limit`: positive maximum number of eligible
+  historical Experiences examined for one packet, capped at `50`.
+- `context.experience.token_budget`: an independent historical-context ceiling,
+  capped at `2048` tokens. It can consume only capacity left after ordinary
+  context selection, so it cannot displace current code, task state, memory,
+  or event context.
+
+Experience is not a generic temporal or working-set source and cannot be
+activated or pinned. Selected Experience explanations identify their authority
+as `historical_supplemental` and retain the lifecycle, outcome, verification,
+evidence-strength, and deterministic search-score facts used for evaluation.
+
+Operational output may report that historical Experience evidence is stale or
+ineligible. These warnings describe the recorded episode scope, lifecycle, and
+graph/source snapshot at creation time; they are not claims about the current
+workspace. Current code, task, and Event evidence remain authoritative.
 - `context.ranking.semantic_weight`, `lexical_weight`, `task_weight`,
   `working_set_weight`, `recency_weight`, `provenance_weight`,
   `freshness_weight`, and `structural_weight`: finite non-negative component

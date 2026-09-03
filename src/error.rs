@@ -36,6 +36,9 @@ pub enum CortexError {
     #[error("ambiguous: {0}")]
     Ambiguous(String),
 
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

@@ -12,7 +12,7 @@ fn version_reports_the_release_identity() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        "cortexweave 0.4.1"
+        "cortexweave 0.5.0"
     );
 }
 
@@ -156,6 +156,70 @@ fn graph_command_exposes_bounded_structural_subcommands() {
     let detail = String::from_utf8(detail.stdout).unwrap();
     for option in ["--allow-stale", "--max-nodes", "--max-edges", "--max-depth"] {
         assert!(detail.contains(option), "missing graph option {option}");
+    }
+}
+
+#[test]
+fn episode_and_experience_commands_expose_explicit_lifecycle_controls() {
+    let episode = Command::new(env!("CARGO_BIN_EXE_cortexweave"))
+        .args(["episode", "--help"])
+        .output()
+        .unwrap();
+    assert!(episode.status.success());
+    let episode = String::from_utf8(episode.stdout).unwrap();
+    for command in ["start", "add-events", "close", "abandon", "show", "list"] {
+        assert!(
+            episode.contains(command),
+            "missing episode command {command}"
+        );
+    }
+
+    let experience = Command::new(env!("CARGO_BIN_EXE_cortexweave"))
+        .args(["experience", "--help"])
+        .output()
+        .unwrap();
+    assert!(experience.status.success());
+    let experience = String::from_utf8(experience.stdout).unwrap();
+    for command in [
+        "preview",
+        "consolidate",
+        "search",
+        "show",
+        "explain",
+        "history",
+        "assess",
+        "propose-dispute",
+    ] {
+        assert!(
+            experience.contains(command),
+            "missing experience command {command}"
+        );
+    }
+
+    let consolidate = Command::new(env!("CARGO_BIN_EXE_cortexweave"))
+        .args(["experience", "consolidate", "--help"])
+        .output()
+        .unwrap();
+    assert!(consolidate.status.success());
+    let consolidate = String::from_utf8(consolidate.stdout).unwrap();
+    for option in ["--expected-fingerprint", "--expected-proposal-hash"] {
+        assert!(
+            consolidate.contains(option),
+            "missing consolidation option {option}"
+        );
+    }
+
+    let assessment = Command::new(env!("CARGO_BIN_EXE_cortexweave"))
+        .args(["experience", "assess", "--help"])
+        .output()
+        .unwrap();
+    assert!(assessment.status.success());
+    let assessment = String::from_utf8(assessment.stdout).unwrap();
+    for option in ["--reviewed-by", "--reason", "--evidence-event-id"] {
+        assert!(
+            assessment.contains(option),
+            "missing assessment option {option}"
+        );
     }
 }
 

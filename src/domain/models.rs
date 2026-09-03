@@ -477,6 +477,7 @@ pub enum EventType {
     ExternalToolFinished,
     CompilerResult,
     TestResult,
+    UserAcceptance,
     ContextHydrationOverride,
     Other(String),
 }

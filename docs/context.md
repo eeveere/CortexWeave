@@ -4,6 +4,9 @@ CortexWeave builds bounded, source-aware context without making core code depend
 on an agent harness or MCP. The application service accepts transport-neutral
 requests; CLI and MCP are thin adapters over the same operations.
 
+For the historical Experience contract, verification scope, and lifecycle, see
+[Verified Experience Core](verified-experience.md).
+
 ```text
 code + documents + memories + events + task/session state
                          |
@@ -41,6 +44,22 @@ effective session; an explicit task also selects only its own task state.
 Trusted durable memories and events remain workspace evidence, including across
 sessions. Imported memory stays outside automatic context until an explicit
 trust review accepts it; see [Memory Integrity](memory-integrity.md).
+
+## Historical Experience
+
+An optional canonical active failure signature may request Experience-aware
+context. The ordinary packet is selected first from current source, task,
+state, and Event evidence. Only then can the service add eligible active
+Experience from a separately bounded historical pool. The item is explicitly
+`historical_supplemental`; its explanation reports lifecycle, outcome,
+verification, strength, search score, and exact or compatible signature reason.
+
+Experience never substitutes for current code or a current compiler/test Event.
+It cannot reclaim ordinary context capacity or displace required task, source,
+or pinned evidence. Its past verification is historical scope, not a claim
+about present code. Explicit search filters remain exact; compatible active
+failure matching may retrieve a verified Experience from a different path or
+symbol within the workspace.
 
 ## Working Set and Time
 

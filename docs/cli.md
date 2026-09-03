@@ -2,6 +2,8 @@
 
 For graph semantics, provenance, analyzer extension guidance, and limitations,
 see [Structural Graph Architecture](graph-architecture.md).
+For Episode and Experience semantics beyond this command reference, see
+[Verified Experience Core](verified-experience.md).
 
 The global configuration option precedes the command:
 
@@ -37,6 +39,18 @@ cortexweave context-unpin <workspace-id> <session-id> <source-id> <source-type> 
 cortexweave checkpoint create <workspace-id> <session-id> <content> [options]
 cortexweave checkpoint latest <workspace-id> [--session-id <id>|--task-id <id>]
 cortexweave memory add <workspace-id> <content> [options]
+cortexweave episode start <workspace-id> --session-id <id> --type <type> [--task-id <id>] [--title <text>]
+cortexweave episode add-events <workspace-id> <episode-id> --expected-version <n> --request-key <key> <event-id>...
+cortexweave episode close|abandon <workspace-id> <episode-id> --expected-version <n> --request-key <key>
+cortexweave episode show <workspace-id> <episode-id>
+cortexweave episode list <workspace-id> [--session-id <id>] [--task-id <id>] [--limit N]
+cortexweave experience preview <workspace-id> --episode-id <id> --expected-version <n>
+cortexweave experience consolidate <workspace-id> --episode-id <id> --expected-version <n> --expected-fingerprint <hash> --expected-proposal-hash <hash>
+cortexweave experience search <workspace-id> [--query <text>] [--failure-signature <json>] [--include-historical] [--limit N]
+cortexweave experience show|explain <workspace-id> <experience-id>
+cortexweave experience history <workspace-id> <experience-id> [--limit N] [--after-created-at <rfc3339> --after-id <id>]
+cortexweave experience assess <workspace-id> <experience-id> --kind <kind> --reviewed-by <identity> --request-key <key> --reason <text> --evidence-event-id <id>...
+cortexweave experience propose-dispute <workspace-id> --failure-signature <json> --recurring-failure-event-id <id>...
 ```
 
 Graph commands return JSON with the graph snapshot, effective limits, nodes,
@@ -77,6 +91,7 @@ documents, memories, events, and task or session state. Its options are:
 --no-events
 --path-scope <path>
 --language-scope <language>
+--active-failure-signature <json>
 --explain
 ```
 
@@ -89,6 +104,41 @@ Add `--explain` to `context` or `resume` to include a diagnostic for every
 selected item: source identity, selection reasons, component scores, token
 estimate, and truncation status. Explanation is not prompt content and does not
 consume the packet token budget.
+
+`--active-failure-signature` accepts the canonical JSON `FailureSignature`
+returned by CortexWeave. It may add bounded historical Experience material only
+after ordinary context has been selected; it neither asserts present code state
+nor replaces current task or Event evidence.
+
+## Episodes and Experiences
+
+This is the transport surface for the verified historical-learning path; it
+does not grant a CLI caller authority to invent evidence, accept a proposal
+implicitly, or treat an old verification as current truth.
+
+Episodes are explicit user-created records over existing session-scoped events.
+Use `episode start`, add at most 100 event IDs with `episode add-events`, then
+explicitly `close` or `abandon` the record. Membership and terminal operations
+require both an expected version and caller-chosen request key, making retries
+and concurrent changes visible rather than silently merged.
+
+`experience preview` is read-only. Only a proposal whose disposition is
+`automatic` can be accepted in v0.5; copy that proposal's exact fingerprint and
+proposal hash into `experience consolidate`. A `review_required` proposal is
+inspectable but remains read-only, and the command has no reviewed-acceptance
+bypass. It never infers acceptance from an episode alone.
+Experience search returns active records by default. `--include-historical` is
+required to inspect disputed, refuted, or superseded records.
+
+`experience assess` appends a caller-declared reviewed assessment with an
+identity, idempotency key, reason, and one to 64 evidence event IDs. Repeating
+the same key and review returns the original immutable row; changing the review
+under that key is a conflict. `experience history` returns at most 50 rows and
+uses its returned cursor with `--after-created-at` and `--after-id` to continue.
+It records the supplied
+review metadata but does not authenticate that identity or impose a policy on an
+external agent. `experience propose-dispute` is read-only and never changes an
+Experience lifecycle.
 
 `resume` returns a `ResumeContext` envelope. It resolves the current interaction
 session and task independently from the checkpoint evidence session, then

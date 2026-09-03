@@ -3,13 +3,18 @@ use std::{
     sync::Arc,
 };
 
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cortexweave::{
     AppConfig, CortexError, CortexWeaveService, Result, WorkspaceGraphStatus,
     adapters::mcp::{McpServer, WorkspaceHint},
     domain::{
-        Checkpoint, ContextRequest, ContextSourceType, MemoryKind, MemoryRecord,
-        ResumeContextRequest, StructuralReadOptions,
+        Checkpoint, ConsolidationAcceptanceRequest, ConsolidationRequest, ContextRequest,
+        ContextSourceType, EpisodeCreator, EpisodeEventAssociationRequest, EpisodeListRequest,
+        EpisodeStartRequest, EpisodeTerminalRequest, EpisodeType, ExperienceAssessmentKind,
+        ExperienceAssessmentReviewRequest, ExperienceDisputeProposalRequest,
+        ExperienceSearchRequest, FailureSignature, MemoryKind, MemoryRecord, ResumeContextRequest,
+        StructuralReadOptions,
     },
     workspace::WorkspaceSelector,
 };
@@ -62,6 +67,14 @@ enum Command {
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
+    },
+    Episode {
+        #[command(subcommand)]
+        command: EpisodeCommand,
+    },
+    Experience {
+        #[command(subcommand)]
+        command: ExperienceCommand,
     },
     Reindex {
         workspace_id: String,
@@ -206,6 +219,11 @@ struct ContextArgs {
     path_scope: Vec<String>,
     #[arg(long = "language-scope")]
     language_scope: Vec<String>,
+    #[arg(
+        long,
+        help = "Canonical FailureSignature JSON for optional historical Experience context"
+    )]
+    active_failure_signature: Option<String>,
     #[arg(long)]
     explain: bool,
 }
@@ -291,6 +309,210 @@ enum MemoryCommand {
     Add(MemoryAddArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum EpisodeCommand {
+    Start(EpisodeStartArgs),
+    AddEvents(EpisodeAddEventsArgs),
+    Close(EpisodeTerminalArgs),
+    Abandon(EpisodeTerminalArgs),
+    Show(EpisodeShowArgs),
+    List(EpisodeListArgs),
+}
+
+#[derive(Debug, Args)]
+struct EpisodeStartArgs {
+    workspace_id: String,
+    #[arg(long)]
+    session_id: String,
+    #[arg(long)]
+    task_id: Option<String>,
+    #[arg(long = "type", value_enum)]
+    episode_type: EpisodeTypeArg,
+    #[arg(long)]
+    title: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct EpisodeAddEventsArgs {
+    workspace_id: String,
+    episode_id: String,
+    #[arg(long)]
+    expected_version: u64,
+    #[arg(long)]
+    request_key: String,
+    #[arg(required = true, num_args = 1..=100)]
+    event_ids: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct EpisodeTerminalArgs {
+    workspace_id: String,
+    episode_id: String,
+    #[arg(long)]
+    expected_version: u64,
+    #[arg(long)]
+    request_key: String,
+}
+
+#[derive(Debug, Args)]
+struct EpisodeShowArgs {
+    workspace_id: String,
+    episode_id: String,
+}
+
+#[derive(Debug, Args)]
+struct EpisodeListArgs {
+    workspace_id: String,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long)]
+    task_id: Option<String>,
+    #[arg(long, default_value_t = 100, value_parser = parse_cli_episode_limit)]
+    limit: usize,
+}
+
+#[derive(Debug, Subcommand)]
+enum ExperienceCommand {
+    Preview(ExperienceEpisodeArgs),
+    Consolidate(ExperienceConsolidateArgs),
+    Search(ExperienceSearchArgs),
+    Show(ExperienceShowArgs),
+    Explain(ExperienceShowArgs),
+    History(ExperienceHistoryArgs),
+    Assess(ExperienceAssessArgs),
+    ProposeDispute(ExperienceProposeDisputeArgs),
+}
+
+#[derive(Debug, Args)]
+struct ExperienceEpisodeArgs {
+    workspace_id: String,
+    #[arg(long)]
+    episode_id: String,
+    #[arg(long)]
+    expected_version: u64,
+}
+
+#[derive(Debug, Args)]
+struct ExperienceConsolidateArgs {
+    #[command(flatten)]
+    episode: ExperienceEpisodeArgs,
+    #[arg(long)]
+    expected_fingerprint: String,
+    #[arg(long)]
+    expected_proposal_hash: String,
+}
+
+#[derive(Debug, Args)]
+struct ExperienceSearchArgs {
+    workspace_id: String,
+    #[arg(long)]
+    query: Option<String>,
+    #[arg(
+        long,
+        help = "Canonical FailureSignature JSON returned by a prior API response"
+    )]
+    failure_signature: Option<String>,
+    #[arg(long)]
+    include_historical: bool,
+    #[arg(long, default_value_t = 20, value_parser = parse_cli_experience_limit)]
+    limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct ExperienceShowArgs {
+    workspace_id: String,
+    experience_id: String,
+}
+
+#[derive(Debug, Args)]
+struct ExperienceHistoryArgs {
+    workspace_id: String,
+    experience_id: String,
+    #[arg(long, default_value_t = cortexweave::domain::DEFAULT_EXPERIENCE_ASSESSMENT_PAGE_LIMIT)]
+    limit: usize,
+    #[arg(long)]
+    after_created_at: Option<String>,
+    #[arg(long)]
+    after_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ExperienceAssessArgs {
+    workspace_id: String,
+    experience_id: String,
+    #[arg(long, value_enum)]
+    kind: ExperienceAssessmentKindArg,
+    #[arg(long)]
+    reviewed_by: String,
+    #[arg(long)]
+    request_key: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long)]
+    replacement_experience_id: Option<String>,
+    #[arg(long = "evidence-event-id", required = true, num_args = 1..=64)]
+    evidence_event_ids: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct ExperienceProposeDisputeArgs {
+    workspace_id: String,
+    #[arg(long)]
+    failure_signature: String,
+    #[arg(long = "recurring-failure-event-id", required = true, num_args = 1..=64)]
+    recurring_failure_event_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EpisodeTypeArg {
+    Implementation,
+    Debugging,
+    Verification,
+    Investigation,
+    Refactor,
+    Configuration,
+    DependencyChange,
+    ArchitectureDecision,
+    Documentation,
+    Other,
+}
+
+impl From<EpisodeTypeArg> for EpisodeType {
+    fn from(value: EpisodeTypeArg) -> Self {
+        match value {
+            EpisodeTypeArg::Implementation => Self::Implementation,
+            EpisodeTypeArg::Debugging => Self::Debugging,
+            EpisodeTypeArg::Verification => Self::Verification,
+            EpisodeTypeArg::Investigation => Self::Investigation,
+            EpisodeTypeArg::Refactor => Self::Refactor,
+            EpisodeTypeArg::Configuration => Self::Configuration,
+            EpisodeTypeArg::DependencyChange => Self::DependencyChange,
+            EpisodeTypeArg::ArchitectureDecision => Self::ArchitectureDecision,
+            EpisodeTypeArg::Documentation => Self::Documentation,
+            EpisodeTypeArg::Other => Self::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ExperienceAssessmentKindArg {
+    Disputed,
+    Refuted,
+    Superseded,
+    Confirmed,
+}
+
+impl From<ExperienceAssessmentKindArg> for ExperienceAssessmentKind {
+    fn from(value: ExperienceAssessmentKindArg) -> Self {
+        match value {
+            ExperienceAssessmentKindArg::Disputed => Self::Disputed,
+            ExperienceAssessmentKindArg::Refuted => Self::Refuted,
+            ExperienceAssessmentKindArg::Superseded => Self::Superseded,
+            ExperienceAssessmentKindArg::Confirmed => Self::Confirmed,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct MemoryAddArgs {
     workspace_id: String,
@@ -340,6 +562,8 @@ struct DoctorReport {
     fts: Check,
     embedding: Check,
     embedding_capacity: Check,
+    experience_persistence: Check,
+    workspace_inventory: Check,
     workspace_resolution: Check,
     registered_analyzers: Vec<String>,
     grammar_initialization: Check,
@@ -397,6 +621,9 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
                 && report.migrations.ok
                 && report.fts.ok
                 && report.embedding.ok
+                && report.embedding_capacity.ok
+                && report.experience_persistence.ok
+                && report.workspace_inventory.ok
                 && report.workspace_resolution.ok
                 && report.grammar_initialization.ok
                 && report.watcher.ok
@@ -646,6 +873,8 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
             request.include_events = !args.no_events;
             request.path_scope = args.path_scope;
             request.language_scope = args.language_scope;
+            request.active_failure_signature =
+                parse_cli_failure_signature(args.active_failure_signature.as_deref())?;
             request.include_explanation = args.explain;
             print_json(service.semantic_context(request).await?)?;
         }
@@ -746,12 +975,254 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
                 print_json(service.record_memory(memory).await?)?;
             }
         },
+        Command::Episode { command } => match command {
+            EpisodeCommand::Start(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                print_json(
+                    service
+                        .start_episode(EpisodeStartRequest {
+                            workspace_id,
+                            session_id: args.session_id,
+                            task_id: args.task_id,
+                            episode_type: args.episode_type.into(),
+                            title: args.title,
+                            created_by: EpisodeCreator::User,
+                        })
+                        .await?,
+                )?;
+            }
+            EpisodeCommand::AddEvents(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                print_json(
+                    service
+                        .add_episode_events(EpisodeEventAssociationRequest {
+                            workspace_id,
+                            episode_id: args.episode_id,
+                            expected_version: args.expected_version,
+                            request_key: args.request_key,
+                            event_ids: args.event_ids,
+                        })
+                        .await?,
+                )?;
+            }
+            EpisodeCommand::Close(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                print_json(
+                    service
+                        .close_episode(EpisodeTerminalRequest {
+                            workspace_id,
+                            episode_id: args.episode_id,
+                            expected_version: args.expected_version,
+                            request_key: args.request_key,
+                        })
+                        .await?,
+                )?;
+            }
+            EpisodeCommand::Abandon(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                print_json(
+                    service
+                        .abandon_episode(EpisodeTerminalRequest {
+                            workspace_id,
+                            episode_id: args.episode_id,
+                            expected_version: args.expected_version,
+                            request_key: args.request_key,
+                        })
+                        .await?,
+                )?;
+            }
+            EpisodeCommand::Show(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                print_json(service.get_episode(&workspace_id, &args.episode_id).await?)?;
+            }
+            EpisodeCommand::List(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                print_json(
+                    service
+                        .list_episodes(EpisodeListRequest {
+                            workspace_id,
+                            session_id: args.session_id,
+                            task_id: args.task_id,
+                            limit: args.limit,
+                        })
+                        .await?,
+                )?;
+            }
+        },
+        Command::Experience { command } => match command {
+            ExperienceCommand::Preview(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                print_json(
+                    service
+                        .preview_experience(&ConsolidationRequest {
+                            workspace_id,
+                            episode_id: args.episode_id,
+                            expected_episode_version: args.expected_version,
+                        })
+                        .await?,
+                )?;
+            }
+            ExperienceCommand::Consolidate(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.episode.workspace_id).await?;
+                print_json(
+                    service
+                        .accept_experience(&ConsolidationAcceptanceRequest {
+                            request: ConsolidationRequest {
+                                workspace_id,
+                                episode_id: args.episode.episode_id,
+                                expected_episode_version: args.episode.expected_version,
+                            },
+                            expected_fingerprint: args.expected_fingerprint,
+                            expected_proposal_hash: args.expected_proposal_hash,
+                        })
+                        .await?,
+                )?;
+            }
+            ExperienceCommand::Search(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                let signature = parse_cli_failure_signature(args.failure_signature.as_deref())?;
+                print_json(
+                    service
+                        .search_experiences(&ExperienceSearchRequest {
+                            workspace_id,
+                            query: args.query,
+                            exact_failure_signature: signature,
+                            compatible_components: Default::default(),
+                            path: None,
+                            graph_stable_key: None,
+                            outcomes: Vec::new(),
+                            strengths: Vec::new(),
+                            lifecycles: Vec::new(),
+                            include_historical: args.include_historical,
+                            created_after: None,
+                            created_before: None,
+                            limit: args.limit,
+                        })
+                        .await?,
+                )?;
+            }
+            ExperienceCommand::Show(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                print_json(
+                    service
+                        .get_experience(&workspace_id, &args.experience_id)
+                        .await?,
+                )?;
+            }
+            ExperienceCommand::Explain(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                print_json(
+                    service
+                        .experience_get(&workspace_id, &args.experience_id)
+                        .await?,
+                )?;
+            }
+            ExperienceCommand::History(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                let after = cli_assessment_cursor(
+                    args.after_created_at.as_deref(),
+                    args.after_id.as_deref(),
+                )?;
+                print_json(
+                    service
+                        .experience_assessment_history(
+                            &workspace_id,
+                            &args.experience_id,
+                            after.as_ref(),
+                            args.limit,
+                        )
+                        .await?,
+                )?;
+            }
+            ExperienceCommand::Assess(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                print_json(
+                    service
+                        .review_experience_assessment(ExperienceAssessmentReviewRequest {
+                            workspace_id,
+                            experience_id: args.experience_id,
+                            kind: args.kind.into(),
+                            reviewed_by: args.reviewed_by,
+                            request_key: args.request_key,
+                            reason: args.reason,
+                            replacement_experience_id: args.replacement_experience_id,
+                            evidence_event_ids: args.evidence_event_ids,
+                        })
+                        .await?,
+                )?;
+            }
+            ExperienceCommand::ProposeDispute(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                print_json(
+                    service
+                        .propose_experience_disputes(&ExperienceDisputeProposalRequest {
+                            workspace_id,
+                            failure_signature: parse_required_cli_failure_signature(
+                                &args.failure_signature,
+                            )?,
+                            recurring_failure_event_ids: args.recurring_failure_event_ids,
+                        })
+                        .await?,
+                )?;
+            }
+        },
         Command::Reindex { workspace_id } => {
             let workspace_id = cli_workspace_id(&service, &workspace_id).await?;
             print_json(service.workspace_reindex(&workspace_id).await?)?
         }
     }
     Ok(())
+}
+
+fn cli_assessment_cursor(
+    created_at: Option<&str>,
+    id: Option<&str>,
+) -> Result<Option<cortexweave::domain::ExperienceAssessmentCursor>> {
+    match (created_at, id) {
+        (None, None) => Ok(None),
+        (Some(created_at), Some(id)) if !id.trim().is_empty() => {
+            let created_at = DateTime::parse_from_rfc3339(created_at)
+                .map_err(|error| {
+                    CortexError::Analysis(format!("invalid --after-created-at: {error}"))
+                })?
+                .with_timezone(&Utc);
+            Ok(Some(cortexweave::domain::ExperienceAssessmentCursor {
+                created_at,
+                id: id.to_owned(),
+            }))
+        }
+        _ => Err(CortexError::Analysis(
+            "--after-created-at and --after-id must be supplied together".into(),
+        )),
+    }
+}
+
+fn parse_cli_failure_signature(value: Option<&str>) -> Result<Option<FailureSignature>> {
+    value.map(parse_required_cli_failure_signature).transpose()
+}
+
+fn parse_required_cli_failure_signature(value: &str) -> Result<FailureSignature> {
+    serde_json::from_str(value)
+        .map_err(|error| CortexError::Analysis(format!("failure_signature must be JSON: {error}")))
+}
+
+fn parse_cli_episode_limit(value: &str) -> std::result::Result<usize, String> {
+    let value = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be a non-negative integer".to_owned())?;
+    (value <= 100)
+        .then_some(value)
+        .ok_or_else(|| "limit must not exceed 100".to_owned())
+}
+
+fn parse_cli_experience_limit(value: &str) -> std::result::Result<usize, String> {
+    let value = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer".to_owned())?;
+    (1..=50)
+        .contains(&value)
+        .then_some(value)
+        .ok_or_else(|| "limit must be between 1 and 50".to_owned())
 }
 
 async fn cli_workspace_id(service: &CortexWeaveService, selector: &str) -> Result<String> {
@@ -856,10 +1327,16 @@ async fn doctor(service: &CortexWeaveService) -> DoctorReport {
             service.embeddings().token_counter_accuracy(),
         ),
     };
-    let workspaces: Vec<WorkspaceCheck> = service
-        .list_workspaces()
-        .await
-        .map(|workspaces| {
+    let experience_persistence = check(
+        service.storage().experience_health_check().await,
+        "episode, Experience, assessment, and Experience FTS persistence are healthy",
+    );
+    let (workspace_inventory, workspaces) = match service.list_workspaces().await {
+        Ok(workspaces) => (
+            Check {
+                ok: true,
+                detail: format!("loaded {} registered workspaces", workspaces.len()),
+            },
             workspaces
                 .into_iter()
                 .map(|workspace| {
@@ -873,54 +1350,69 @@ async fn doctor(service: &CortexWeaveService) -> DoctorReport {
                         root_is_directory,
                     }
                 })
-                .collect()
-        })
-        .unwrap_or_default();
+                .collect::<Vec<_>>(),
+        ),
+        Err(error) => (
+            Check {
+                ok: false,
+                detail: format!("workspace inventory is unavailable: {error}"),
+            },
+            Vec::new(),
+        ),
+    };
     let configured_workspace_hint = std::env::var_os("CORTEXWEAVE_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty());
-    let workspace_resolution = match configured_workspace_hint {
-        Some(root) => match service
-            .resolve_workspace(
-                WorkspaceSelector::Default,
-                Some(WorkspaceSelector::RootPath(root.clone())),
-            )
-            .await
-        {
-            Ok(workspace) => Check {
-                ok: true,
-                detail: format!(
-                    "configured root {:?} resolves to workspace {} ({})",
-                    root.display().to_string(),
-                    workspace.name,
-                    workspace.id
-                ),
+    let workspace_resolution = if !workspace_inventory.ok {
+        Check {
+            ok: false,
+            detail: "workspace resolution was not evaluated because inventory failed".into(),
+        }
+    } else {
+        match configured_workspace_hint {
+            Some(root) => match service
+                .resolve_workspace(
+                    WorkspaceSelector::Default,
+                    Some(WorkspaceSelector::RootPath(root.clone())),
+                )
+                .await
+            {
+                Ok(workspace) => Check {
+                    ok: true,
+                    detail: format!(
+                        "configured root {:?} resolves to workspace {} ({})",
+                        root.display().to_string(),
+                        workspace.name,
+                        workspace.id
+                    ),
+                },
+                Err(error) => Check {
+                    ok: false,
+                    detail: format!(
+                        "configured root {:?} does not resolve: {error}",
+                        root.display().to_string()
+                    ),
+                },
             },
-            Err(error) => Check {
-                ok: false,
-                detail: format!(
-                    "configured root {:?} does not resolve: {error}",
-                    root.display().to_string()
-                ),
+            None => match workspaces.as_slice() {
+                [] => Check {
+                    ok: true,
+                    detail: "no default root is configured and no workspaces are registered".into(),
+                },
+                [workspace] => Check {
+                    ok: true,
+                    detail: format!(
+                        "no default root is configured; singleton fallback selects workspace {}",
+                        workspace.id
+                    ),
+                },
+                _ => Check {
+                    ok: true,
+                    detail: "no default root is configured; MCP calls need an explicit selector"
+                        .into(),
+                },
             },
-        },
-        None => match workspaces.as_slice() {
-            [] => Check {
-                ok: true,
-                detail: "no default root is configured and no workspaces are registered".into(),
-            },
-            [workspace] => Check {
-                ok: true,
-                detail: format!(
-                    "no default root is configured; singleton fallback selects workspace {}",
-                    workspace.id
-                ),
-            },
-            _ => Check {
-                ok: true,
-                detail: "no default root is configured; MCP calls need an explicit selector".into(),
-            },
-        },
+        }
     };
     let registered_analyzers = service.analyzers().registered_languages();
     let grammar_initialization = match registered_analyzers.iter().try_for_each(|language| {
@@ -941,10 +1433,15 @@ async fn doctor(service: &CortexWeaveService) -> DoctorReport {
         },
     };
     let watcher = Check {
-        ok: workspaces
-            .iter()
-            .all(|workspace| workspace.root_is_directory),
-        detail: "all registered workspace roots are available for watcher startup".into(),
+        ok: workspace_inventory.ok
+            && workspaces
+                .iter()
+                .all(|workspace| workspace.root_is_directory),
+        detail: if workspace_inventory.ok {
+            "all registered workspace roots are available for watcher startup".into()
+        } else {
+            "watcher health was not evaluated because workspace inventory failed".into()
+        },
     };
     let mut graph_workspaces = Vec::with_capacity(workspaces.len());
     for workspace in &workspaces {
@@ -962,14 +1459,17 @@ async fn doctor(service: &CortexWeaveService) -> DoctorReport {
         }
     }
     let graph = Check {
-        ok: graph_workspaces.iter().all(|workspace| {
-            workspace.error.is_none()
-                && workspace
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| status.is_current)
-        }),
-        detail: if graph_workspaces.is_empty() {
+        ok: workspace_inventory.ok
+            && graph_workspaces.iter().all(|workspace| {
+                workspace.error.is_none()
+                    && workspace
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.is_current)
+            }),
+        detail: if !workspace_inventory.ok {
+            "graph health was not evaluated because workspace inventory failed".into()
+        } else if graph_workspaces.is_empty() {
             "no workspaces are registered".into()
         } else {
             let current = graph_workspaces
@@ -997,6 +1497,8 @@ async fn doctor(service: &CortexWeaveService) -> DoctorReport {
         fts,
         embedding,
         embedding_capacity,
+        experience_persistence,
+        workspace_inventory,
         workspace_resolution,
         registered_analyzers,
         grammar_initialization,

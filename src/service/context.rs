@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
 };
 
@@ -14,18 +14,31 @@ use crate::{
         Checkpoint, ContextCandidate, ContextCandidatePool, ContextExplanation, ContextFreshness,
         ContextItem, ContextPacket, ContextPin, ContextRequest, ContextScores,
         ContextSelectionExplanation, ContextSelectionReason, ContextSourceType, CortexEvent,
-        EventType, GraphEdgeType, MemoryKind, RecentChange, ResumeContext, ResumeContextRequest,
+        EventType, EvidenceStrength, ExperienceContextAuthority, ExperienceContextDegradation,
+        ExperienceContextExplanation, ExperienceContextSelectionExplanation, ExperienceExplanation,
+        ExperienceLifecycle, ExperienceOutcome, ExperienceSearchHit, ExperienceSearchRequest,
+        GraphEdgeType, MemoryKind, RecentChange, ResumeContext, ResumeContextRequest,
         ResumeSessionSelection, ResumeTaskSelection, SourceSegment, StoredChunk, Task,
-        TemporalBounds, TemporalContextItem, TemporalQuery, TemporalSessionScope, WorkingSetEntry,
-        WorkingSetSnapshot,
+        TemporalBounds, TemporalContextItem, TemporalQuery, TemporalSessionScope,
+        VerificationStatus, WorkingSetEntry, WorkingSetSnapshot,
     },
     embedding::{ConservativeByteCounter, TokenCounter},
     retrieval::{RetrievalResult, RetrievalService},
+    service::ExperienceSearchService,
     storage::{SqliteStorage, StructuralRelation, TemporalCandidate},
 };
 
 trait Clock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
+}
+
+const MAX_CONTEXT_EXPERIENCE_RENDERED_BYTES: usize = 2_048;
+
+struct ExperienceContextCandidate {
+    item: ContextCandidate,
+    member_event_ids: BTreeSet<String>,
+    rank: (u8, u8, u8, u8, u32),
+    explanation: ExperienceContextSelectionExplanation,
 }
 
 struct SystemClock;
@@ -557,7 +570,11 @@ impl ContextService {
         })
     }
 
-    pub async fn assemble_context_packet(&self, request: ContextRequest) -> Result<ContextPacket> {
+    pub async fn assemble_context_packet(
+        &self,
+        mut request: ContextRequest,
+    ) -> Result<ContextPacket> {
+        normalize_context_request(&mut request)?;
         if request.token_budget == 0 {
             self.validate_candidate_scope(&request).await?;
             let mut packet = ContextPacket {
@@ -571,21 +588,252 @@ impl ContextService {
                 generated_at: self.clock.now(),
                 explanation: None,
             };
-            attach_explanation(&mut packet, request.include_explanation);
+            let experience = if request.active_failure_signature.is_some() {
+                ExperienceContextExplanation {
+                    candidate_count: 0,
+                    selected_experience_ids: Vec::new(),
+                    selections: Vec::new(),
+                    deduplicated_candidate_count: 0,
+                    over_budget_candidate_count: 0,
+                    degradation: Some(ExperienceContextDegradation::BudgetExhausted),
+                }
+            } else {
+                experience_not_requested()
+            };
+            attach_explanation(&mut packet, request.include_explanation, experience);
             return Ok(packet);
         }
 
         let token_budget = request.token_budget;
         let include_explanation = request.include_explanation;
-        let pool = self.build_candidate_pool(request).await?;
+        let pool = self.build_candidate_pool(request.clone()).await?;
         let mut packet = build_context_packet(
             pool,
             token_budget,
             &self.context.budget,
             self.token_counter.as_ref(),
         );
-        attach_explanation(&mut packet, include_explanation);
+        let experience = self.append_experience_context(&request, &mut packet).await;
+        attach_explanation(&mut packet, include_explanation, experience);
         Ok(packet)
+    }
+
+    async fn append_experience_context(
+        &self,
+        request: &ContextRequest,
+        packet: &mut ContextPacket,
+    ) -> ExperienceContextExplanation {
+        let Some(signature) = request.active_failure_signature.as_ref() else {
+            return experience_not_requested();
+        };
+        if !self.context.experience.enabled {
+            return ExperienceContextExplanation {
+                candidate_count: 0,
+                selected_experience_ids: Vec::new(),
+                selections: Vec::new(),
+                deduplicated_candidate_count: 0,
+                over_budget_candidate_count: 0,
+                degradation: Some(ExperienceContextDegradation::Disabled),
+            };
+        }
+        let search = ExperienceSearchService::new(Arc::clone(&self.storage));
+        let search_request = ExperienceSearchRequest {
+            workspace_id: request.workspace_id.clone(),
+            query: request.query.clone(),
+            exact_failure_signature: Some(signature.clone()),
+            compatible_components: BTreeMap::new(),
+            // Path and graph-key selectors are hard search filters. The active
+            // signature already carries them in its exact identity; applying
+            // them again here would suppress component-compatible history from
+            // another current location.
+            path: None,
+            graph_stable_key: None,
+            outcomes: vec![
+                ExperienceOutcome::Success,
+                ExperienceOutcome::PartialSuccess,
+                ExperienceOutcome::Failure,
+            ],
+            strengths: vec![EvidenceStrength::Strong, EvidenceStrength::Moderate],
+            lifecycles: vec![ExperienceLifecycle::Active],
+            include_historical: false,
+            created_after: None,
+            created_before: None,
+            // Retrieve the bounded global candidate set before applying the
+            // context-specific authority order; a config cap must not turn
+            // recency into an accidental historical authority rule.
+            limit: crate::domain::MAX_EXPERIENCE_SEARCH_LIMIT,
+        };
+        let hits = match search.search(&search_request).await {
+            Ok(hits) => hits,
+            Err(_) => {
+                return ExperienceContextExplanation {
+                    candidate_count: 0,
+                    selected_experience_ids: Vec::new(),
+                    selections: Vec::new(),
+                    deduplicated_candidate_count: 0,
+                    over_budget_candidate_count: 0,
+                    degradation: Some(ExperienceContextDegradation::SearchUnavailable),
+                };
+            }
+        };
+        let mut candidates = Vec::new();
+        for hit in hits {
+            if !matches!(
+                hit.experience.verification.status,
+                VerificationStatus::VerifiedPassed | VerificationStatus::VerifiedFailed
+            ) {
+                continue;
+            }
+            let explanation = match search.get(&request.workspace_id, &hit.experience.id).await {
+                Ok(Some(explanation)) => explanation,
+                Ok(None) => continue,
+                Err(_) => {
+                    return ExperienceContextExplanation {
+                        candidate_count: 0,
+                        selected_experience_ids: Vec::new(),
+                        selections: Vec::new(),
+                        deduplicated_candidate_count: 0,
+                        over_budget_candidate_count: 0,
+                        degradation: Some(ExperienceContextDegradation::SearchUnavailable),
+                    };
+                }
+            };
+            if !explanation.normal_context.eligible {
+                continue;
+            }
+            let exact = hit.explanation.scores.exact_signature > 0;
+            let compatible = !hit.explanation.matched_components.is_empty();
+            let mut reasons = Vec::new();
+            if exact {
+                reasons.push(ContextSelectionReason::ExperienceExactFailureSignature);
+            } else if compatible {
+                reasons.push(ContextSelectionReason::ExperienceCompatibleFailureSignature);
+            }
+            reasons.push(ContextSelectionReason::ExperienceVerifiedOutcome);
+            let rank = experience_rank(&hit);
+            candidates.push(ExperienceContextCandidate {
+                item: ContextCandidate {
+                    source_id: hit.experience.id.clone(),
+                    source_type: ContextSourceType::Experience,
+                    content: render_experience_context(&hit.experience.summary),
+                    path: hit
+                        .experience
+                        .failure_signature
+                        .as_ref()
+                        .and_then(|value| value.scope.path.clone()),
+                    symbol: hit
+                        .experience
+                        .failure_signature
+                        .as_ref()
+                        .and_then(|value| value.scope.target.clone()),
+                    language: hit
+                        .experience
+                        .failure_signature
+                        .as_ref()
+                        .and_then(|value| value.scope.language.clone()),
+                    source_segments: Vec::new(),
+                    freshness: ContextFreshness::Historical,
+                    scores: ContextScores {
+                        lexical: hit.explanation.lexical_match.then_some(1.0),
+                        provenance: 0.25,
+                        freshness: 0.25,
+                        final_score: 0.25,
+                        ..ContextScores::default()
+                    },
+                    reasons,
+                    structural_evidence: Vec::new(),
+                },
+                member_event_ids: experience_member_event_ids(&explanation),
+                rank,
+                explanation: ExperienceContextSelectionExplanation {
+                    experience_id: hit.experience.id,
+                    authority: ExperienceContextAuthority::HistoricalSupplemental,
+                    lifecycle: hit.lifecycle,
+                    outcome: hit.experience.outcome,
+                    verification_status: hit.experience.verification.status,
+                    evidence_strength: hit.experience.evidence_strength.strength,
+                    search_scores: hit.explanation.scores,
+                },
+            });
+        }
+        let candidate_count = candidates.len();
+        if candidates.is_empty() {
+            return ExperienceContextExplanation {
+                candidate_count,
+                selected_experience_ids: Vec::new(),
+                selections: Vec::new(),
+                deduplicated_candidate_count: 0,
+                over_budget_candidate_count: 0,
+                degradation: Some(ExperienceContextDegradation::NoEligibleResult),
+            };
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .rank
+                .cmp(&left.rank)
+                .then_with(|| left.item.source_id.cmp(&right.item.source_id))
+        });
+        let mut selected_experience_ids = Vec::new();
+        let mut selected_experience_keys = HashSet::new();
+        let mut consumed_event_ids: BTreeSet<_> = packet
+            .items
+            .iter()
+            .filter(|item| item.source_type == ContextSourceType::Event)
+            .map(|item| item.source_id.clone())
+            .collect();
+        let mut remaining = packet
+            .token_budget
+            .saturating_sub(packet.estimated_tokens)
+            .min(self.context.experience.token_budget);
+        let mut deduplicated = false;
+        let mut deduplicated_candidate_count = 0;
+        let mut over_budget_candidate_count = 0;
+        let mut selections = Vec::new();
+        for candidate in candidates {
+            if selected_experience_keys.contains(&candidate.item.source_id)
+                || candidate
+                    .member_event_ids
+                    .iter()
+                    .any(|event_id| consumed_event_ids.contains(event_id))
+            {
+                deduplicated = true;
+                deduplicated_candidate_count += 1;
+                continue;
+            }
+            let Some(item) = context_item_for_budget(
+                &candidate.item,
+                remaining,
+                false,
+                self.token_counter.as_ref(),
+            ) else {
+                over_budget_candidate_count += 1;
+                continue;
+            };
+            remaining = remaining.saturating_sub(item.estimated_tokens);
+            packet.estimated_tokens += item.estimated_tokens;
+            selected_experience_keys.insert(item.source_id.clone());
+            selected_experience_ids.push(item.source_id.clone());
+            consumed_event_ids.extend(candidate.member_event_ids);
+            selections.push(candidate.explanation);
+            packet.items.push(item);
+        }
+        let degradation = if selected_experience_ids.is_empty() {
+            Some(if deduplicated {
+                ExperienceContextDegradation::Deduplicated
+            } else {
+                ExperienceContextDegradation::BudgetExhausted
+            })
+        } else {
+            None
+        };
+        ExperienceContextExplanation {
+            candidate_count,
+            selected_experience_ids,
+            selections,
+            deduplicated_candidate_count,
+            over_budget_candidate_count,
+            degradation,
+        }
     }
 
     pub async fn resume_context(&self, request: ResumeContextRequest) -> Result<ResumeContext> {
@@ -593,6 +841,12 @@ impl ContextService {
         const MAX_RESUME_EVENTS: usize = 128;
         const MAX_RESUME_PATHS: usize = 50;
 
+        if request.token_budget > crate::domain::MAX_CONTEXT_TOKEN_BUDGET {
+            return Err(CortexError::Analysis(format!(
+                "resume token budget must be at most {}",
+                crate::domain::MAX_CONTEXT_TOKEN_BUDGET
+            )));
+        }
         self.validate_workspace(&request.workspace_id).await?;
         let now = self.clock.now();
         let explicit_task = match request.task_id.as_deref() {
@@ -1018,7 +1272,11 @@ impl ContextService {
             &self.context.budget,
             self.token_counter.as_ref(),
         );
-        attach_explanation(&mut packet, request.include_explanation);
+        attach_explanation(
+            &mut packet,
+            request.include_explanation,
+            experience_not_requested(),
+        );
         Ok(ResumeContext {
             workspace_id: request.workspace_id,
             selected_session,
@@ -1181,6 +1439,7 @@ impl ContextService {
                 | ContextSourceType::TaskState => ContextFreshness::Current,
                 ContextSourceType::Memory
                 | ContextSourceType::Event
+                | ContextSourceType::Experience
                 | ContextSourceType::SessionState
                 | ContextSourceType::Other(_) => ContextFreshness::Historical,
             }
@@ -1550,7 +1809,92 @@ fn build_context_packet(
     }
 }
 
-fn attach_explanation(packet: &mut ContextPacket, include_explanation: bool) {
+fn experience_not_requested() -> ExperienceContextExplanation {
+    ExperienceContextExplanation {
+        candidate_count: 0,
+        selected_experience_ids: Vec::new(),
+        selections: Vec::new(),
+        deduplicated_candidate_count: 0,
+        over_budget_candidate_count: 0,
+        degradation: Some(ExperienceContextDegradation::NotRequested),
+    }
+}
+
+fn experience_rank(hit: &ExperienceSearchHit) -> (u8, u8, u8, u8, u32) {
+    let identity = if hit.explanation.scores.exact_signature > 0 {
+        2
+    } else if !hit.explanation.matched_components.is_empty() {
+        1
+    } else {
+        0
+    };
+    let verification = match hit.experience.verification.status {
+        VerificationStatus::VerifiedPassed => 2,
+        VerificationStatus::VerifiedFailed => 1,
+        _ => 0,
+    };
+    let strength = match hit.experience.evidence_strength.strength {
+        EvidenceStrength::Strong => 2,
+        EvidenceStrength::Moderate => 1,
+        _ => 0,
+    };
+    let outcome = match hit.experience.outcome {
+        ExperienceOutcome::Success => 3,
+        ExperienceOutcome::PartialSuccess => 2,
+        ExperienceOutcome::Failure => 1,
+        ExperienceOutcome::Inconclusive | ExperienceOutcome::Abandoned => 0,
+    };
+    (
+        identity,
+        verification,
+        strength,
+        outcome,
+        hit.explanation.scores.total,
+    )
+}
+
+fn experience_member_event_ids(explanation: &ExperienceExplanation) -> BTreeSet<String> {
+    explanation
+        .record
+        .evidence
+        .iter()
+        .map(|link| link.event_id.clone())
+        .chain(
+            explanation
+                .record
+                .code_snapshots
+                .iter()
+                .map(|snapshot| snapshot.source_event_id.clone()),
+        )
+        .chain(
+            explanation
+                .record
+                .experience
+                .verification
+                .observations
+                .iter()
+                .map(|observation| observation.evidence_event_id.clone()),
+        )
+        .collect()
+}
+
+fn render_experience_context(summary: &str) -> String {
+    let compact = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prefix = "Historical experience (not current evidence): ";
+    let available = MAX_CONTEXT_EXPERIENCE_RENDERED_BYTES.saturating_sub(prefix.len());
+    let mut end = compact.len().min(available);
+    while end > 0 && !compact.is_char_boundary(end) {
+        end -= 1;
+    }
+    let suffix = if end < compact.len() { "…" } else { "" };
+    format!("{prefix}{}{suffix}", &compact[..end])
+}
+
+fn attach_explanation(
+    packet: &mut ContextPacket,
+    include_explanation: bool,
+    experience: ExperienceContextExplanation,
+) {
     if include_explanation {
         packet.explanation = Some(ContextExplanation {
             selected: packet
@@ -1567,6 +1911,7 @@ fn attach_explanation(packet: &mut ContextPacket, include_explanation: bool) {
                     truncated: item.truncated,
                 })
                 .collect(),
+            experience,
         });
     }
 }
@@ -1658,6 +2003,7 @@ fn budget_category(candidate: &ContextCandidate) -> BudgetCategory {
         }
         ContextSourceType::Memory => BudgetCategory::Memory,
         ContextSourceType::Event => BudgetCategory::Event,
+        ContextSourceType::Experience => BudgetCategory::State,
         ContextSourceType::TaskState
         | ContextSourceType::SessionState
         | ContextSourceType::Other(_) => BudgetCategory::State,
@@ -1670,6 +2016,9 @@ fn context_item_for_budget(
     allow_truncation: bool,
     token_counter: &dyn TokenCounter,
 ) -> Option<ContextItem> {
+    if candidate.content.len() > crate::domain::MAX_CONTEXT_ITEM_BYTES {
+        return None;
+    }
     let full_tokens = token_counter.count(&candidate.content).tokens;
     let (content, estimated_tokens, truncated) = if full_tokens <= available_tokens {
         (candidate.content.clone(), full_tokens, false)
@@ -1696,6 +2045,59 @@ fn context_item_for_budget(
         estimated_tokens,
         truncated,
     })
+}
+
+fn normalize_context_request(request: &mut ContextRequest) -> Result<()> {
+    if request.token_budget > crate::domain::MAX_CONTEXT_TOKEN_BUDGET {
+        return Err(CortexError::Analysis(format!(
+            "context token budget must be at most {}",
+            crate::domain::MAX_CONTEXT_TOKEN_BUDGET
+        )));
+    }
+    request.path_scope = normalize_context_scopes(&request.path_scope, true)?;
+    request.language_scope = normalize_context_scopes(&request.language_scope, false)?;
+    Ok(())
+}
+
+fn normalize_context_scopes(values: &[String], paths: bool) -> Result<Vec<String>> {
+    if values.len() > crate::domain::MAX_CONTEXT_SCOPE_ITEMS {
+        return Err(CortexError::Analysis(
+            "context scope has too many entries".into(),
+        ));
+    }
+    let mut normalized = BTreeSet::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() || value.len() > crate::domain::MAX_CONTEXT_SCOPE_VALUE_BYTES {
+            return Err(CortexError::Analysis(
+                "context scope values must be bounded and non-empty".into(),
+            ));
+        }
+        if paths {
+            if value.starts_with('/')
+                || value.contains('\\')
+                || value
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                return Err(CortexError::Analysis(
+                    "context path scopes must be normalized workspace-relative paths".into(),
+                ));
+            }
+            normalized.insert(value.to_owned());
+        } else {
+            if !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            {
+                return Err(CortexError::Analysis(
+                    "context language scopes must be normalized identifiers".into(),
+                ));
+            }
+            normalized.insert(value.to_ascii_lowercase());
+        }
+    }
+    Ok(normalized.into_iter().collect())
 }
 
 fn truncate_to_budget(
@@ -1776,6 +2178,7 @@ fn record_selected_item(
         }
         ContextSourceType::Memory => BudgetCategory::Memory,
         ContextSourceType::Event => BudgetCategory::Event,
+        ContextSourceType::Experience => BudgetCategory::State,
         ContextSourceType::TaskState
         | ContextSourceType::SessionState
         | ContextSourceType::Other(_) => BudgetCategory::State,
@@ -2312,6 +2715,7 @@ fn provenance_score(source_type: &ContextSourceType) -> f32 {
         ContextSourceType::TaskState | ContextSourceType::SessionState => 0.95,
         ContextSourceType::Memory => 0.9,
         ContextSourceType::Event => 0.8,
+        ContextSourceType::Experience => 0.25,
         ContextSourceType::Other(_) => 0.5,
     }
 }
@@ -2393,16 +2797,20 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        AnalyzedChunk, Checkpoint, CortexEvent, Document, EventType, GraphState, MemoryKind,
-        MemoryRecord, MemorySupersession, Session, StoredChunk, StructuralEvidence, StructuralPath,
-        StructuralReadOptions, Task, TemporalFilter, TemporalQuery, Workspace,
-        WorkspaceGraphRevision,
+        AnalyzedChunk, Checkpoint, ConsolidationAcceptance, ConsolidationAcceptanceRequest,
+        ConsolidationPreview, ConsolidationRequest, CortexEvent, Document, Episode, EpisodeCreator,
+        EpisodeEventAssociationRequest, EpisodeStatus, EpisodeTerminalRequest, EpisodeType,
+        EventType, ExperienceAssessment, ExperienceAssessmentKind, FailureNormalizationResult,
+        FailureSignature, GraphState, MemoryKind, MemoryRecord, MemorySupersession, Session,
+        StoredChunk, StructuralEvidence, StructuralPath, StructuralReadOptions, Task,
+        TemporalFilter, TemporalQuery, Workspace, WorkspaceGraphRevision,
     };
     use crate::embedding::{TokenCount, TokenCountAccuracy, provider::MockEmbeddingProvider};
     use crate::parsing::{
         LanguageAnalyzer,
         languages::{CSharpAnalyzer, PythonAnalyzer, RustAnalyzer, TypeScriptAnalyzer},
     };
+    use crate::service::{ConsolidationService, EvidenceService, FailureNormalizationService};
 
     fn test_retrieval(storage: Arc<SqliteStorage>) -> Arc<RetrievalService> {
         Arc::new(
@@ -2413,6 +2821,153 @@ mod tests {
                 0.3,
             )
             .unwrap(),
+        )
+    }
+
+    async fn experience_context_fixture() -> (
+        ContextService,
+        Workspace,
+        Session,
+        Task,
+        crate::domain::FailureSignature,
+        CortexEvent,
+        crate::domain::ExperienceRecord,
+    ) {
+        let storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        let workspace = Workspace::new("C:/experience-context", "experience-context");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let session = Session::new(&workspace.id, serde_json::json!({}));
+        storage.insert_session(&session).await.unwrap();
+        let task = Task::new(
+            &workspace.id,
+            Some(session.id.clone()),
+            "current task remains authoritative",
+            serde_json::json!({}),
+        );
+        storage.insert_task(&task).await.unwrap();
+        let episode = Episode::new(
+            &workspace.id,
+            &session.id,
+            Some(task.id.clone()),
+            EpisodeType::Debugging,
+            None,
+            EpisodeCreator::User,
+        );
+        storage.insert_episode(&episode).await.unwrap();
+        let mut failure = CortexEvent::new(
+            &workspace.id,
+            EventType::CompilerResult,
+            serde_json::json!({
+                "contract": "cortexweave.rust_compiler_result",
+                "version": 1,
+                "subject": {"kind": "target", "value": "core"},
+                "exit_code": 1,
+                "diagnostics": [{
+                    "level": "error", "code": "E0308", "message": "mismatched types",
+                    "expected_type": "String", "actual_type": "u32", "path": "src/lib.rs",
+                    "start_line": 1, "start_column": 1
+                }]
+            }),
+        );
+        let mut change = CortexEvent::new(
+            &workspace.id,
+            EventType::ExternalToolFinished,
+            serde_json::json!({
+                "contract": "cortexweave.external_tool_completion", "version": 1,
+                "tool": "editor", "operation": "edit", "exit_code": 0,
+                "error_class": null, "message": null
+            }),
+        );
+        let mut verification = CortexEvent::new(
+            &workspace.id,
+            EventType::CompilerResult,
+            serde_json::json!({
+                "contract": "cortexweave.rust_compiler_result", "version": 1,
+                "subject": {"kind": "target", "value": "core"}, "exit_code": 0,
+                "diagnostics": []
+            }),
+        );
+        for event in [&mut failure, &mut change, &mut verification] {
+            event.session_id = Some(session.id.clone());
+            event.task_id = Some(task.id.clone());
+            storage.insert_event(event).await.unwrap();
+        }
+        let associated = storage
+            .associate_episode_events(
+                &EpisodeEventAssociationRequest {
+                    workspace_id: workspace.id.clone(),
+                    episode_id: episode.id.clone(),
+                    expected_version: episode.version,
+                    request_key: "experience-context-associate".into(),
+                    event_ids: vec![
+                        failure.id.clone(),
+                        change.id.clone(),
+                        verification.id.clone(),
+                    ],
+                },
+                &"a".repeat(64),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let closed = storage
+            .transition_episode(
+                &EpisodeTerminalRequest {
+                    workspace_id: workspace.id.clone(),
+                    episode_id: episode.id.clone(),
+                    expected_version: associated.version,
+                    request_key: "experience-context-close".into(),
+                },
+                EpisodeStatus::Closed,
+                &"b".repeat(64),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let normalizer = FailureNormalizationService::standard().unwrap();
+        let decoder = EvidenceService::standard().unwrap();
+        let signature = match normalizer.normalize(decoder.diagnose(&failure).decoded().unwrap()) {
+            FailureNormalizationResult::Normalized { normalization } => normalization.signature,
+            FailureNormalizationResult::Unsupported { reason } => panic!("{reason:?}"),
+        };
+        let consolidator = ConsolidationService::new(
+            Arc::clone(&storage),
+            Arc::new(decoder),
+            Arc::new(normalizer),
+        );
+        let request = ConsolidationRequest {
+            workspace_id: workspace.id.clone(),
+            episode_id: episode.id,
+            expected_episode_version: closed.version,
+        };
+        let ConsolidationPreview::Proposal { proposal, .. } =
+            consolidator.preview(&request).await.unwrap()
+        else {
+            panic!("fixture must produce an experience");
+        };
+        let accepted = consolidator
+            .accept(&ConsolidationAcceptanceRequest {
+                request,
+                expected_fingerprint: proposal.fingerprint.clone(),
+                expected_proposal_hash: proposal.proposal_hash.clone(),
+            })
+            .await
+            .unwrap();
+        let record = match accepted {
+            ConsolidationAcceptance::Accepted { record } => *record,
+            other => panic!("fixture must accept an experience: {other:?}"),
+        };
+        let service = ContextService::with_clock(
+            Arc::clone(&storage),
+            test_retrieval(storage),
+            WorkingSetConfig::default(),
+            TemporalConfig::default(),
+            ContextConfig::default(),
+            Arc::new(TestClock::new(Utc::now())),
+        )
+        .unwrap();
+        (
+            service, workspace, session, task, signature, failure, record,
         )
     }
 
@@ -4366,5 +4921,477 @@ mod tests {
                 .count()
                 > 1
         );
+    }
+
+    #[tokio::test]
+    async fn experience_context_is_bounded_historical_and_keeps_current_task_state() {
+        let (service, workspace, session, task, signature, _, _) =
+            experience_context_fixture().await;
+        let document = Document::new(&workspace.id, "src/lib.rs");
+        service.storage.insert_document(&document).await.unwrap();
+        let current_code = StoredChunk::new(
+            &document.id,
+            "rust:function:authoritative_current_symbol",
+            "fn authoritative_current_symbol() -> &'static str { \"current\" }",
+        );
+        service.storage.insert_chunk(&current_code).await.unwrap();
+        let mut request = ContextRequest::new(&workspace.id);
+        request.query = Some("authoritative_current_symbol".into());
+        request.session_id = Some(session.id.clone());
+        request.task_id = Some(task.id.clone());
+        request.active_failure_signature = Some(signature);
+        request.token_budget = 1_024;
+        request.include_events = false;
+        request.include_explanation = true;
+
+        let packet = service.assemble_context_packet(request).await.unwrap();
+
+        assert!(packet.items.iter().any(|item| {
+            item.source_id == task.id && item.source_type == ContextSourceType::TaskState
+        }));
+        let current_index = packet
+            .items
+            .iter()
+            .position(|item| item.source_id == current_code.id)
+            .expect("matching current code remains in the ordinary source category");
+        let experience_index = packet
+            .items
+            .iter()
+            .position(|item| item.source_type == ContextSourceType::Experience)
+            .expect("eligible history is added only after ordinary context selection");
+        assert!(current_index < experience_index);
+        assert_eq!(
+            packet.items[current_index].freshness,
+            ContextFreshness::Current
+        );
+        let experience = &packet.items[experience_index];
+        let experience_id = experience.source_id.clone();
+        assert_eq!(experience.freshness, ContextFreshness::Historical);
+        assert!(
+            experience
+                .reasons
+                .contains(&ContextSelectionReason::ExperienceExactFailureSignature)
+        );
+        assert!(
+            experience
+                .content
+                .starts_with("Historical experience (not current evidence):")
+        );
+        let explanation = packet.explanation.unwrap();
+        assert_eq!(
+            explanation.experience.selected_experience_ids,
+            vec![experience_id.clone()]
+        );
+        assert_eq!(explanation.experience.selections.len(), 1);
+        assert_eq!(
+            explanation.experience.selections[0].authority,
+            ExperienceContextAuthority::HistoricalSupplemental
+        );
+        assert!(
+            explanation.experience.selections[0]
+                .search_scores
+                .exact_signature
+                > 0
+        );
+        assert_eq!(explanation.experience.degradation, None);
+        assert!(packet.estimated_tokens <= packet.token_budget);
+        assert!(
+            service
+                .activate_source(
+                    &workspace.id,
+                    &session.id,
+                    Some(&task.id),
+                    &experience_id,
+                    ContextSourceType::Experience,
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn experience_context_selects_compatible_history_across_path_and_symbol() {
+        let (service, workspace, session, task, signature, _, _) =
+            experience_context_fixture().await;
+        let compatible_signature = FailureSignature::new(
+            signature.domain,
+            signature.identity_capability,
+            signature.components.clone(),
+            signature.normalizer_id.clone(),
+            signature.normalizer_version.clone(),
+            crate::domain::FailureScope {
+                path: Some("src/other.rs".into()),
+                symbol_key: Some("rust:function:other".into()),
+                ..signature.scope.clone()
+            },
+        )
+        .unwrap();
+        let mut request = ContextRequest::new(&workspace.id);
+        request.session_id = Some(session.id);
+        request.task_id = Some(task.id);
+        request.active_failure_signature = Some(compatible_signature);
+        request.include_code = false;
+        request.include_documents = false;
+        request.include_memories = false;
+        request.include_events = false;
+        request.token_budget = 1_024;
+        request.include_explanation = true;
+
+        let packet = service.assemble_context_packet(request).await.unwrap();
+
+        let experience = packet
+            .items
+            .iter()
+            .find(|item| item.source_type == ContextSourceType::Experience)
+            .expect("component-compatible history may cross current path and symbol");
+        assert!(
+            experience
+                .reasons
+                .contains(&ContextSelectionReason::ExperienceCompatibleFailureSignature)
+        );
+        assert!(
+            !experience
+                .reasons
+                .contains(&ContextSelectionReason::ExperienceExactFailureSignature)
+        );
+        let selection = &packet.explanation.unwrap().experience.selections[0];
+        assert_eq!(selection.search_scores.exact_signature, 0);
+        assert!(selection.search_scores.compatible_components > 0);
+    }
+
+    #[tokio::test]
+    async fn experience_context_deduplicates_selected_member_events() {
+        let (service, workspace, session, task, signature, failure, _) =
+            experience_context_fixture().await;
+        service
+            .activate_source(
+                &workspace.id,
+                &session.id,
+                Some(&task.id),
+                &failure.id,
+                ContextSourceType::Event,
+            )
+            .await
+            .unwrap();
+        let mut request = ContextRequest::new(&workspace.id);
+        request.session_id = Some(session.id);
+        request.task_id = Some(task.id);
+        request.active_failure_signature = Some(signature);
+        request.token_budget = 1_024;
+        request.include_explanation = true;
+
+        let packet = service.assemble_context_packet(request).await.unwrap();
+
+        assert!(packet.items.iter().any(|item| item.source_id == failure.id));
+        assert!(
+            !packet
+                .items
+                .iter()
+                .any(|item| item.source_type == ContextSourceType::Experience)
+        );
+        assert_eq!(
+            packet.explanation.unwrap().experience.degradation,
+            Some(ExperienceContextDegradation::Deduplicated)
+        );
+    }
+
+    #[tokio::test]
+    async fn active_failure_event_precedes_matching_historical_success() {
+        let (service, workspace, _, _, signature, historical_failure, _) =
+            experience_context_fixture().await;
+        let session = Session::new(&workspace.id, serde_json::json!({"state": "current"}));
+        service.storage.insert_session(&session).await.unwrap();
+        let task = Task::new(
+            &workspace.id,
+            Some(session.id.clone()),
+            "diagnose active compiler failure",
+            serde_json::json!({}),
+        );
+        service.storage.insert_task(&task).await.unwrap();
+        let mut active_failure = CortexEvent::new(
+            &workspace.id,
+            EventType::CompilerResult,
+            historical_failure.payload,
+        );
+        active_failure.session_id = Some(session.id.clone());
+        active_failure.task_id = Some(task.id.clone());
+        service.storage.insert_event(&active_failure).await.unwrap();
+        service
+            .activate_source(
+                &workspace.id,
+                &session.id,
+                Some(&task.id),
+                &active_failure.id,
+                ContextSourceType::Event,
+            )
+            .await
+            .unwrap();
+        let mut request = ContextRequest::new(&workspace.id);
+        request.session_id = Some(session.id);
+        request.task_id = Some(task.id);
+        request.active_failure_signature = Some(signature);
+        request.include_code = false;
+        request.include_documents = false;
+        request.include_memories = false;
+        request.include_events = false;
+        request.token_budget = 2_048;
+        request.include_explanation = true;
+
+        let packet = service.assemble_context_packet(request).await.unwrap();
+
+        assert!(
+            !packet
+                .items
+                .iter()
+                .any(|item| item.source_id == historical_failure.id)
+        );
+        let current_task_index = packet
+            .items
+            .iter()
+            .position(|item| item.source_type == ContextSourceType::TaskState)
+            .expect("current task evidence remains selected");
+        let active_failure_index = packet
+            .items
+            .iter()
+            .position(|item| item.source_id == active_failure.id)
+            .expect("explicit active failure remains in the working set");
+        let experience_index = packet
+            .items
+            .iter()
+            .position(|item| item.source_type == ContextSourceType::Experience)
+            .expect("matching historical success supplements the active failure");
+        assert!(current_task_index < experience_index);
+        assert!(active_failure_index < experience_index);
+        let selection = &packet.explanation.unwrap().experience.selections[0];
+        assert_eq!(selection.outcome, ExperienceOutcome::Success);
+        assert_eq!(
+            selection.authority,
+            ExperienceContextAuthority::HistoricalSupplemental
+        );
+    }
+
+    #[tokio::test]
+    async fn disputed_or_refuted_exact_loses_to_active_compatible_experience() {
+        let (service, workspace, session, task, exact_signature, _, record) =
+            experience_context_fixture().await;
+        let exact_experience_id = record.experience.id.clone();
+        let mut weaker_record = record.clone();
+        let weaker_signature = FailureSignature::new(
+            exact_signature.domain,
+            exact_signature.identity_capability,
+            exact_signature.components.clone(),
+            exact_signature.normalizer_id.clone(),
+            exact_signature.normalizer_version.clone(),
+            crate::domain::FailureScope {
+                target: Some("compatible-other-target".into()),
+                ..exact_signature.scope.clone()
+            },
+        )
+        .unwrap();
+        weaker_record.experience.id = "active-compatible-experience".into();
+        weaker_record.experience.failure_signature = Some(weaker_signature.clone());
+        weaker_record.experience.summary = crate::domain::render_summary(
+            Some(&weaker_signature),
+            weaker_record.experience.outcome,
+            &weaker_record.experience.verification,
+            weaker_record.attempts.len(),
+        );
+        weaker_record.experience.consolidation_fingerprint = "c".repeat(64);
+        weaker_record.experience.proposal_hash = "d".repeat(64);
+        for attempt in &mut weaker_record.attempts {
+            attempt.id = format!("active-compatible-attempt-{}", attempt.ordinal);
+            attempt.experience_id = weaker_record.experience.id.clone();
+        }
+        service
+            .storage
+            .insert_experience(&weaker_record)
+            .await
+            .unwrap();
+        let mut duplicate_request = ContextRequest::new(&workspace.id);
+        duplicate_request.session_id = Some(session.id.clone());
+        duplicate_request.task_id = Some(task.id.clone());
+        duplicate_request.active_failure_signature = Some(exact_signature.clone());
+        duplicate_request.include_events = false;
+        duplicate_request.token_budget = 1_024;
+        duplicate_request.include_explanation = true;
+        let duplicate_packet = service
+            .assemble_context_packet(duplicate_request)
+            .await
+            .unwrap();
+        assert_eq!(
+            duplicate_packet
+                .items
+                .iter()
+                .filter(|item| item.source_type == ContextSourceType::Experience)
+                .count(),
+            1,
+            "shared historical member events can consume Experience context once"
+        );
+        let duplicate_explanation = duplicate_packet.explanation.unwrap().experience;
+        assert_eq!(duplicate_explanation.candidate_count, 2);
+        assert_eq!(duplicate_explanation.deduplicated_candidate_count, 1);
+        service
+            .storage
+            .append_experience_assessment(&ExperienceAssessment {
+                id: "dispute-exact-for-authority-review".into(),
+                workspace_id: workspace.id.clone(),
+                experience_id: exact_experience_id.clone(),
+                kind: ExperienceAssessmentKind::Disputed,
+                actor: "authority-review".into(),
+                reason: "exact historical interpretation is disputed".into(),
+                replacement_experience_id: None,
+                evidence_event_ids: Vec::new(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let mut request = ContextRequest::new(&workspace.id);
+        request.session_id = Some(session.id);
+        request.task_id = Some(task.id);
+        request.active_failure_signature = Some(exact_signature);
+        request.include_events = false;
+        request.token_budget = 1_024;
+        request.include_explanation = true;
+
+        let packet = service
+            .assemble_context_packet(request.clone())
+            .await
+            .unwrap();
+
+        let explanation = packet.explanation.unwrap().experience;
+        assert_eq!(
+            explanation.selected_experience_ids,
+            vec!["active-compatible-experience"]
+        );
+        assert_eq!(
+            explanation.selections[0].lifecycle,
+            ExperienceLifecycle::Active
+        );
+        assert_eq!(explanation.selections[0].search_scores.exact_signature, 0);
+        assert!(
+            explanation.selections[0]
+                .search_scores
+                .compatible_components
+                > 0
+        );
+        assert!(
+            packet
+                .items
+                .iter()
+                .all(|item| item.source_id != exact_experience_id)
+        );
+        service
+            .storage
+            .append_experience_assessment(&ExperienceAssessment {
+                id: "refute-exact-for-authority-review".into(),
+                workspace_id: workspace.id,
+                experience_id: exact_experience_id.clone(),
+                kind: ExperienceAssessmentKind::Refuted,
+                actor: "authority-review".into(),
+                reason: "exact historical interpretation was refuted".into(),
+                replacement_experience_id: None,
+                evidence_event_ids: Vec::new(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let refuted_packet = service.assemble_context_packet(request).await.unwrap();
+        assert!(
+            refuted_packet
+                .items
+                .iter()
+                .all(|item| item.source_id != exact_experience_id)
+        );
+        assert_eq!(
+            refuted_packet
+                .explanation
+                .unwrap()
+                .experience
+                .selected_experience_ids,
+            vec!["active-compatible-experience"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_experience_search_degrades_without_losing_ordinary_context() {
+        let (service, workspace, session, task, mut signature, _, _) =
+            experience_context_fixture().await;
+        signature.normalized_key = "0".repeat(64);
+        let mut request = ContextRequest::new(&workspace.id);
+        request.session_id = Some(session.id);
+        request.task_id = Some(task.id.clone());
+        request.active_failure_signature = Some(signature);
+        request.include_events = false;
+        request.include_explanation = true;
+
+        let packet = service.assemble_context_packet(request).await.unwrap();
+
+        assert!(packet.items.iter().any(|item| item.source_id == task.id));
+        assert!(
+            !packet
+                .items
+                .iter()
+                .any(|item| item.source_type == ContextSourceType::Experience)
+        );
+        assert_eq!(
+            packet.explanation.unwrap().experience.degradation,
+            Some(ExperienceContextDegradation::SearchUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_budget_reports_experience_degradation_without_fabricating_history() {
+        let (service, workspace, _, _, signature, _, _) = experience_context_fixture().await;
+        let mut request = ContextRequest::new(&workspace.id);
+        request.active_failure_signature = Some(signature);
+        request.token_budget = 0;
+        request.include_explanation = true;
+
+        let packet = service.assemble_context_packet(request).await.unwrap();
+
+        assert!(packet.items.is_empty());
+        assert_eq!(
+            packet.explanation.unwrap().experience.degradation,
+            Some(ExperienceContextDegradation::BudgetExhausted)
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_request_with_stale_graph_does_not_invent_experience_context() {
+        let (service, workspace, session, task, _, _, _) = experience_context_fixture().await;
+        sqlx::query(
+            "UPDATE workspace_graph_revisions SET graph_state = 'stale' WHERE workspace_id = ?",
+        )
+        .bind(&workspace.id)
+        .execute(service.storage.pool())
+        .await
+        .unwrap();
+        let mut request = ContextRequest::new(&workspace.id);
+        request.session_id = Some(session.id);
+        request.task_id = Some(task.id.clone());
+        request.include_events = false;
+        request.include_explanation = true;
+
+        let packet = service.assemble_context_packet(request).await.unwrap();
+
+        assert!(packet.items.iter().any(|item| item.source_id == task.id));
+        assert!(
+            !packet
+                .items
+                .iter()
+                .any(|item| item.source_type == ContextSourceType::Experience)
+        );
+        assert_eq!(
+            packet.explanation.unwrap().experience.degradation,
+            Some(ExperienceContextDegradation::NotRequested)
+        );
+    }
+
+    #[test]
+    fn compact_experience_renderer_has_a_hard_byte_ceiling() {
+        let rendered =
+            render_experience_context(&"é".repeat(MAX_CONTEXT_EXPERIENCE_RENDERED_BYTES));
+        assert!(rendered.len() <= MAX_CONTEXT_EXPERIENCE_RENDERED_BYTES + "…".len());
+        assert!(rendered.is_char_boundary(rendered.len()));
     }
 }

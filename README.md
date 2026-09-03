@@ -2,10 +2,10 @@
 
 # CortexWeave
 
-CortexWeave v0.4 is a local-first context substrate for coding agents and
-harnesses. It indexes registered workspaces, keeps explicit memory and a
-durable structural code graph with provenance, and returns bounded, explainable
-context packets through a CLI and MCP over stdio.
+CortexWeave v0.5 is a local-first context substrate for coding agents and
+harnesses. It indexes registered workspaces, keeps explicit memory, durable
+structural code provenance, and verified historical Experience, and returns
+bounded, explainable context packets through a CLI and MCP over stdio.
 
 It is not an agent harness. CortexWeave does not invoke reasoning models,
 execute tools, or orchestrate agent loops. A harness such as [Crush](https://github.com/charmbracelet/crush "Glamourous agentic coding for all 💘") decides when
@@ -31,6 +31,8 @@ to call it and owns any subsequent tool use.
   the cost of explicitly enabling an available analyzer and reindexing.
 - Imported-memory trust review, source-range provenance, duplicate accounting,
   and explicit, audited supersession.
+- Explicit episodes and deterministic, immutable Experience consolidation with
+  bounded historical retrieval and reviewed assessment history.
 - Pluggable language analyzers that produce normalized chunks; unsupported text
   formats use deterministic generic chunking.
 
@@ -113,7 +115,9 @@ Use [`.crushrc.example`](.crushrc.example) as the project-local Crush template.
 - `docs/v0.3-plan.md`: completed v0.3 delivery plan
 - `docs/native-adapter.md`: direct-harness compatibility constraints
 - `docs/graph-architecture.md`: structural graph semantics, provenance, freshness, and extension boundaries
-- `docs/v0.5-release-boundary.md`: accepted verified-experience scope for the next release
+- `docs/verified-experience.md`: v0.5 episodes, typed evidence, Experience, retrieval, authority, and limits
+- `docs/v0.5-release-boundary.md`: accepted verified-experience release scope and deferred research
+- [v0.5.1 implementation plan](<CortexWeave v0.5.1 Test Evidence and Vitest Integration Plan.md>): proposed Vitest and Python unittest evidence, with Crush qualification on emCP and PiHype
 
 ## Context and Memory Boundaries
 
@@ -126,3 +130,8 @@ CortexWeave stores memories only when a caller records or imports them.
 Human-authorized memories are trusted when recorded. Imported memories require
 source segments and remain outside automatic context until an explicit trust
 review accepts them.
+
+Experience is different from Memory: it is an immutable interpretation of an
+explicit episode with typed evidence and scoped verification. It may supplement
+a later matching failure, but never replaces current source, current task, or
+current deterministic observations. See [Verified Experience Core](docs/verified-experience.md).

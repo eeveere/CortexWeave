@@ -16,11 +16,14 @@ pub mod workspace;
 pub use config::AppConfig;
 pub use error::{CortexError, Result};
 pub use service::{
-    AnalyzerRecommendation, ContextService, ContextSufficiencyAssessment, CortexWeaveService,
-    GraphLanguageStatus, HarnessContext, HarnessContextPolicy, HarnessContextRequest,
-    HarnessHydrationRequest, HarnessSelectedSource, HydratedContextSource, HydrationAuthorization,
-    HydrationScoreProvenance, LanguageReadiness, MemoryConsolidationProposal,
-    MemoryConsolidationReport, MemoryConsolidationRequest, MemoryContradiction,
-    MemorySupersessionReviewRequest, MemoryTrustReviewRequest, ProposedMemorySupersession,
-    RebuildCost, StructuralService, WorkspaceGraphStatus, WorkspaceReadiness,
+    AnalyzerRecommendation, ConsolidationService, ContextService, ContextSufficiencyAssessment,
+    CortexWeaveService, EventEvidenceDecoder, EventEvidenceDecoderRegistry, EvidenceService,
+    ExperienceSearchService, FailureNormalizationService, FailureNormalizer,
+    FailureNormalizerRegistry, GraphLanguageStatus, HarnessContext, HarnessContextPolicy,
+    HarnessContextRequest, HarnessHydrationRequest, HarnessSelectedSource, HydratedContextSource,
+    HydrationAuthorization, HydrationScoreProvenance, LanguageReadiness,
+    MemoryConsolidationProposal, MemoryConsolidationReport, MemoryConsolidationRequest,
+    MemoryContradiction, MemorySupersessionReviewRequest, MemoryTrustReviewRequest,
+    ProposedMemorySupersession, RebuildCost, StructuralService, VerifierRuleRegistry,
+    WorkspaceGraphStatus, WorkspaceReadiness,
 };

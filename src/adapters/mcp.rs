@@ -7,6 +7,7 @@ use std::{
     },
 };
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -15,8 +16,14 @@ use tokio::task::JoinHandle;
 use crate::{
     CortexWeaveService,
     domain::{
-        Checkpoint, ContextRequest, ContextSourceType, CortexEvent, EventType, GraphRepairMode,
-        MemoryKind, MemoryRecord, ResumeContextRequest, StructuralReadOptions,
+        Checkpoint, ConsolidationAcceptanceRequest, ConsolidationRequest, ContextRequest,
+        ContextSourceType, CortexEvent, EpisodeCreator, EpisodeEventAssociationRequest,
+        EpisodeListRequest, EpisodeStartRequest, EpisodeTerminalRequest, EpisodeType, EventType,
+        ExperienceAssessmentKind, ExperienceAssessmentReviewRequest,
+        ExperienceDisputeProposalRequest, ExperienceSearchRequest, FailureSignature,
+        GraphRepairMode, MAX_EPISODE_EVENTS, MAX_EXPERIENCE_ASSESSMENT_EVIDENCE,
+        MAX_EXPERIENCE_ASSESSMENT_PAGE_LIMIT, MemoryKind, MemoryRecord, ResumeContextRequest,
+        StructuralReadOptions,
     },
     indexing::{WorkspaceWatcher, WorkspaceWatcherHandle},
     workspace::WorkspaceSelector,
@@ -270,6 +277,20 @@ impl McpServer {
             "session_start" => self.session_start(arguments).await,
             "session_end" => self.session_end(arguments).await,
             "event_record" => self.event_record(arguments).await,
+            "episode_start" => self.episode_start(arguments).await,
+            "episode_add_events" => self.episode_add_events(arguments).await,
+            "episode_close" => self.episode_terminal(arguments, true).await,
+            "episode_abandon" => self.episode_terminal(arguments, false).await,
+            "episode_get" => self.episode_get(arguments).await,
+            "episode_list" => self.episode_list(arguments).await,
+            "experience_preview" => self.experience_preview(arguments).await,
+            "experience_consolidate" => self.experience_consolidate(arguments).await,
+            "experience_search" => self.experience_search(arguments).await,
+            "experience_get" => self.experience_get(arguments, false).await,
+            "experience_explain" => self.experience_get(arguments, true).await,
+            "experience_history" => self.experience_history(arguments).await,
+            "experience_assess_reviewed" => self.experience_assess_reviewed(arguments).await,
+            "experience_propose_dispute" => self.experience_propose_dispute(arguments).await,
             _ => return Err((-32601, format!("unknown tool: {name}"))),
         };
         Ok(match result {
@@ -305,6 +326,8 @@ impl McpServer {
         request.path_scope = optional_strings(args, "path_scope")?;
         request.language_scope = optional_strings(args, "language_scope")?;
         request.include_explanation = optional_bool(args, "include_explanation", false)?;
+        request.active_failure_signature =
+            optional_failure_signature(args, "active_failure_signature")?;
         serialize_service(self.service.semantic_context(request).await)
     }
 
@@ -640,6 +663,203 @@ impl McpServer {
         serialize_service(self.service.record_event(event).await)
     }
 
+    async fn episode_start(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(
+            self.service
+                .start_episode(EpisodeStartRequest {
+                    workspace_id: workspace.id,
+                    session_id: required_string(args, "session_id")?.to_owned(),
+                    task_id: optional_string(args, "task_id")?,
+                    episode_type: parse_episode_type(required_string(args, "episode_type")?)?,
+                    title: optional_string(args, "title")?,
+                    created_by: EpisodeCreator::User,
+                })
+                .await,
+        )
+    }
+
+    async fn episode_add_events(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(
+            self.service
+                .add_episode_events(EpisodeEventAssociationRequest {
+                    workspace_id: workspace.id,
+                    episode_id: required_string(args, "episode_id")?.to_owned(),
+                    expected_version: required_u64(args, "expected_version")?,
+                    request_key: required_string(args, "request_key")?.to_owned(),
+                    event_ids: bounded_strings(args, "event_ids", 1, MAX_EPISODE_EVENTS)?,
+                })
+                .await,
+        )
+    }
+
+    async fn episode_terminal(&self, args: &Map<String, Value>, close: bool) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        let request = EpisodeTerminalRequest {
+            workspace_id: workspace.id,
+            episode_id: required_string(args, "episode_id")?.to_owned(),
+            expected_version: required_u64(args, "expected_version")?,
+            request_key: required_string(args, "request_key")?.to_owned(),
+        };
+        if close {
+            serialize_service(self.service.close_episode(request).await)
+        } else {
+            serialize_service(self.service.abandon_episode(request).await)
+        }
+    }
+
+    async fn episode_get(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(
+            self.service
+                .get_episode(&workspace.id, required_string(args, "episode_id")?)
+                .await,
+        )
+    }
+
+    async fn episode_list(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(
+            self.service
+                .list_episodes(EpisodeListRequest {
+                    workspace_id: workspace.id,
+                    session_id: optional_string(args, "session_id")?,
+                    task_id: optional_string(args, "task_id")?,
+                    limit: optional_limit(args, MAX_TOOL_LIMIT)?,
+                })
+                .await,
+        )
+    }
+
+    async fn experience_preview(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(
+            self.service
+                .preview_experience(&ConsolidationRequest {
+                    workspace_id: workspace.id,
+                    episode_id: required_string(args, "episode_id")?.to_owned(),
+                    expected_episode_version: required_u64(args, "expected_version")?,
+                })
+                .await,
+        )
+    }
+
+    async fn experience_consolidate(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(
+            self.service
+                .accept_experience(&ConsolidationAcceptanceRequest {
+                    request: ConsolidationRequest {
+                        workspace_id: workspace.id,
+                        episode_id: required_string(args, "episode_id")?.to_owned(),
+                        expected_episode_version: required_u64(args, "expected_version")?,
+                    },
+                    expected_fingerprint: required_string(args, "expected_fingerprint")?.to_owned(),
+                    expected_proposal_hash: required_string(args, "expected_proposal_hash")?
+                        .to_owned(),
+                })
+                .await,
+        )
+    }
+
+    async fn experience_search(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(
+            self.service
+                .search_experiences(&ExperienceSearchRequest {
+                    workspace_id: workspace.id,
+                    query: optional_string(args, "query")?,
+                    exact_failure_signature: optional_failure_signature(args, "failure_signature")?,
+                    compatible_components: BTreeMap::new(),
+                    path: optional_string(args, "path")?,
+                    graph_stable_key: optional_string(args, "graph_stable_key")?,
+                    outcomes: Vec::new(),
+                    strengths: Vec::new(),
+                    lifecycles: Vec::new(),
+                    include_historical: optional_bool(args, "include_historical", false)?,
+                    created_after: None,
+                    created_before: None,
+                    limit: optional_experience_limit(args, 20)?,
+                })
+                .await,
+        )
+    }
+
+    async fn experience_get(&self, args: &Map<String, Value>, explain: bool) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        let experience_id = required_string(args, "experience_id")?;
+        if explain {
+            serialize_service(
+                self.service
+                    .experience_get(&workspace.id, experience_id)
+                    .await,
+            )
+        } else {
+            serialize_service(
+                self.service
+                    .get_experience(&workspace.id, experience_id)
+                    .await,
+            )
+        }
+    }
+
+    async fn experience_history(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        let after = assessment_cursor(args)?;
+        serialize_service(
+            self.service
+                .experience_assessment_history(
+                    &workspace.id,
+                    required_string(args, "experience_id")?,
+                    after.as_ref(),
+                    optional_experience_assessment_limit(args)?,
+                )
+                .await,
+        )
+    }
+
+    async fn experience_assess_reviewed(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(
+            self.service
+                .review_experience_assessment(ExperienceAssessmentReviewRequest {
+                    workspace_id: workspace.id,
+                    experience_id: required_string(args, "experience_id")?.to_owned(),
+                    kind: parse_assessment_kind(required_string(args, "kind")?)?,
+                    reviewed_by: required_string(args, "reviewed_by")?.to_owned(),
+                    request_key: required_string(args, "request_key")?.to_owned(),
+                    reason: required_string(args, "reason")?.to_owned(),
+                    replacement_experience_id: optional_string(args, "replacement_experience_id")?,
+                    evidence_event_ids: bounded_strings(
+                        args,
+                        "evidence_event_ids",
+                        1,
+                        MAX_EXPERIENCE_ASSESSMENT_EVIDENCE,
+                    )?,
+                })
+                .await,
+        )
+    }
+
+    async fn experience_propose_dispute(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        serialize_service(
+            self.service
+                .propose_experience_disputes(&ExperienceDisputeProposalRequest {
+                    workspace_id: workspace.id,
+                    failure_signature: required_failure_signature(args, "failure_signature")?,
+                    recurring_failure_event_ids: bounded_strings(
+                        args,
+                        "recurring_failure_event_ids",
+                        1,
+                        MAX_EXPERIENCE_ASSESSMENT_EVIDENCE,
+                    )?,
+                })
+                .await,
+        )
+    }
+
     async fn resolve_workspace(
         &self,
         args: &Map<String, Value>,
@@ -739,8 +959,9 @@ fn tool_definitions() -> Vec<Value> {
                 "include_memories": { "type": "boolean" },
                 "include_events": { "type": "boolean" },
                 "path_scope": { "type": "array", "items": string_schema() },
-                "language_scope": { "type": "array", "items": string_schema() }
-                ,"include_explanation": { "type": "boolean" }
+                "language_scope": { "type": "array", "items": string_schema() },
+                "active_failure_signature": { "type": "object", "description": "Canonical FailureSignature that may request bounded historical Experience context." },
+                "include_explanation": { "type": "boolean" }
             })),
             &["query"],
         ),
@@ -948,6 +1169,145 @@ fn tool_definitions() -> Vec<Value> {
             ),
             &["event_type"],
         ),
+        tool(
+            "episode_start",
+            "Start a user-created episode in the resolved workspace.",
+            workspace_properties(json!({
+                "session_id": string_schema(),
+                "task_id": string_schema(),
+                "episode_type": { "type": "string", "enum": ["implementation", "debugging", "verification", "investigation", "refactor", "configuration", "dependency_change", "architecture_decision", "documentation", "other"] },
+                "title": string_schema()
+            })),
+            &["session_id", "episode_type"],
+        ),
+        tool(
+            "episode_add_events",
+            "Associate up to 100 existing event IDs with an open episode using explicit optimistic-concurrency and idempotency keys.",
+            workspace_properties(json!({
+                "episode_id": string_schema(),
+                "expected_version": { "type": "integer", "minimum": 0 },
+                "request_key": string_schema(),
+                "event_ids": bounded_string_array_schema(1, MAX_EPISODE_EVENTS)
+            })),
+            &["episode_id", "expected_version", "request_key", "event_ids"],
+        ),
+        tool(
+            "episode_close",
+            "Close an episode using an explicit optimistic-concurrency and idempotency key.",
+            workspace_properties(
+                json!({ "episode_id": string_schema(), "expected_version": { "type": "integer", "minimum": 0 }, "request_key": string_schema() }),
+            ),
+            &["episode_id", "expected_version", "request_key"],
+        ),
+        tool(
+            "episode_abandon",
+            "Abandon an episode using an explicit optimistic-concurrency and idempotency key.",
+            workspace_properties(
+                json!({ "episode_id": string_schema(), "expected_version": { "type": "integer", "minimum": 0 }, "request_key": string_schema() }),
+            ),
+            &["episode_id", "expected_version", "request_key"],
+        ),
+        tool(
+            "episode_get",
+            "Inspect one episode and its current status.",
+            workspace_properties(json!({ "episode_id": string_schema() })),
+            &["episode_id"],
+        ),
+        tool(
+            "episode_list",
+            "List bounded recent episodes, optionally within one session or task.",
+            workspace_properties(
+                json!({ "session_id": string_schema(), "task_id": string_schema(), "limit": limit_schema() }),
+            ),
+            &[],
+        ),
+        tool(
+            "experience_preview",
+            "Produce a deterministic, read-only consolidation preview for a terminal episode.",
+            workspace_properties(
+                json!({ "episode_id": string_schema(), "expected_version": { "type": "integer", "minimum": 0 } }),
+            ),
+            &["episode_id", "expected_version"],
+        ),
+        tool(
+            "experience_consolidate",
+            "Accept exactly a previously inspected automatic consolidation preview. A review_required proposal remains read-only in v0.5. The expected fingerprint and proposal hash make this mutation explicit.",
+            workspace_properties(json!({
+                "episode_id": string_schema(),
+                "expected_version": { "type": "integer", "minimum": 0 },
+                "expected_fingerprint": string_schema(),
+                "expected_proposal_hash": string_schema()
+            })),
+            &[
+                "episode_id",
+                "expected_version",
+                "expected_fingerprint",
+                "expected_proposal_hash",
+            ],
+        ),
+        tool(
+            "experience_search",
+            "Search bounded historical Experience records. By default only active records are returned; include_historical is explicit.",
+            workspace_properties(json!({
+                "query": string_schema(),
+                "failure_signature": { "type": "object" },
+                "path": string_schema(),
+                "graph_stable_key": string_schema(),
+                "include_historical": { "type": "boolean" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": crate::domain::MAX_EXPERIENCE_SEARCH_LIMIT }
+            })),
+            &[],
+        ),
+        tool(
+            "experience_get",
+            "Retrieve one immutable historical Experience record.",
+            workspace_properties(json!({ "experience_id": string_schema() })),
+            &["experience_id"],
+        ),
+        tool(
+            "experience_explain",
+            "Retrieve one Experience with its bounded explanation and normal-context eligibility projection.",
+            workspace_properties(json!({ "experience_id": string_schema() })),
+            &["experience_id"],
+        ),
+        tool(
+            "experience_history",
+            "Retrieve one bounded page of immutable reviewed assessment history for one Experience.",
+            workspace_properties(
+                json!({ "experience_id": string_schema(), "limit": { "type": "integer", "minimum": 1, "maximum": MAX_EXPERIENCE_ASSESSMENT_PAGE_LIMIT }, "after_created_at": string_schema(), "after_id": string_schema() }),
+            ),
+            &["experience_id"],
+        ),
+        tool(
+            "experience_assess_reviewed",
+            "Apply a caller-declared reviewed assessment. This records supplied review metadata but does not authenticate the reviewer or enforce external agent behavior.",
+            workspace_properties(json!({
+                "experience_id": string_schema(),
+                "kind": { "type": "string", "enum": ["disputed", "refuted", "superseded", "confirmed"] },
+                "reviewed_by": string_schema(),
+                "request_key": string_schema(),
+                "reason": string_schema(),
+                "replacement_experience_id": string_schema(),
+                "evidence_event_ids": bounded_string_array_schema(1, MAX_EXPERIENCE_ASSESSMENT_EVIDENCE)
+            })),
+            &[
+                "experience_id",
+                "kind",
+                "reviewed_by",
+                "request_key",
+                "reason",
+                "evidence_event_ids",
+            ],
+        ),
+        tool(
+            "experience_propose_dispute",
+            "Read-only deterministic proposal for a possible dispute; it does not change lifecycle or enforce any external agent policy.",
+            workspace_properties(json!({
+                "failure_signature": { "type": "object" },
+                "recurring_failure_event_ids": bounded_string_array_schema(1, MAX_EXPERIENCE_ASSESSMENT_EVIDENCE)
+            })),
+            &["failure_signature", "recurring_failure_event_ids"],
+        ),
     ]
 }
 
@@ -966,6 +1326,15 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 
 fn string_schema() -> Value {
     json!({ "type": "string" })
+}
+
+fn bounded_string_array_schema(minimum: usize, maximum: usize) -> Value {
+    json!({
+        "type": "array",
+        "items": string_schema(),
+        "minItems": minimum,
+        "maxItems": maximum,
+    })
 }
 
 fn workspace_properties(mut properties: Value) -> Value {
@@ -1083,6 +1452,129 @@ fn optional_strings(args: &Map<String, Value>, name: &str) -> Result<Vec<String>
                 .ok_or_else(|| format!("{name} must contain non-empty strings"))
         })
         .collect()
+}
+
+fn bounded_strings(
+    args: &Map<String, Value>,
+    name: &str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<Vec<String>, String> {
+    let values = optional_strings(args, name)?;
+    ((minimum..=maximum).contains(&values.len()))
+        .then_some(values)
+        .ok_or_else(|| format!("{name} must contain between {minimum} and {maximum} strings"))
+}
+
+fn required_u64(args: &Map<String, Value>, name: &str) -> Result<u64, String> {
+    args.get(name)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{name} must be a non-negative integer"))
+}
+
+fn optional_failure_signature(
+    args: &Map<String, Value>,
+    name: &str,
+) -> Result<Option<FailureSignature>, String> {
+    args.get(name)
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|error| {
+                format!("{name} must be a canonical FailureSignature object: {error}")
+            })
+        })
+        .transpose()
+}
+
+fn required_failure_signature(
+    args: &Map<String, Value>,
+    name: &str,
+) -> Result<FailureSignature, String> {
+    optional_failure_signature(args, name)?.ok_or_else(|| format!("{name} is required"))
+}
+
+fn optional_experience_limit(args: &Map<String, Value>, default: usize) -> Result<usize, String> {
+    let Some(value) = args.get("limit") else {
+        return Ok(default);
+    };
+    value
+        .as_u64()
+        .ok_or_else(|| "limit must be a positive integer".into())
+        .and_then(|value| usize::try_from(value).map_err(|_| "limit is too large".into()))
+        .and_then(|value| {
+            (1..=crate::domain::MAX_EXPERIENCE_SEARCH_LIMIT)
+                .contains(&value)
+                .then_some(value)
+                .ok_or_else(|| {
+                    format!(
+                        "limit must be between 1 and {}",
+                        crate::domain::MAX_EXPERIENCE_SEARCH_LIMIT
+                    )
+                })
+        })
+}
+
+fn optional_experience_assessment_limit(args: &Map<String, Value>) -> Result<usize, String> {
+    let Some(value) = args.get("limit") else {
+        return Ok(crate::domain::DEFAULT_EXPERIENCE_ASSESSMENT_PAGE_LIMIT);
+    };
+    value
+        .as_u64()
+        .ok_or_else(|| "limit must be a positive integer".into())
+        .and_then(|value| usize::try_from(value).map_err(|_| "limit is too large".into()))
+        .and_then(|value| {
+            (1..=MAX_EXPERIENCE_ASSESSMENT_PAGE_LIMIT)
+                .contains(&value)
+                .then_some(value)
+                .ok_or_else(|| {
+                    format!("limit must be between 1 and {MAX_EXPERIENCE_ASSESSMENT_PAGE_LIMIT}")
+                })
+        })
+}
+
+fn assessment_cursor(
+    args: &Map<String, Value>,
+) -> Result<Option<crate::domain::ExperienceAssessmentCursor>, String> {
+    match (
+        optional_string(args, "after_created_at")?,
+        optional_string(args, "after_id")?,
+    ) {
+        (None, None) => Ok(None),
+        (Some(created_at), Some(id)) => DateTime::parse_from_rfc3339(&created_at)
+            .map_err(|error| format!("after_created_at must be RFC3339: {error}"))
+            .map(|created_at| {
+                Some(crate::domain::ExperienceAssessmentCursor {
+                    created_at: created_at.with_timezone(&Utc),
+                    id,
+                })
+            }),
+        _ => Err("after_created_at and after_id must be supplied together".into()),
+    }
+}
+
+fn parse_episode_type(value: &str) -> Result<EpisodeType, String> {
+    match value {
+        "implementation" => Ok(EpisodeType::Implementation),
+        "debugging" => Ok(EpisodeType::Debugging),
+        "verification" => Ok(EpisodeType::Verification),
+        "investigation" => Ok(EpisodeType::Investigation),
+        "refactor" => Ok(EpisodeType::Refactor),
+        "configuration" => Ok(EpisodeType::Configuration),
+        "dependency_change" => Ok(EpisodeType::DependencyChange),
+        "architecture_decision" => Ok(EpisodeType::ArchitectureDecision),
+        "documentation" => Ok(EpisodeType::Documentation),
+        "other" => Ok(EpisodeType::Other),
+        _ => Err(format!("unsupported episode_type: {value}")),
+    }
+}
+
+fn parse_assessment_kind(value: &str) -> Result<ExperienceAssessmentKind, String> {
+    match value {
+        "disputed" => Ok(ExperienceAssessmentKind::Disputed),
+        "refuted" => Ok(ExperienceAssessmentKind::Refuted),
+        "superseded" => Ok(ExperienceAssessmentKind::Superseded),
+        "confirmed" => Ok(ExperienceAssessmentKind::Confirmed),
+        _ => Err(format!("unsupported assessment kind: {value}")),
+    }
 }
 
 fn parse_workspace_selector(value: &str) -> WorkspaceSelector {
@@ -1281,7 +1773,7 @@ mod tests {
             initialized["result"]["capabilities"]["tools"]["listChanged"],
             false
         );
-        assert_eq!(initialized["result"]["serverInfo"]["version"], "0.4.1");
+        assert_eq!(initialized["result"]["serverInfo"]["version"], "0.5.0");
         let listed = server
             .handle_json(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
             .await
@@ -1314,9 +1806,139 @@ mod tests {
             "graph_callers",
             "graph_implementations",
             "graph_impact_symbol",
+            "episode_start",
+            "episode_add_events",
+            "episode_close",
+            "episode_abandon",
+            "episode_get",
+            "episode_list",
+            "experience_preview",
+            "experience_consolidate",
+            "experience_search",
+            "experience_get",
+            "experience_explain",
+            "experience_history",
+            "experience_assess_reviewed",
+            "experience_propose_dispute",
         ] {
             assert!(names.contains(&required));
         }
+    }
+
+    #[tokio::test]
+    async fn episode_and_experience_tools_are_bounded_thin_service_calls() {
+        let (server, workspace_id) = server().await;
+        initialize(&server).await;
+        let session = call_tool(
+            &server,
+            "session_start",
+            json!({ "workspace_id": workspace_id }),
+        )
+        .await;
+        let session_id = session["structuredContent"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let event = call_tool(
+            &server,
+            "event_record",
+            json!({
+                "workspace_id": workspace_id,
+                "event_type": "external_tool_finished",
+                "session_id": session_id,
+                "payload": { "tool": "cargo", "status": "passed" }
+            }),
+        )
+        .await;
+        let event_id = event["structuredContent"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let episode = call_tool(
+            &server,
+            "episode_start",
+            json!({
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "episode_type": "verification",
+                "title": "Adapter conformance"
+            }),
+        )
+        .await;
+        assert_eq!(episode["isError"], false);
+        let episode_id = episode["structuredContent"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let associated = call_tool(
+            &server,
+            "episode_add_events",
+            json!({
+                "workspace_id": workspace_id,
+                "episode_id": episode_id,
+                "expected_version": 0,
+                "request_key": "associate-first-event",
+                "event_ids": [event_id]
+            }),
+        )
+        .await;
+        assert_eq!(associated["isError"], false);
+        assert_eq!(associated["structuredContent"]["version"], 1);
+
+        let closed = call_tool(
+            &server,
+            "episode_close",
+            json!({
+                "workspace_id": workspace_id,
+                "episode_id": episode_id,
+                "expected_version": 1,
+                "request_key": "close-episode"
+            }),
+        )
+        .await;
+        assert_eq!(closed["isError"], false);
+        assert_eq!(closed["structuredContent"]["status"], "closed");
+
+        let listed = call_tool(
+            &server,
+            "episode_list",
+            json!({ "workspace_id": workspace_id, "session_id": session_id, "limit": 1 }),
+        )
+        .await;
+        assert_eq!(listed["isError"], false);
+        assert_eq!(listed["structuredContent"][0]["id"], episode_id);
+
+        let oversized = call_tool(
+            &server,
+            "episode_add_events",
+            json!({
+                "workspace_id": workspace_id,
+                "episode_id": episode_id,
+                "expected_version": 2,
+                "request_key": "too-many-events",
+                "event_ids": vec!["event"; MAX_EPISODE_EVENTS + 1]
+            }),
+        )
+        .await;
+        assert_eq!(oversized["isError"], true);
+
+        let search = call_tool(
+            &server,
+            "experience_search",
+            json!({ "workspace_id": workspace_id, "limit": 1 }),
+        )
+        .await;
+        assert_eq!(search["isError"], false);
+        assert_eq!(search["structuredContent"], json!([]));
+        let incomplete_mutation = call_tool(
+            &server,
+            "experience_consolidate",
+            json!({ "workspace_id": workspace_id, "episode_id": episode_id }),
+        )
+        .await;
+        assert_eq!(incomplete_mutation["isError"], true);
     }
 
     #[tokio::test]

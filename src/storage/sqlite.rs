@@ -73,6 +73,53 @@ impl SqliteStorage {
         sqlx::query("SELECT COUNT(*) FROM memory_fts")
             .execute(&self.pool)
             .await?;
+        sqlx::query("SELECT COUNT(*) FROM experience_fts")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Verifies the v0.5 episode and Experience persistence surface without
+    /// interpreting historical records or mutating durable state.
+    pub async fn experience_health_check(&self) -> Result<()> {
+        for table in [
+            "episodes",
+            "episode_events",
+            "episode_mutation_requests",
+            "experiences",
+            "experience_verifications",
+            "experience_attempts",
+            "experience_evidence",
+            "experience_code_snapshots",
+            "experience_graph_snapshots",
+            "experience_strength_bases",
+            "experience_assessments",
+            "experience_assessment_evidence",
+            "experience_fts",
+        ] {
+            sqlx::query(&format!("SELECT COUNT(*) FROM {table}"))
+                .execute(&self.pool)
+                .await?;
+        }
+        let missing_fts_projection: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM experiences experience LEFT JOIN experience_fts fts ON fts.experience_id = experience.id WHERE fts.experience_id IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if missing_fts_projection != 0 {
+            return Err(crate::CortexError::Analysis(format!(
+                "{missing_fts_projection} Experience rows are missing FTS projections"
+            )));
+        }
+        let foreign_key_violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&self.pool)
+                .await?;
+        if !foreign_key_violations.is_empty() {
+            return Err(crate::CortexError::Analysis(
+                "episode or Experience foreign-key integrity check failed".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -280,7 +327,7 @@ mod tests {
                 .fetch_all(upgraded.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     }
 
     #[tokio::test]
@@ -319,7 +366,7 @@ mod tests {
                 .fetch_all(upgraded.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         assert_eq!(
             upgraded.recent_memories(&workspace.id, 10).await.unwrap(),
             vec![memory]
@@ -332,6 +379,47 @@ mod tests {
         assert_eq!(revision.content_revision, 1);
         assert_eq!(revision.graph_content_revision, 0);
         assert_eq!(revision.graph_state, GraphState::Stale);
+    }
+
+    #[tokio::test]
+    async fn migration_0006_adds_episode_tables_without_fabricating_legacy_membership() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cortexweave.sqlite");
+        let legacy = storage_at_migration(&path, 6).await;
+        let workspace = Workspace::new("C:/episode-upgrade", "episode-upgrade");
+        legacy.insert_workspace(&workspace).await.unwrap();
+        let session = Session::new(&workspace.id, serde_json::json!({}));
+        legacy.insert_session(&session).await.unwrap();
+        let mut event = CortexEvent::new(
+            &workspace.id,
+            crate::domain::EventType::CompilerResult,
+            serde_json::json!({"ok": false}),
+        );
+        event.session_id = Some(session.id);
+        legacy.insert_event(&event).await.unwrap();
+        legacy.pool.close().await;
+
+        let upgraded = SqliteStorage::open(&path).await.unwrap();
+        upgraded.experience_health_check().await.unwrap();
+        assert_eq!(
+            upgraded.recent_events(&workspace.id, 10).await.unwrap(),
+            vec![event]
+        );
+        let episodes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM episodes")
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+        let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM episode_events")
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+        assert_eq!(episodes, 0);
+        assert_eq!(members, 0);
+        let experiences: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM experiences")
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+        assert_eq!(experiences, 0, "legacy events do not fabricate experiences");
     }
 
     #[tokio::test]

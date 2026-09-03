@@ -3,7 +3,12 @@ use std::{
     time::Duration,
 };
 
-use crate::domain::{ContextPacket, ContextSourceType};
+use serde::Serialize;
+
+use crate::{
+    Result,
+    domain::{ContextPacket, ContextSourceType},
+};
 
 #[derive(Debug, Clone)]
 pub struct ContextEvaluationCase {
@@ -27,6 +32,49 @@ pub struct ContextEvaluationMetrics {
     pub current_source_accuracy: f64,
     pub resume_context_accuracy: f64,
     pub average_selection_latency: Duration,
+}
+
+/// Stable, timestamp-free wire representation for deterministic evaluation
+/// artifacts. Runtime duration is normalized to integer microseconds so reports
+/// do not depend on platform-specific `Duration` serialization.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContextEvaluationReport {
+    pub schema_version: &'static str,
+    pub case_count: usize,
+    pub context_recall: f64,
+    pub context_precision: f64,
+    pub mean_reciprocal_rank: f64,
+    pub token_utilization: f64,
+    pub duplicate_token_ratio: f64,
+    pub current_source_accuracy: f64,
+    pub resume_context_accuracy: f64,
+    pub average_selection_latency_micros: u64,
+}
+
+impl From<&ContextEvaluationMetrics> for ContextEvaluationReport {
+    fn from(metrics: &ContextEvaluationMetrics) -> Self {
+        Self {
+            schema_version: "cortexweave.context-evaluation-report.v1",
+            case_count: metrics.case_count,
+            context_recall: metrics.context_recall,
+            context_precision: metrics.context_precision,
+            mean_reciprocal_rank: metrics.mean_reciprocal_rank,
+            token_utilization: metrics.token_utilization,
+            duplicate_token_ratio: metrics.duplicate_token_ratio,
+            current_source_accuracy: metrics.current_source_accuracy,
+            resume_context_accuracy: metrics.resume_context_accuracy,
+            average_selection_latency_micros: metrics
+                .average_selection_latency
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64,
+        }
+    }
+}
+
+pub fn serialize_context_evaluation_report(metrics: &ContextEvaluationMetrics) -> Result<String> {
+    Ok(serde_json::to_string_pretty(
+        &ContextEvaluationReport::from(metrics),
+    )?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -395,6 +443,11 @@ mod tests {
         assert_eq!(metrics.resume_context_accuracy, 1.0);
         assert_eq!(metrics.token_utilization, 0.3);
         assert_eq!(metrics.average_selection_latency, Duration::from_micros(50));
+        let first = serialize_context_evaluation_report(&metrics).unwrap();
+        let second = serialize_context_evaluation_report(&metrics).unwrap();
+        assert_eq!(first, second);
+        assert!(first.contains("cortexweave.context-evaluation-report.v1"));
+        assert!(first.contains("average_selection_latency_micros"));
     }
 
     #[test]

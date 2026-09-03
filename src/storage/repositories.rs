@@ -1,17 +1,21 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{FromRow, QueryBuilder, Sqlite, Transaction};
+use sqlx::{FromRow, QueryBuilder, Row, Sqlite, Transaction};
 
 use crate::{
     CortexError, Result,
     domain::{
-        Checkpoint, ContextPin, ContextSourceType, CortexEvent, Document, EmbeddingRecord,
-        EventType, GraphAnalysisExpectation, GraphAnalysisState, GraphEdge, GraphEdgeType,
-        GraphNode, GraphNodeType, GraphProjectionManifest, GraphRelationshipFact,
-        GraphRepairGeneration, GraphRepairMode, GraphRepairState, GraphState, MemoryClaim,
-        MemoryKind, MemoryOrigin, MemoryRecord, MemorySupersession, MemoryTrust, MemoryTrustReview,
+        Checkpoint, ConsolidationInputIdentity, ConsolidationInputMember, ContextPin,
+        ContextSourceType, CortexEvent, Document, EmbeddingRecord, Episode, EpisodeEvent,
+        EpisodeEventAssociationRequest, EpisodeListRequest, EpisodeStatus, EpisodeTerminalRequest,
+        EventType, Experience, ExperienceAssessment, ExperienceAttempt, ExperienceCodeSnapshot,
+        ExperienceEvidenceLink, ExperienceGraphSnapshot, ExperienceRecord,
+        GraphAnalysisExpectation, GraphAnalysisState, GraphEdge, GraphEdgeType, GraphNode,
+        GraphNodeType, GraphProjectionManifest, GraphRelationshipFact, GraphRepairGeneration,
+        GraphRepairMode, GraphRepairState, GraphState, MAX_EPISODE_EVENTS, MemoryClaim, MemoryKind,
+        MemoryOrigin, MemoryRecord, MemorySupersession, MemoryTrust, MemoryTrustReview,
         RelationshipTargetKind, Session, SourceSegment, StoredChunk, SymbolKind, Task, TaskStatus,
         TemporalBounds, UnresolvedRelationship, WorkingSetEntry, Workspace, WorkspaceGraphRevision,
     },
@@ -25,6 +29,26 @@ pub(crate) struct SemanticCandidate {
     pub workspace_id: String,
     pub relative_path: String,
     pub vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExperienceSearchCandidates {
+    pub exact_signature: Vec<String>,
+    pub compatible_components: Vec<String>,
+    pub lexical: Vec<String>,
+    pub path: Vec<String>,
+    pub graph_stable_key: Vec<String>,
+    pub recent: Vec<String>,
+}
+
+pub(crate) struct ExperienceCandidateQuery<'a> {
+    pub workspace_id: &'a str,
+    pub exact_failure_key: Option<&'a str>,
+    pub components: &'a BTreeMap<String, String>,
+    pub lexical_query: Option<&'a str>,
+    pub path: Option<&'a str>,
+    pub graph_stable_key: Option<&'a str>,
+    pub limit: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +106,18 @@ pub(crate) enum GraphReconciliationStatus {
     Current,
     Stale,
     Superseded,
+}
+
+struct EpisodeMutation {
+    workspace_id: String,
+    episode_id: String,
+    expected_version: u64,
+    request_key: String,
+    operation: &'static str,
+    request_hash: String,
+    event_ids: Option<Vec<String>>,
+    terminal_status: Option<EpisodeStatus>,
+    occurred_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -860,6 +896,7 @@ impl SqliteStorage {
     }
 
     pub async fn insert_event(&self, event: &CortexEvent) -> Result<()> {
+        let mut transaction = self.pool().begin().await?;
         sqlx::query(
             "INSERT INTO events(id, workspace_id, session_id, task_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
@@ -870,8 +907,21 @@ impl SqliteStorage {
         .bind(event.event_type.storage_name())
         .bind(serde_json::to_string(&event.payload)?)
         .bind(event.created_at)
-        .execute(self.pool())
+        .execute(&mut *transaction)
         .await?;
+        // Upgrade fixtures deliberately exercise pre-v0.5 schemas. Production
+        // opens run every migration first; only those legacy test schemas lack
+        // this frontier table and therefore retain no false ordering claim.
+        if historical_frontier_schema_available(&mut transaction).await? {
+            insert_historical_write_order(
+                &mut transaction,
+                &event.workspace_id,
+                "event",
+                &event.id,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -888,6 +938,849 @@ impl SqliteStorage {
         .fetch_all(self.pool())
         .await?;
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn event(&self, workspace_id: &str, event_id: &str) -> Result<Option<CortexEvent>> {
+        let row = sqlx::query_as::<_, EventRow>(
+            "SELECT id, workspace_id, session_id, task_id, event_type, payload_json, created_at FROM events WHERE workspace_id = ? AND id = ?",
+        )
+        .bind(workspace_id)
+        .bind(event_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
+    /// Persists one fully-formed immutable historical record. This is a
+    /// storage primitive for the later consolidator; it neither extracts an
+    /// interpretation nor changes source events.
+    #[allow(dead_code)] // Phase 5's internal consolidator will become the production caller.
+    pub(crate) async fn insert_experience(
+        &self,
+        record: &ExperienceRecord,
+    ) -> Result<ExperienceRecord> {
+        self.insert_experience_checked(record, None, None).await
+    }
+
+    /// Consolidation acceptance rechecks the exact episode membership frontier
+    /// while its immutable record is inserted in the same SQLite transaction.
+    pub(crate) async fn insert_consolidated_experience(
+        &self,
+        record: &ExperienceRecord,
+        expected_episode_version: u64,
+        input_identity: &ConsolidationInputIdentity,
+    ) -> Result<ExperienceRecord> {
+        self.insert_experience_checked(record, Some(expected_episode_version), Some(input_identity))
+            .await
+    }
+
+    async fn insert_experience_checked(
+        &self,
+        record: &ExperienceRecord,
+        expected_episode_version: Option<u64>,
+        expected_input_identity: Option<&ConsolidationInputIdentity>,
+    ) -> Result<ExperienceRecord> {
+        validate_experience_record(record)?;
+        let experience = &record.experience;
+        // A consolidation reads its immutable input before becoming a writer.
+        // SQLite's deferred transactions can both read and then deadlock while
+        // upgrading; take the single writer slot up front so concurrent service
+        // instances serialize and the loser performs the idempotent lookup.
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let episode = episode_in_transaction(
+            &mut transaction,
+            &experience.workspace_id,
+            &experience.episode_id,
+        )
+        .await?
+        .ok_or_else(|| CortexError::NotFound(format!("episode {}", experience.episode_id)))?;
+        if let Some(expected_episode_version) = expected_episode_version
+            && episode.version != expected_episode_version
+        {
+            return Err(CortexError::Conflict(
+                "episode changed after consolidation preview".into(),
+            ));
+        }
+        if let Some(expected_input_identity) = expected_input_identity {
+            validate_consolidation_input_in_transaction(
+                &mut transaction,
+                experience,
+                expected_input_identity,
+            )
+            .await?;
+        }
+        if !matches!(
+            episode.status,
+            EpisodeStatus::Closed | EpisodeStatus::Abandoned
+        ) {
+            return Err(CortexError::Analysis(
+                "an experience requires a closed or explicitly abandoned episode".into(),
+            ));
+        }
+        if episode.session_id != experience.session_id || episode.task_id != experience.task_id {
+            return Err(CortexError::Analysis(
+                "experience scope must exactly match its episode".into(),
+            ));
+        }
+        if episode.status == EpisodeStatus::Abandoned
+            && !matches!(
+                experience.outcome,
+                crate::domain::ExperienceOutcome::Failure
+                    | crate::domain::ExperienceOutcome::Abandoned
+            )
+        {
+            return Err(CortexError::Analysis(
+                "an abandoned episode may support only a failed or abandoned experience".into(),
+            ));
+        }
+        if episode.status == EpisodeStatus::Closed
+            && experience.outcome == crate::domain::ExperienceOutcome::Abandoned
+        {
+            return Err(CortexError::Analysis(
+                "an abandoned experience requires an explicitly abandoned episode".into(),
+            ));
+        }
+        if let Some(existing) = experience_by_fingerprint_in_transaction(
+            &mut transaction,
+            &experience.workspace_id,
+            &experience.consolidation_fingerprint,
+        )
+        .await?
+        {
+            if existing.proposal_hash != experience.proposal_hash {
+                return Err(CortexError::Conflict(
+                    "consolidation fingerprint already has a different material proposal".into(),
+                ));
+            }
+            let existing = experience_record_in_transaction(
+                &mut transaction,
+                &experience.workspace_id,
+                &existing.id,
+            )
+            .await?
+            .ok_or_else(|| {
+                CortexError::Storage(sqlx::Error::Decode(
+                    "experience disappeared during idempotent lookup".into(),
+                ))
+            })?;
+            transaction.commit().await?;
+            return Ok(existing);
+        }
+
+        insert_experience_row(&mut transaction, experience).await?;
+        for link in &record.evidence {
+            insert_experience_evidence(
+                &mut transaction,
+                &experience.workspace_id,
+                &experience.id,
+                link,
+            )
+            .await?;
+        }
+        for observation in &experience.verification.observations {
+            insert_experience_verification(
+                &mut transaction,
+                &experience.workspace_id,
+                &experience.id,
+                observation,
+            )
+            .await?;
+        }
+        for attempt in &record.attempts {
+            insert_experience_attempt(&mut transaction, attempt).await?;
+        }
+        for snapshot in &record.code_snapshots {
+            insert_experience_code_snapshot(
+                &mut transaction,
+                &experience.workspace_id,
+                &experience.id,
+                snapshot,
+            )
+            .await?;
+        }
+        for snapshot in &record.graph_snapshots {
+            insert_experience_graph_snapshot(
+                &mut transaction,
+                &experience.workspace_id,
+                &experience.id,
+                snapshot,
+            )
+            .await?;
+        }
+        for (ordinal, basis) in experience.evidence_strength.bases.iter().enumerate() {
+            sqlx::query("INSERT INTO experience_strength_bases(workspace_id, experience_id, ordinal, basis) VALUES (?, ?, ?, ?)")
+                .bind(&experience.workspace_id).bind(&experience.id).bind(ordinal_to_i64(ordinal as u64)?).bind(basis.as_str())
+                .execute(&mut *transaction).await?;
+        }
+        let acceptance_order = insert_historical_write_order(
+            &mut transaction,
+            &experience.workspace_id,
+            "experience_acceptance",
+            &experience.id,
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO experience_seals(workspace_id, experience_id, acceptance_order) VALUES (?, ?, ?)",
+        )
+        .bind(&experience.workspace_id)
+        .bind(&experience.id)
+        .bind(acceptance_order)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(record.clone())
+    }
+
+    /// Returns true only when SQLite durably observed every Event after the
+    /// Experience acceptance frontier. Legacy rows have no provable frontier
+    /// and therefore fail closed.
+    pub(crate) async fn events_ingressed_after_experience(
+        &self,
+        workspace_id: &str,
+        experience_id: &str,
+        event_ids: &[String],
+    ) -> Result<bool> {
+        if event_ids.is_empty() {
+            return Ok(false);
+        }
+        let acceptance_order = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT acceptance_order FROM experience_seals WHERE workspace_id = ? AND experience_id = ?",
+        )
+        .bind(workspace_id)
+        .bind(experience_id)
+        .fetch_optional(self.pool())
+        .await?
+        .flatten();
+        let Some(acceptance_order) = acceptance_order else {
+            return Ok(false);
+        };
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT sequence FROM historical_write_order WHERE workspace_id = ",
+        );
+        query
+            .push_bind(workspace_id)
+            .push(" AND entity_kind = 'event' AND entity_id IN (");
+        {
+            let mut separated = query.separated(", ");
+            for event_id in event_ids {
+                separated.push_bind(event_id);
+            }
+        }
+        query.push(")");
+        let orders = query
+            .build_query_scalar::<i64>()
+            .fetch_all(self.pool())
+            .await?;
+        Ok(orders.len() == event_ids.len()
+            && orders
+                .into_iter()
+                .all(|event_order| event_order > acceptance_order))
+    }
+
+    pub async fn experience(
+        &self,
+        workspace_id: &str,
+        experience_id: &str,
+    ) -> Result<Option<ExperienceRecord>> {
+        let mut transaction = self.pool().begin().await?;
+        let result =
+            experience_record_in_transaction(&mut transaction, workspace_id, experience_id).await?;
+        transaction.commit().await?;
+        Ok(result)
+    }
+
+    /// Returns bounded identifiers from independent deterministic candidate
+    /// sources. The service performs all semantic filtering and scoring after
+    /// loading immutable records.
+    pub(crate) async fn experience_search_candidates(
+        &self,
+        query: ExperienceCandidateQuery<'_>,
+    ) -> Result<ExperienceSearchCandidates> {
+        let limit = memory_limit(query.limit)?;
+        let exact_signature = match query.exact_failure_key {
+            Some(key) => experience_search_ids(self, query.workspace_id,
+                "SELECT id FROM experiences WHERE workspace_id = ? AND failure_key = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+                key,
+                limit,
+            )
+            .await?,
+            None => Vec::new(),
+        };
+        let mut compatible_components = Vec::new();
+        for (name, value) in query.components {
+            let token = format!("{name}:{value}");
+            compatible_components.extend(
+                experience_search_ids(self, query.workspace_id,
+                    "SELECT id FROM experiences WHERE workspace_id = ? AND instr(failure_components, ?) > 0 ORDER BY created_at DESC, id DESC LIMIT ?",
+                    &token,
+                    limit,
+                )
+                .await?,
+            );
+        }
+        let lexical = match query.lexical_query {
+            Some(value) if !value.is_empty() => experience_search_ids(self, query.workspace_id,
+                "SELECT experience.id FROM experience_fts fts JOIN experiences experience ON experience.id = fts.experience_id WHERE experience.workspace_id = ? AND experience_fts MATCH ? ORDER BY bm25(experience_fts), experience.created_at DESC, experience.id DESC LIMIT ?",
+                value,
+                limit,
+            )
+            .await?,
+            _ => Vec::new(),
+        };
+        let path_ids = match query.path {
+            Some(path) => sqlx::query_scalar::<_, String>(
+                "SELECT DISTINCT experience.id FROM experiences experience LEFT JOIN experience_code_snapshots snapshot ON snapshot.workspace_id = experience.workspace_id AND snapshot.experience_id = experience.id WHERE experience.workspace_id = ? AND (experience.failure_path = ? OR snapshot.relative_path = ?) ORDER BY experience.created_at DESC, experience.id DESC LIMIT ?",
+            )
+            .bind(query.workspace_id)
+            .bind(path)
+            .bind(path)
+            .bind(limit)
+            .fetch_all(self.pool())
+            .await?,
+            None => Vec::new(),
+        };
+        let graph_ids = match query.graph_stable_key {
+            Some(key) => experience_search_ids(self, query.workspace_id,
+                "SELECT DISTINCT experience.id FROM experiences experience JOIN experience_graph_snapshots snapshot ON snapshot.workspace_id = experience.workspace_id AND snapshot.experience_id = experience.id WHERE experience.workspace_id = ? AND snapshot.node_stable_key = ? ORDER BY experience.created_at DESC, experience.id DESC LIMIT ?",
+                key,
+                limit,
+            )
+            .await?,
+            None => Vec::new(),
+        };
+        let recent = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM experiences WHERE workspace_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(query.workspace_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ExperienceSearchCandidates {
+            exact_signature,
+            compatible_components,
+            lexical,
+            path: path_ids,
+            graph_stable_key: graph_ids,
+            recent,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn append_experience_assessment(
+        &self,
+        assessment: &ExperienceAssessment,
+    ) -> Result<()> {
+        validate_assessment(assessment)?;
+        let mut transaction = self.pool().begin().await?;
+        sqlx::query("INSERT INTO experience_assessments(id, workspace_id, experience_id, kind, actor, reason, replacement_experience_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&assessment.id).bind(&assessment.workspace_id).bind(&assessment.experience_id)
+            .bind(assessment.kind.as_str()).bind(&assessment.actor).bind(&assessment.reason)
+            .bind(&assessment.replacement_experience_id).bind(assessment.created_at)
+            .execute(&mut *transaction).await?;
+        for (ordinal, event_id) in assessment.evidence_event_ids.iter().enumerate() {
+            sqlx::query("INSERT INTO experience_assessment_evidence(workspace_id, assessment_id, ordinal, event_id) VALUES (?, ?, ?, ?)")
+                .bind(&assessment.workspace_id).bind(&assessment.id).bind(ordinal_to_i64(ordinal as u64)?).bind(event_id)
+                .execute(&mut *transaction).await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Appends a public reviewed assessment exactly once for its caller key.
+    /// The unique index remains the concurrency backstop; a sequential retry
+    /// returns the original immutable assessment instead of a new review row.
+    pub(crate) async fn append_reviewed_experience_assessment(
+        &self,
+        assessment: &ExperienceAssessment,
+        request_key: &str,
+        request_hash: &str,
+    ) -> Result<ExperienceAssessment> {
+        validate_assessment(assessment)?;
+        let mut transaction = self.pool().begin().await?;
+        let existing = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, request_hash FROM experience_assessments WHERE workspace_id = ? AND experience_id = ? AND request_key = ?",
+        )
+        .bind(&assessment.workspace_id)
+        .bind(&assessment.experience_id)
+        .bind(request_key)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some((id, existing_hash)) = existing {
+            if existing_hash != request_hash {
+                return Err(CortexError::Conflict(
+                    "experience assessment request key was reused with different review content"
+                        .into(),
+                ));
+            }
+            transaction.commit().await?;
+            return self
+                .experience_assessment_by_id(&assessment.workspace_id, &id)
+                .await?
+                .ok_or_else(|| CortexError::Storage(sqlx::Error::RowNotFound));
+        }
+        sqlx::query("INSERT INTO experience_assessments(id, workspace_id, experience_id, kind, actor, reason, replacement_experience_id, created_at, request_key, request_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&assessment.id).bind(&assessment.workspace_id).bind(&assessment.experience_id)
+            .bind(assessment.kind.as_str()).bind(&assessment.actor).bind(&assessment.reason)
+            .bind(&assessment.replacement_experience_id).bind(assessment.created_at)
+            .bind(request_key).bind(request_hash)
+            .execute(&mut *transaction).await?;
+        for (ordinal, event_id) in assessment.evidence_event_ids.iter().enumerate() {
+            sqlx::query("INSERT INTO experience_assessment_evidence(workspace_id, assessment_id, ordinal, event_id) VALUES (?, ?, ?, ?)")
+                .bind(&assessment.workspace_id).bind(&assessment.id).bind(ordinal_to_i64(ordinal as u64)?).bind(event_id)
+                .execute(&mut *transaction).await?;
+        }
+        transaction.commit().await?;
+        Ok(assessment.clone())
+    }
+
+    async fn experience_assessment_by_id(
+        &self,
+        workspace_id: &str,
+        assessment_id: &str,
+    ) -> Result<Option<ExperienceAssessment>> {
+        let row = sqlx::query_as::<_, ExperienceAssessmentRow>(
+            "SELECT id, workspace_id, experience_id, kind, actor, reason, replacement_experience_id, created_at FROM experience_assessments WHERE workspace_id = ? AND id = ?",
+        )
+        .bind(workspace_id)
+        .bind(assessment_id)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let evidence_event_ids = sqlx::query_scalar::<_, String>(
+            "SELECT event_id FROM experience_assessment_evidence WHERE workspace_id = ? AND assessment_id = ? ORDER BY ordinal ASC",
+        )
+        .bind(workspace_id)
+        .bind(assessment_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(Some(ExperienceAssessment {
+            id: row.id,
+            workspace_id: row.workspace_id,
+            experience_id: row.experience_id,
+            kind: crate::domain::ExperienceAssessmentKind::from_storage(&row.kind),
+            actor: row.actor,
+            reason: row.reason,
+            replacement_experience_id: row.replacement_experience_id,
+            evidence_event_ids,
+            created_at: row.created_at,
+        }))
+    }
+
+    pub async fn experience_assessments(
+        &self,
+        workspace_id: &str,
+        experience_id: &str,
+    ) -> Result<Vec<ExperienceAssessment>> {
+        Ok(self
+            .experience_assessment_page(
+                workspace_id,
+                experience_id,
+                None,
+                crate::domain::MAX_EXPERIENCE_ASSESSMENT_PAGE_LIMIT,
+            )
+            .await?
+            .assessments)
+    }
+
+    pub async fn experience_assessment_page(
+        &self,
+        workspace_id: &str,
+        experience_id: &str,
+        after: Option<&crate::domain::ExperienceAssessmentCursor>,
+        limit: usize,
+    ) -> Result<crate::domain::ExperienceAssessmentPage> {
+        if limit == 0 || limit > crate::domain::MAX_EXPERIENCE_ASSESSMENT_PAGE_LIMIT {
+            return Err(CortexError::Analysis(format!(
+                "experience assessment page limit must be between 1 and {}",
+                crate::domain::MAX_EXPERIENCE_ASSESSMENT_PAGE_LIMIT
+            )));
+        }
+        let sql = if after.is_some() {
+            "SELECT id, workspace_id, experience_id, kind, actor, reason, replacement_experience_id, created_at FROM experience_assessments WHERE workspace_id = ? AND experience_id = ? AND (created_at < ? OR (created_at = ? AND id < ?)) ORDER BY created_at DESC, id DESC LIMIT ?"
+        } else {
+            "SELECT id, workspace_id, experience_id, kind, actor, reason, replacement_experience_id, created_at FROM experience_assessments WHERE workspace_id = ? AND experience_id = ? ORDER BY created_at DESC, id DESC LIMIT ?"
+        };
+        let mut query = sqlx::query_as::<_, ExperienceAssessmentRow>(sql)
+            .bind(workspace_id)
+            .bind(experience_id);
+        if let Some(after) = after {
+            query = query
+                .bind(after.created_at)
+                .bind(after.created_at)
+                .bind(&after.id);
+        }
+        let rows = query
+            .bind(i64::try_from(limit + 1).expect("bounded limit"))
+            .fetch_all(self.pool())
+            .await?;
+        let has_more = rows.len() > limit;
+        let rows = rows.into_iter().take(limit).collect::<Vec<_>>();
+        let ids: Vec<_> = rows.iter().map(|row| row.id.as_str()).collect();
+        let mut evidence_by_assessment: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if !ids.is_empty() {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT assessment_id, event_id FROM experience_assessment_evidence WHERE workspace_id = ",
+            );
+            query
+                .push_bind(workspace_id)
+                .push(" AND assessment_id IN (");
+            {
+                let mut separated = query.separated(", ");
+                for id in &ids {
+                    separated.push_bind(id);
+                }
+            }
+            query.push(") ORDER BY assessment_id ASC, ordinal ASC");
+            for row in query.build().fetch_all(self.pool()).await? {
+                evidence_by_assessment
+                    .entry(row.try_get("assessment_id")?)
+                    .or_default()
+                    .push(row.try_get("event_id")?);
+            }
+        }
+        let assessments = rows
+            .into_iter()
+            .map(|row| ExperienceAssessment {
+                evidence_event_ids: evidence_by_assessment.remove(&row.id).unwrap_or_default(),
+                id: row.id,
+                workspace_id: row.workspace_id,
+                experience_id: row.experience_id,
+                kind: crate::domain::ExperienceAssessmentKind::from_storage(&row.kind),
+                actor: row.actor,
+                reason: row.reason,
+                replacement_experience_id: row.replacement_experience_id,
+                created_at: row.created_at,
+            })
+            .collect::<Vec<_>>();
+        let next_cursor = has_more.then(|| {
+            let last = assessments
+                .last()
+                .expect("non-empty page with a next cursor");
+            crate::domain::ExperienceAssessmentCursor {
+                created_at: last.created_at,
+                id: last.id.clone(),
+            }
+        });
+        Ok(crate::domain::ExperienceAssessmentPage {
+            assessments,
+            next_cursor,
+        })
+    }
+
+    /// Projects lifecycle in SQLite without materializing the unbounded
+    /// append-only assessment ledger. Negative assessments remain terminal for
+    /// ordinary context eligibility even when they are older than a display page.
+    pub(crate) async fn experience_lifecycle(
+        &self,
+        workspace_id: &str,
+        experience_id: &str,
+    ) -> Result<crate::domain::ExperienceLifecycle> {
+        let lifecycle = sqlx::query_scalar::<_, String>(
+            "SELECT CASE
+                WHEN EXISTS (SELECT 1 FROM experience_assessments WHERE workspace_id = ? AND experience_id = ? AND kind = 'superseded') THEN 'superseded'
+                WHEN EXISTS (SELECT 1 FROM experience_assessments WHERE workspace_id = ? AND experience_id = ? AND kind = 'refuted') THEN 'refuted'
+                WHEN EXISTS (SELECT 1 FROM experience_assessments WHERE workspace_id = ? AND experience_id = ? AND kind = 'disputed') THEN 'disputed'
+                ELSE 'active' END",
+        )
+        .bind(workspace_id)
+        .bind(experience_id)
+        .bind(workspace_id)
+        .bind(experience_id)
+        .bind(workspace_id)
+        .bind(experience_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(match lifecycle.as_str() {
+            "superseded" => crate::domain::ExperienceLifecycle::Superseded,
+            "refuted" => crate::domain::ExperienceLifecycle::Refuted,
+            "disputed" => crate::domain::ExperienceLifecycle::Disputed,
+            _ => crate::domain::ExperienceLifecycle::Active,
+        })
+    }
+
+    pub async fn insert_episode(&self, episode: &Episode) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO episodes(id, workspace_id, session_id, task_id, episode_type, status, title, created_by, version, started_at, ended_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&episode.id)
+        .bind(&episode.workspace_id)
+        .bind(&episode.session_id)
+        .bind(&episode.task_id)
+        .bind(episode.episode_type.as_str())
+        .bind(episode.status.as_str())
+        .bind(&episode.title)
+        .bind(episode.created_by.as_str())
+        .bind(episode_version(episode.version)?)
+        .bind(episode.started_at)
+        .bind(episode.ended_at)
+        .bind(episode.created_at)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn episode(&self, workspace_id: &str, episode_id: &str) -> Result<Option<Episode>> {
+        let row = sqlx::query_as::<_, EpisodeRow>(
+            "SELECT id, workspace_id, session_id, task_id, episode_type, status, title, created_by, version, started_at, ended_at, created_at FROM episodes WHERE workspace_id = ? AND id = ?",
+        )
+        .bind(workspace_id)
+        .bind(episode_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn list_episodes(&self, request: &EpisodeListRequest) -> Result<Vec<Episode>> {
+        let rows = sqlx::query_as::<_, EpisodeRow>(
+            "SELECT id, workspace_id, session_id, task_id, episode_type, status, title, created_by, version, started_at, ended_at, created_at FROM episodes WHERE workspace_id = ? AND (? IS NULL OR session_id = ?) AND (? IS NULL OR task_id = ?) ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(&request.workspace_id)
+        .bind(&request.session_id)
+        .bind(&request.session_id)
+        .bind(&request.task_id)
+        .bind(&request.task_id)
+        .bind(memory_limit(request.limit)?)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn episode_events(
+        &self,
+        workspace_id: &str,
+        episode_id: &str,
+        limit: usize,
+    ) -> Result<Vec<EpisodeEvent>> {
+        let rows = sqlx::query_as::<_, EpisodeEventRow>(
+            "SELECT workspace_id, episode_id, event_id, ordinal, associated_at FROM episode_events WHERE workspace_id = ? AND episode_id = ? ORDER BY ordinal ASC LIMIT ?",
+        )
+        .bind(workspace_id)
+        .bind(episode_id)
+        .bind(memory_limit(limit)?)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn associate_episode_events(
+        &self,
+        request: &EpisodeEventAssociationRequest,
+        request_hash: &str,
+        associated_at: DateTime<Utc>,
+    ) -> Result<Episode> {
+        self.mutate_episode(EpisodeMutation {
+            workspace_id: request.workspace_id.clone(),
+            episode_id: request.episode_id.clone(),
+            expected_version: request.expected_version,
+            request_key: request.request_key.clone(),
+            operation: "add_events",
+            request_hash: request_hash.to_owned(),
+            event_ids: Some(request.event_ids.clone()),
+            terminal_status: None,
+            occurred_at: associated_at,
+        })
+        .await
+    }
+
+    pub async fn transition_episode(
+        &self,
+        request: &EpisodeTerminalRequest,
+        status: EpisodeStatus,
+        request_hash: &str,
+        ended_at: DateTime<Utc>,
+    ) -> Result<Episode> {
+        debug_assert!(status.is_terminal());
+        let operation = match status {
+            EpisodeStatus::Closed => "close",
+            EpisodeStatus::Abandoned => "abandon",
+            EpisodeStatus::Open | EpisodeStatus::Invalid => {
+                return Err(CortexError::Analysis(
+                    "only close or abandon is supported by the v0.5 episode facade".into(),
+                ));
+            }
+        };
+        self.mutate_episode(EpisodeMutation {
+            workspace_id: request.workspace_id.clone(),
+            episode_id: request.episode_id.clone(),
+            expected_version: request.expected_version,
+            request_key: request.request_key.clone(),
+            operation,
+            request_hash: request_hash.to_owned(),
+            event_ids: None,
+            terminal_status: Some(status),
+            occurred_at: ended_at,
+        })
+        .await
+    }
+
+    async fn mutate_episode(&self, mutation: EpisodeMutation) -> Result<Episode> {
+        let workspace_id = mutation.workspace_id.as_str();
+        let episode_id = mutation.episode_id.as_str();
+        let request_key = mutation.request_key.as_str();
+        let operation = mutation.operation;
+        let request_hash = mutation.request_hash.as_str();
+        let event_ids = mutation.event_ids.as_deref();
+        let terminal_status = mutation.terminal_status;
+        let occurred_at = mutation.occurred_at;
+        let expected_version = episode_version(mutation.expected_version)?;
+        let resulting_version = expected_version.checked_add(1).ok_or_else(|| {
+            CortexError::Conflict("episode version cannot exceed SQLite integer range".into())
+        })?;
+        let mut transaction = self.pool().begin().await?;
+
+        if let Some(existing) =
+            episode_mutation_request(&mut transaction, workspace_id, episode_id, request_key)
+                .await?
+        {
+            if existing.operation != operation || existing.request_hash != request_hash {
+                return Err(CortexError::Conflict(format!(
+                    "episode mutation request key {request_key} was already used with different content"
+                )));
+            }
+            let episode = episode_in_transaction(&mut transaction, workspace_id, episode_id)
+                .await?
+                .ok_or_else(|| CortexError::NotFound(format!("episode {episode_id}")))?;
+            if episode.version < episode_result_version(existing.resulting_version)? {
+                return Err(CortexError::Storage(sqlx::Error::Decode(
+                    "episode mutation result version exceeds episode version".into(),
+                )));
+            }
+            transaction.commit().await?;
+            return Ok(episode);
+        }
+
+        let reservation = sqlx::query(
+            "INSERT INTO episode_mutation_requests(workspace_id, episode_id, operation, request_key, request_hash, resulting_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(workspace_id)
+        .bind(episode_id)
+        .bind(operation)
+        .bind(request_key)
+        .bind(request_hash)
+        .bind(resulting_version)
+        .bind(occurred_at)
+        .execute(&mut *transaction)
+        .await;
+        if reservation.is_err() {
+            if let Some(existing) =
+                episode_mutation_request(&mut transaction, workspace_id, episode_id, request_key)
+                    .await?
+            {
+                if existing.operation == operation && existing.request_hash == request_hash {
+                    let episode =
+                        episode_in_transaction(&mut transaction, workspace_id, episode_id)
+                            .await?
+                            .ok_or_else(|| {
+                                CortexError::NotFound(format!("episode {episode_id}"))
+                            })?;
+                    if episode.version < episode_result_version(existing.resulting_version)? {
+                        return Err(CortexError::Storage(sqlx::Error::Decode(
+                            "episode mutation result version exceeds episode version".into(),
+                        )));
+                    }
+                    transaction.commit().await?;
+                    return Ok(episode);
+                }
+                return Err(CortexError::Conflict(format!(
+                    "episode mutation request key {request_key} was already used with different content"
+                )));
+            }
+            return Err(reservation.expect_err("checked reservation error").into());
+        }
+
+        let updated = match terminal_status {
+            Some(status) => sqlx::query(
+                "UPDATE episodes SET status = ?, ended_at = ?, version = ? WHERE workspace_id = ? AND id = ? AND status = 'open' AND version = ?",
+            )
+            .bind(status.as_str())
+            .bind(occurred_at)
+            .bind(resulting_version)
+            .bind(workspace_id)
+            .bind(episode_id)
+            .bind(expected_version)
+            .execute(&mut *transaction)
+            .await?,
+            None => sqlx::query(
+                "UPDATE episodes SET version = ? WHERE workspace_id = ? AND id = ? AND status = 'open' AND version = ?",
+            )
+            .bind(resulting_version)
+            .bind(workspace_id)
+            .bind(episode_id)
+            .bind(expected_version)
+            .execute(&mut *transaction)
+            .await?,
+        };
+        if updated.rows_affected() != 1 {
+            return episode_mutation_conflict(
+                &mut transaction,
+                workspace_id,
+                episode_id,
+                expected_version,
+            )
+            .await;
+        }
+
+        if let Some(event_ids) = event_ids {
+            let ordinal_start: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM episode_events WHERE workspace_id = ? AND episode_id = ?",
+            )
+            .bind(workspace_id)
+            .bind(episode_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            let requested = i64::try_from(event_ids.len()).map_err(|_| {
+                CortexError::Analysis("episode event count exceeds SQLite integer range".into())
+            })?;
+            let total = ordinal_start.checked_add(requested).ok_or_else(|| {
+                CortexError::Analysis("episode event count exceeds SQLite integer range".into())
+            })?;
+            if total > i64::try_from(MAX_EPISODE_EVENTS).expect("episode limit fits i64") {
+                return Err(CortexError::Analysis(format!(
+                    "episode membership cannot exceed {MAX_EPISODE_EVENTS} events"
+                )));
+            }
+            for (index, event_id) in event_ids.iter().enumerate() {
+                let ordinal = ordinal_start
+                    .checked_add(i64::try_from(index).map_err(|_| {
+                        CortexError::Conflict(
+                            "episode event ordinal exceeds SQLite integer range".into(),
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        CortexError::Conflict(
+                            "episode event ordinal exceeds SQLite integer range".into(),
+                        )
+                    })?;
+                let insertion = sqlx::query(
+                    "INSERT INTO episode_events(workspace_id, episode_id, event_id, ordinal, associated_at) VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(workspace_id)
+                .bind(episode_id)
+                .bind(event_id)
+                .bind(ordinal)
+                .bind(occurred_at)
+                .execute(&mut *transaction)
+                .await;
+                if let Err(error) = insertion {
+                    if error
+                        .as_database_error()
+                        .is_some_and(|database| database.is_unique_violation())
+                    {
+                        return Err(CortexError::Conflict(format!(
+                            "event {event_id} already has a primary episode membership"
+                        )));
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+
+        let episode = episode_in_transaction(&mut transaction, workspace_id, episode_id)
+            .await?
+            .ok_or_else(|| CortexError::NotFound(format!("episode {episode_id}")))?;
+        transaction.commit().await?;
+        Ok(episode)
     }
 
     pub(crate) async fn resume_events(
@@ -1038,6 +1931,7 @@ impl SqliteStorage {
             .bind(workspace_id)
             .fetch_optional(self.pool())
             .await?,
+            ContextSourceType::Experience => None,
             ContextSourceType::TaskState => sqlx::query_as::<_, TemporalCandidateRow>(
                 "SELECT id AS source_id, 'task_state' AS source_type, session_id, id AS task_id, title AS content, NULL AS path, NULL AS symbol, NULL AS language, NULL AS start_byte, NULL AS end_byte, created_at, updated_at AS modified_at, 0 AS is_superseded FROM tasks WHERE id = ? AND workspace_id = ?",
             )
@@ -1284,6 +2178,7 @@ impl SqliteStorage {
                 .fetch_one(self.pool())
                 .await?
             }
+            ContextSourceType::Experience => false,
             ContextSourceType::TaskState => {
                 sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ? AND workspace_id = ?)",
@@ -4106,6 +5001,1107 @@ impl TryFrom<EventRow> for CortexEvent {
     }
 }
 
+async fn experience_search_ids(
+    storage: &SqliteStorage,
+    workspace_id: &str,
+    sql: &str,
+    value: &str,
+    limit: i64,
+) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar::<_, String>(sql)
+        .bind(workspace_id)
+        .bind(value)
+        .bind(limit)
+        .fetch_all(storage.pool())
+        .await?)
+}
+
+#[derive(FromRow)]
+struct ExperienceRow {
+    id: String,
+    workspace_id: String,
+    session_id: String,
+    task_id: Option<String>,
+    episode_id: String,
+    failure_signature_json: Option<String>,
+    outcome: String,
+    verification_status: String,
+    verification_reasons_json: String,
+    evidence_strength: String,
+    summary: String,
+    extractor_id: String,
+    extractor_version: String,
+    summary_renderer_version: String,
+    canonicalization_version: String,
+    consolidation_fingerprint: String,
+    proposal_hash: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(FromRow)]
+struct ExperienceVerificationRow {
+    ordinal: i64,
+    status: String,
+    kind: String,
+    subject_kind: String,
+    subject_value: String,
+    evidence_event_id: String,
+    rule_id: String,
+    rule_version: String,
+}
+
+#[derive(FromRow)]
+struct ExperienceAttemptRow {
+    id: String,
+    workspace_id: String,
+    experience_id: String,
+    ordinal: i64,
+    result: String,
+    change_evidence_ordinals_json: String,
+    following_verification_ordinal: Option<i64>,
+}
+
+#[derive(FromRow)]
+struct ExperienceEvidenceRow {
+    ordinal: i64,
+    relation: String,
+    event_id: String,
+}
+
+#[derive(FromRow)]
+struct ExperienceCodeSnapshotRow {
+    ordinal: i64,
+    source_event_id: String,
+    relative_path: String,
+    workspace_content_revision: i64,
+    document_content_revision: i64,
+    document_content_hash: String,
+    content: String,
+    chunk_stable_key: Option<String>,
+    chunk_content_hash: Option<String>,
+    symbol_logical_key: Option<String>,
+    symbol_label: Option<String>,
+    source_start_byte: Option<i64>,
+    source_end_byte: Option<i64>,
+}
+
+#[derive(FromRow)]
+struct ExperienceGraphSnapshotRow {
+    ordinal: i64,
+    code_snapshot_ordinal: i64,
+    graph_content_revision: i64,
+    graph_schema_version: i64,
+    graph_state: String,
+    analyzer_id: String,
+    analyzer_version: String,
+    structure_version: String,
+    node_stable_key: String,
+    node_type: String,
+    resolution_provenance_json: String,
+}
+
+#[derive(FromRow)]
+struct ExperienceAssessmentRow {
+    id: String,
+    workspace_id: String,
+    experience_id: String,
+    kind: String,
+    actor: String,
+    reason: String,
+    replacement_experience_id: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+async fn experience_by_fingerprint_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+    fingerprint: &str,
+) -> Result<Option<ExperienceRow>> {
+    Ok(sqlx::query_as::<_, ExperienceRow>(
+        "SELECT id, workspace_id, session_id, task_id, episode_id, failure_signature_json, outcome, verification_status, verification_reasons_json, evidence_strength, summary, extractor_id, extractor_version, summary_renderer_version, canonicalization_version, consolidation_fingerprint, proposal_hash, created_at FROM experiences WHERE workspace_id = ? AND consolidation_fingerprint = ?",
+    ).bind(workspace_id).bind(fingerprint).fetch_optional(&mut **transaction).await?)
+}
+
+async fn experience_record_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+    experience_id: &str,
+) -> Result<Option<ExperienceRecord>> {
+    let Some(row) = sqlx::query_as::<_, ExperienceRow>(
+        "SELECT id, workspace_id, session_id, task_id, episode_id, failure_signature_json, outcome, verification_status, verification_reasons_json, evidence_strength, summary, extractor_id, extractor_version, summary_renderer_version, canonicalization_version, consolidation_fingerprint, proposal_hash, created_at FROM experiences WHERE workspace_id = ? AND id = ?",
+    ).bind(workspace_id).bind(experience_id).fetch_optional(&mut **transaction).await? else { return Ok(None); };
+    let bases = sqlx::query_scalar::<_, String>("SELECT basis FROM experience_strength_bases WHERE workspace_id = ? AND experience_id = ? ORDER BY ordinal ASC")
+        .bind(workspace_id).bind(experience_id).fetch_all(&mut **transaction).await?
+        .into_iter().map(|value| crate::domain::EvidenceBasis::from_storage(&value)).collect();
+    let failure_signature = row
+        .failure_signature_json
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?;
+    let observations = sqlx::query_as::<_, ExperienceVerificationRow>(
+        "SELECT ordinal, status, kind, subject_kind, subject_value, evidence_event_id, rule_id, rule_version FROM experience_verifications WHERE workspace_id = ? AND experience_id = ? ORDER BY ordinal ASC",
+    ).bind(workspace_id).bind(experience_id).fetch_all(&mut **transaction).await?.into_iter().map(|observation| Ok(crate::domain::ExperienceVerificationObservation {
+        ordinal: ordinal_from_i64(observation.ordinal)?,
+        status: crate::domain::VerificationStatus::from_storage(&observation.status),
+        kind: crate::domain::VerificationKind::from_storage(&observation.kind),
+        subject: crate::domain::VerificationSubject { kind: verification_subject_kind(&observation.subject_kind)?, value: observation.subject_value },
+        evidence_event_id: observation.evidence_event_id, rule_id: observation.rule_id, rule_version: observation.rule_version,
+    })).collect::<Result<Vec<_>>>()?;
+    let experience = Experience {
+        id: row.id,
+        workspace_id: row.workspace_id,
+        session_id: row.session_id,
+        task_id: row.task_id,
+        episode_id: row.episode_id,
+        failure_signature,
+        outcome: crate::domain::ExperienceOutcome::from_storage(&row.outcome),
+        verification: crate::domain::ExperienceVerification {
+            status: crate::domain::VerificationStatus::from_storage(&row.verification_status),
+            observations,
+            reasons: serde_json::from_str(&row.verification_reasons_json)?,
+        },
+        summary: row.summary,
+        evidence_strength: crate::domain::EvidenceStrengthAssessment {
+            strength: crate::domain::EvidenceStrength::from_storage(&row.evidence_strength),
+            bases,
+        },
+        extractor_id: row.extractor_id,
+        extractor_version: row.extractor_version,
+        summary_renderer_version: row.summary_renderer_version,
+        canonicalization_version: row.canonicalization_version,
+        consolidation_fingerprint: row.consolidation_fingerprint,
+        proposal_hash: row.proposal_hash,
+        created_at: row.created_at,
+    };
+    let attempts = sqlx::query_as::<_, ExperienceAttemptRow>("SELECT id, workspace_id, experience_id, ordinal, result, change_evidence_ordinals_json, following_verification_ordinal FROM experience_attempts WHERE workspace_id = ? AND experience_id = ? ORDER BY ordinal ASC")
+        .bind(workspace_id).bind(experience_id).fetch_all(&mut **transaction).await?.into_iter().map(|row| Ok(ExperienceAttempt {
+            id: row.id, workspace_id: row.workspace_id, experience_id: row.experience_id, ordinal: ordinal_from_i64(row.ordinal)?, result: crate::domain::AttemptResult::from_storage(&row.result),
+            change_evidence_ordinals: serde_json::from_str(&row.change_evidence_ordinals_json)?, following_verification_ordinal: row.following_verification_ordinal.map(ordinal_from_i64).transpose()?,
+        })).collect::<Result<Vec<_>>>()?;
+    let evidence = sqlx::query_as::<_, ExperienceEvidenceRow>("SELECT ordinal, relation, event_id FROM experience_evidence WHERE workspace_id = ? AND experience_id = ? ORDER BY ordinal ASC")
+        .bind(workspace_id).bind(experience_id).fetch_all(&mut **transaction).await?.into_iter().map(|row| Ok(ExperienceEvidenceLink { ordinal: ordinal_from_i64(row.ordinal)?, relation: crate::domain::ExperienceEvidenceRelation::from_storage(&row.relation), event_id: row.event_id })).collect::<Result<Vec<_>>>()?;
+    let code_snapshots = sqlx::query_as::<_, ExperienceCodeSnapshotRow>("SELECT ordinal, source_event_id, relative_path, workspace_content_revision, document_content_revision, document_content_hash, content, chunk_stable_key, chunk_content_hash, symbol_logical_key, symbol_label, source_start_byte, source_end_byte FROM experience_code_snapshots WHERE workspace_id = ? AND experience_id = ? ORDER BY ordinal ASC")
+        .bind(workspace_id).bind(experience_id).fetch_all(&mut **transaction).await?.into_iter().map(|row| Ok(ExperienceCodeSnapshot { ordinal: ordinal_from_i64(row.ordinal)?, source_event_id: row.source_event_id, relative_path: row.relative_path, workspace_content_revision: row.workspace_content_revision, document_content_revision: row.document_content_revision, document_content_hash: row.document_content_hash, content: row.content, chunk_stable_key: row.chunk_stable_key, chunk_content_hash: row.chunk_content_hash, symbol_logical_key: row.symbol_logical_key, symbol_label: row.symbol_label, source_start_byte: row.source_start_byte, source_end_byte: row.source_end_byte })).collect::<Result<Vec<_>>>()?;
+    let graph_snapshots = sqlx::query_as::<_, ExperienceGraphSnapshotRow>("SELECT ordinal, code_snapshot_ordinal, graph_content_revision, graph_schema_version, graph_state, analyzer_id, analyzer_version, structure_version, node_stable_key, node_type, resolution_provenance_json FROM experience_graph_snapshots WHERE workspace_id = ? AND experience_id = ? ORDER BY ordinal ASC")
+        .bind(workspace_id).bind(experience_id).fetch_all(&mut **transaction).await?.into_iter().map(|row| Ok(ExperienceGraphSnapshot { ordinal: ordinal_from_i64(row.ordinal)?, code_snapshot_ordinal: ordinal_from_i64(row.code_snapshot_ordinal)?, graph_content_revision: row.graph_content_revision, graph_schema_version: row.graph_schema_version, graph_state: crate::domain::GraphState::from_storage(&row.graph_state), analyzer_id: row.analyzer_id, analyzer_version: row.analyzer_version, structure_version: row.structure_version, node_stable_key: row.node_stable_key, node_type: crate::domain::GraphNodeType::from_storage(&row.node_type), resolution_provenance: serde_json::from_str(&row.resolution_provenance_json)? })).collect::<Result<Vec<_>>>()?;
+    Ok(Some(ExperienceRecord {
+        experience,
+        attempts,
+        evidence,
+        code_snapshots,
+        graph_snapshots,
+    }))
+}
+
+async fn insert_historical_write_order(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+    entity_kind: &str,
+    entity_id: &str,
+) -> Result<i64> {
+    let result = sqlx::query(
+        "INSERT INTO historical_write_order(workspace_id, entity_kind, entity_id) VALUES (?, ?, ?)",
+    )
+    .bind(workspace_id)
+    .bind(entity_kind)
+    .bind(entity_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(result.last_insert_rowid())
+}
+
+async fn historical_frontier_schema_available(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'historical_write_order'",
+    )
+    .fetch_one(&mut **transaction)
+    .await?
+        != 0)
+}
+
+async fn insert_experience_row(
+    transaction: &mut Transaction<'_, Sqlite>,
+    experience: &Experience,
+) -> Result<()> {
+    let signature_json = experience
+        .failure_signature
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let (key, components, path, symbol) = match &experience.failure_signature {
+        Some(signature) => (
+            Some(signature.normalized_key.clone()),
+            signature
+                .components
+                .iter()
+                .map(|(key, value)| format!("{key}:{value}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            signature.scope.path.clone(),
+            signature.scope.symbol_key.clone(),
+        ),
+        None => (None, String::new(), None, None),
+    };
+    sqlx::query("INSERT INTO experiences(id, workspace_id, session_id, task_id, episode_id, failure_signature_json, failure_key, failure_components, failure_path, failure_symbol_key, outcome, verification_status, verification_reasons_json, evidence_strength, summary, extractor_id, extractor_version, summary_renderer_version, canonicalization_version, consolidation_fingerprint, proposal_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(&experience.id).bind(&experience.workspace_id).bind(&experience.session_id).bind(&experience.task_id).bind(&experience.episode_id)
+        .bind(signature_json).bind(key).bind(components).bind(path).bind(symbol).bind(experience.outcome.as_str())
+        .bind(experience.verification.status.as_str())
+        .bind(serde_json::to_string(&experience.verification.reasons)?).bind(experience.evidence_strength.strength.as_str())
+        .bind(&experience.summary).bind(&experience.extractor_id).bind(&experience.extractor_version).bind(&experience.summary_renderer_version).bind(&experience.canonicalization_version)
+        .bind(&experience.consolidation_fingerprint).bind(&experience.proposal_hash).bind(experience.created_at)
+        .execute(&mut **transaction).await?;
+    Ok(())
+}
+
+async fn insert_experience_verification(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+    experience_id: &str,
+    observation: &crate::domain::ExperienceVerificationObservation,
+) -> Result<()> {
+    sqlx::query("INSERT INTO experience_verifications(workspace_id, experience_id, ordinal, status, kind, subject_kind, subject_value, evidence_event_id, rule_id, rule_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(workspace_id).bind(experience_id).bind(ordinal_from_u64(observation.ordinal)?)
+        .bind(observation.status.as_str()).bind(observation.kind.as_str())
+        .bind(verification_subject_kind_name(observation.subject.kind)).bind(&observation.subject.value)
+        .bind(&observation.evidence_event_id).bind(&observation.rule_id).bind(&observation.rule_version)
+        .execute(&mut **transaction).await?;
+    Ok(())
+}
+
+async fn insert_experience_attempt(
+    transaction: &mut Transaction<'_, Sqlite>,
+    attempt: &ExperienceAttempt,
+) -> Result<()> {
+    sqlx::query("INSERT INTO experience_attempts(id, workspace_id, experience_id, ordinal, result, change_evidence_ordinals_json, following_verification_ordinal) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .bind(&attempt.id).bind(&attempt.workspace_id).bind(&attempt.experience_id).bind(ordinal_from_u64(attempt.ordinal)?)
+        .bind(attempt.result.as_str()).bind(serde_json::to_string(&attempt.change_evidence_ordinals)?).bind(attempt.following_verification_ordinal.map(ordinal_from_u64).transpose()?)
+        .execute(&mut **transaction).await?;
+    Ok(())
+}
+
+async fn insert_experience_evidence(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+    experience_id: &str,
+    link: &ExperienceEvidenceLink,
+) -> Result<()> {
+    sqlx::query("INSERT INTO experience_evidence(workspace_id, experience_id, ordinal, relation, event_id) VALUES (?, ?, ?, ?, ?)")
+        .bind(workspace_id).bind(experience_id).bind(ordinal_from_u64(link.ordinal)?).bind(link.relation.as_str()).bind(&link.event_id).execute(&mut **transaction).await?;
+    Ok(())
+}
+async fn insert_experience_code_snapshot(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+    experience_id: &str,
+    snapshot: &ExperienceCodeSnapshot,
+) -> Result<()> {
+    sqlx::query("INSERT INTO experience_code_snapshots(workspace_id, experience_id, ordinal, source_event_id, relative_path, workspace_content_revision, document_content_revision, document_content_hash, content, chunk_stable_key, chunk_content_hash, symbol_logical_key, symbol_label, source_start_byte, source_end_byte) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(workspace_id).bind(experience_id).bind(ordinal_from_u64(snapshot.ordinal)?).bind(&snapshot.source_event_id).bind(&snapshot.relative_path).bind(snapshot.workspace_content_revision).bind(snapshot.document_content_revision).bind(&snapshot.document_content_hash).bind(&snapshot.content).bind(&snapshot.chunk_stable_key).bind(&snapshot.chunk_content_hash).bind(&snapshot.symbol_logical_key).bind(&snapshot.symbol_label).bind(snapshot.source_start_byte).bind(snapshot.source_end_byte).execute(&mut **transaction).await?;
+    Ok(())
+}
+async fn insert_experience_graph_snapshot(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+    experience_id: &str,
+    snapshot: &ExperienceGraphSnapshot,
+) -> Result<()> {
+    sqlx::query("INSERT INTO experience_graph_snapshots(workspace_id, experience_id, ordinal, code_snapshot_ordinal, graph_content_revision, graph_schema_version, graph_state, analyzer_id, analyzer_version, structure_version, node_stable_key, node_type, resolution_provenance_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(workspace_id).bind(experience_id).bind(ordinal_from_u64(snapshot.ordinal)?).bind(ordinal_from_u64(snapshot.code_snapshot_ordinal)?).bind(snapshot.graph_content_revision).bind(snapshot.graph_schema_version).bind(snapshot.graph_state.storage_name()).bind(&snapshot.analyzer_id).bind(&snapshot.analyzer_version).bind(&snapshot.structure_version).bind(&snapshot.node_stable_key).bind(snapshot.node_type.storage_name()).bind(serde_json::to_string(&snapshot.resolution_provenance)?).execute(&mut **transaction).await?;
+    Ok(())
+}
+
+fn validate_experience_record(record: &ExperienceRecord) -> Result<()> {
+    let experience = &record.experience;
+    for (label, value) in [
+        ("experience ID", &experience.id),
+        ("workspace ID", &experience.workspace_id),
+        ("session ID", &experience.session_id),
+        ("episode ID", &experience.episode_id),
+        ("extractor ID", &experience.extractor_id),
+        ("extractor version", &experience.extractor_version),
+    ] {
+        if value.trim().is_empty() || value.len() > 256 {
+            return Err(CortexError::Analysis(format!(
+                "{label} must be non-empty and bounded"
+            )));
+        }
+    }
+    if !valid_blake3_hash(&experience.consolidation_fingerprint)
+        || !valid_blake3_hash(&experience.proposal_hash)
+    {
+        return Err(CortexError::Analysis(
+            "experience fingerprints must be lowercase BLAKE3 hashes".into(),
+        ));
+    }
+    if experience.summary.trim().is_empty() || experience.summary.len() > 4096 {
+        return Err(CortexError::Analysis(
+            "experience summary must be non-empty and bounded".into(),
+        ));
+    }
+    if experience.summary_renderer_version != crate::domain::EXPERIENCE_SUMMARY_RENDERER_VERSION {
+        return Err(CortexError::Analysis(
+            "experience uses an unsupported deterministic summary renderer version".into(),
+        ));
+    }
+    if experience.canonicalization_version != crate::domain::EXPERIENCE_CANONICALIZATION_VERSION {
+        return Err(CortexError::Analysis(
+            "experience uses an unsupported canonicalization version".into(),
+        ));
+    }
+    if experience.summary
+        != crate::domain::render_summary(
+            experience.failure_signature.as_ref(),
+            experience.outcome,
+            &experience.verification,
+            record.attempts.len(),
+        )
+    {
+        return Err(CortexError::Analysis(
+            "experience summary does not match the deterministic renderer".into(),
+        ));
+    }
+    if let Some(signature) = &experience.failure_signature {
+        if signature.scope.workspace_id != experience.workspace_id {
+            return Err(CortexError::Analysis(
+                "failure signature workspace does not match experience workspace".into(),
+            ));
+        }
+        let rebuilt = crate::domain::FailureSignature::new(
+            signature.domain,
+            signature.identity_capability,
+            signature.components.clone(),
+            signature.normalizer_id.clone(),
+            signature.normalizer_version.clone(),
+            signature.scope.clone(),
+        )?;
+        if &rebuilt != signature {
+            return Err(CortexError::Analysis(
+                "failure signature does not match its canonical normalized fields".into(),
+            ));
+        }
+    }
+    if record.attempts.is_empty() || record.evidence.is_empty() {
+        return Err(CortexError::Analysis(
+            "an experience requires at least one attempt and one evidence link".into(),
+        ));
+    }
+    if record.attempts.len() > crate::domain::MAX_EXPERIENCE_ATTEMPTS
+        || record.evidence.len() > crate::domain::MAX_EXPERIENCE_EVIDENCE
+        || record.code_snapshots.len() > crate::domain::MAX_EXPERIENCE_SNAPSHOTS
+        || record.graph_snapshots.len() > crate::domain::MAX_EXPERIENCE_SNAPSHOTS
+    {
+        return Err(CortexError::Analysis(
+            "experience relation limit exceeded".into(),
+        ));
+    }
+    validate_verification_semantics(experience, &record.evidence)?;
+    validate_ordinals(record.attempts.iter().map(|value| value.ordinal), "attempt")?;
+    validate_ordinals(
+        record.evidence.iter().map(|value| value.ordinal),
+        "evidence",
+    )?;
+    validate_ordinals(
+        record.code_snapshots.iter().map(|value| value.ordinal),
+        "code snapshot",
+    )?;
+    validate_ordinals(
+        record.graph_snapshots.iter().map(|value| value.ordinal),
+        "graph snapshot",
+    )?;
+    let unique_event_ids: HashSet<_> = record
+        .evidence
+        .iter()
+        .map(|link| link.event_id.as_str())
+        .collect();
+    if unique_event_ids.len() != record.evidence.len() {
+        return Err(CortexError::Analysis(
+            "each event may have only one unambiguous relation in an experience".into(),
+        ));
+    }
+    let evidence_ordinals: HashSet<_> = record.evidence.iter().map(|value| value.ordinal).collect();
+    let mut attempt_ids = HashSet::new();
+    let mut claimed_changes = HashSet::new();
+    let mut claimed_verifications = HashSet::new();
+    for attempt in &record.attempts {
+        if attempt.id.trim().is_empty()
+            || attempt.id.len() > 256
+            || !attempt_ids.insert(attempt.id.as_str())
+            || attempt.workspace_id != experience.workspace_id
+            || attempt.experience_id != experience.id
+        {
+            return Err(CortexError::Analysis(
+                "attempt identity and ownership must be unique and match the experience".into(),
+            ));
+        }
+        if attempt.change_evidence_ordinals.is_empty() {
+            return Err(CortexError::Analysis(
+                "every attempt requires change or tool evidence".into(),
+            ));
+        }
+        for ordinal in &attempt.change_evidence_ordinals {
+            if !claimed_changes.insert(*ordinal) {
+                return Err(CortexError::Analysis(
+                    "attempt change evidence must belong to exactly one attempt".into(),
+                ));
+            }
+        }
+        if attempt
+            .following_verification_ordinal
+            .is_some_and(|ordinal| !claimed_verifications.insert(ordinal))
+        {
+            return Err(CortexError::Analysis(
+                "following verification evidence must belong to exactly one attempt".into(),
+            ));
+        }
+        if attempt
+            .change_evidence_ordinals
+            .iter()
+            .any(|ordinal| !evidence_ordinals.contains(ordinal))
+            || attempt
+                .following_verification_ordinal
+                .is_some_and(|ordinal| !evidence_ordinals.contains(&ordinal))
+        {
+            return Err(CortexError::Analysis(
+                "attempt references an absent evidence link".into(),
+            ));
+        }
+        if attempt.change_evidence_ordinals.iter().any(|ordinal| {
+            record.evidence.get(*ordinal as usize).is_none_or(|link| {
+                link.relation != crate::domain::ExperienceEvidenceRelation::AttemptChange
+            })
+        }) {
+            return Err(CortexError::Analysis(
+                "attempt change ordinals must reference attempt_change evidence".into(),
+            ));
+        }
+        if attempt
+            .following_verification_ordinal
+            .is_some_and(|ordinal| {
+                record.evidence.get(ordinal as usize).is_none_or(|link| {
+                    link.relation != crate::domain::ExperienceEvidenceRelation::AttemptVerification
+                })
+            })
+        {
+            return Err(CortexError::Analysis(
+                "following verification must reference attempt_verification evidence".into(),
+            ));
+        }
+        if attempt.result != crate::domain::AttemptResult::Inconclusive
+            && attempt.following_verification_ordinal.is_none()
+        {
+            return Err(CortexError::Analysis(
+                "a conclusive attempt result requires following verification evidence".into(),
+            ));
+        }
+        // The following relation proves only the ordered event link.  Earlier
+        // attempt results are intentionally absent from the terminal
+        // observations when a later attempt establishes a new frontier.  The
+        // consolidator owns decoded result classification; persistence must
+        // not collapse historical attempt results into the terminal claim.
+    }
+    for link in &record.evidence {
+        match link.relation {
+            crate::domain::ExperienceEvidenceRelation::AttemptChange
+                if !claimed_changes.contains(&link.ordinal) =>
+            {
+                return Err(CortexError::Analysis(
+                    "attempt_change evidence must belong to exactly one attempt".into(),
+                ));
+            }
+            crate::domain::ExperienceEvidenceRelation::AttemptVerification
+                if !claimed_verifications.contains(&link.ordinal) =>
+            {
+                return Err(CortexError::Analysis(
+                    "attempt_verification evidence must follow exactly one attempt".into(),
+                ));
+            }
+            crate::domain::ExperienceEvidenceRelation::TerminalVerification
+                if !experience
+                    .verification
+                    .observations
+                    .iter()
+                    .any(|observation| observation.evidence_event_id == link.event_id) =>
+            {
+                return Err(CortexError::Analysis(
+                    "terminal_verification evidence requires a scoped observation".into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    for snapshot in &record.code_snapshots {
+        if !workspace_relative_experience_path(&snapshot.relative_path)
+            || snapshot.workspace_content_revision < 0
+            || snapshot.document_content_revision < 0
+            || !valid_blake3_hash(&snapshot.document_content_hash)
+            || blake3::hash(snapshot.content.as_bytes()).to_hex().as_str()
+                != snapshot.document_content_hash
+            || snapshot.content.len() > 65_536
+            || snapshot
+                .chunk_stable_key
+                .as_deref()
+                .is_some_and(|value| !bounded_experience_key(value, 512))
+            || snapshot
+                .chunk_content_hash
+                .as_deref()
+                .is_some_and(|value| !valid_blake3_hash(value))
+            || snapshot.chunk_stable_key.is_some() != snapshot.chunk_content_hash.is_some()
+            || snapshot
+                .symbol_logical_key
+                .as_deref()
+                .is_some_and(|value| !bounded_experience_key(value, 512))
+            || snapshot
+                .symbol_label
+                .as_deref()
+                .is_some_and(|value| !bounded_experience_key(value, 512))
+            || snapshot.source_start_byte.is_some() != snapshot.source_end_byte.is_some()
+            || snapshot
+                .source_start_byte
+                .zip(snapshot.source_end_byte)
+                .is_some_and(|(start, end)| {
+                    start < 0 || end < start || end as usize > snapshot.content.len()
+                })
+            || !record.evidence.iter().any(|link| {
+                link.event_id == snapshot.source_event_id
+                    && link.relation == crate::domain::ExperienceEvidenceRelation::AttemptChange
+            })
+        {
+            return Err(CortexError::Analysis(
+                "code snapshots require self-consistent bounded historical content".into(),
+            ));
+        }
+    }
+    for snapshot in &record.graph_snapshots {
+        let code_snapshot = record
+            .code_snapshots
+            .get(snapshot.code_snapshot_ordinal as usize);
+        if code_snapshot.is_none_or(|code| {
+            code.ordinal != snapshot.code_snapshot_ordinal
+                || code.workspace_content_revision != snapshot.graph_content_revision
+        }) || snapshot.graph_content_revision < 0
+            || snapshot.graph_schema_version < 0
+            || !bounded_experience_key(&snapshot.analyzer_id, 256)
+            || !bounded_experience_key(&snapshot.analyzer_version, 256)
+            || !bounded_experience_key(&snapshot.structure_version, 256)
+            || !bounded_experience_key(&snapshot.node_stable_key, 512)
+            || serde_json::to_vec(&snapshot.resolution_provenance)?.len() > 65_536
+        {
+            return Err(CortexError::Analysis(
+                "graph snapshots require bounded stable historical material".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_verification_semantics(
+    experience: &Experience,
+    evidence: &[ExperienceEvidenceLink],
+) -> Result<()> {
+    let verification = &experience.verification;
+    if verification.observations.len() > 16
+        || verification.reasons.len() > 16
+        || verification
+            .reasons
+            .iter()
+            .any(|reason| reason.trim().is_empty() || reason.len() > 4096)
+    {
+        return Err(CortexError::Analysis(
+            "verification observations and reasons must be bounded".into(),
+        ));
+    }
+    validate_ordinals(
+        verification
+            .observations
+            .iter()
+            .map(|observation| observation.ordinal),
+        "verification observation",
+    )?;
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut accepted = 0;
+    let mut positive_subjects = BTreeSet::new();
+    let mut failed_subjects = BTreeSet::new();
+    for observation in &verification.observations {
+        match observation.status {
+            crate::domain::VerificationStatus::VerifiedPassed => {
+                passed += 1;
+                positive_subjects
+                    .insert((observation.subject.kind, observation.subject.value.as_str()));
+            }
+            crate::domain::VerificationStatus::VerifiedFailed => {
+                failed += 1;
+                failed_subjects
+                    .insert((observation.subject.kind, observation.subject.value.as_str()));
+            }
+            crate::domain::VerificationStatus::ExplicitlyAccepted => {
+                accepted += 1;
+                positive_subjects
+                    .insert((observation.subject.kind, observation.subject.value.as_str()));
+            }
+            crate::domain::VerificationStatus::Conflicting
+            | crate::domain::VerificationStatus::Missing
+            | crate::domain::VerificationStatus::Unsupported => {
+                return Err(CortexError::Analysis(
+                    "individual verification observations must be passed, failed, or explicitly accepted".into(),
+                ));
+            }
+        }
+        if observation.kind == crate::domain::VerificationKind::None
+            || (observation.status == crate::domain::VerificationStatus::ExplicitlyAccepted
+                && observation.kind != crate::domain::VerificationKind::UserAcceptance)
+            || (observation.status != crate::domain::VerificationStatus::ExplicitlyAccepted
+                && observation.kind == crate::domain::VerificationKind::UserAcceptance)
+        {
+            return Err(CortexError::Analysis(
+                "verification status and kind are incompatible".into(),
+            ));
+        }
+        if !stable_experience_component(&observation.subject.value, 512)
+            || !stable_experience_component(&observation.rule_id, 256)
+            || !stable_experience_component(&observation.rule_version, 256)
+            || (observation.subject.kind == crate::domain::VerificationSubjectKind::Path
+                && !workspace_relative_experience_path(&observation.subject.value))
+        {
+            return Err(CortexError::Analysis(
+                "verification observations require subject and rule identity".into(),
+            ));
+        }
+        let Some(link) = evidence
+            .iter()
+            .find(|link| link.event_id == observation.evidence_event_id)
+        else {
+            return Err(CortexError::Analysis(
+                "verification observation must reference exact experience evidence".into(),
+            ));
+        };
+        if !matches!(
+            link.relation,
+            crate::domain::ExperienceEvidenceRelation::AttemptVerification
+                | crate::domain::ExperienceEvidenceRelation::TerminalVerification
+        ) {
+            return Err(CortexError::Analysis(
+                "verification observation uses an invalid evidence relation".into(),
+            ));
+        }
+    }
+    if verification.status == crate::domain::VerificationStatus::Conflicting
+        && (failed == 0 || passed + accepted == 0)
+    {
+        return Err(CortexError::Analysis(
+            "conflicting verification requires both positive and failed observations".into(),
+        ));
+    }
+    let outcome_valid = match experience.outcome {
+        crate::domain::ExperienceOutcome::Success => {
+            failed == 0
+                && ((verification.status == crate::domain::VerificationStatus::VerifiedPassed
+                    && passed > 0)
+                    || (verification.status
+                        == crate::domain::VerificationStatus::ExplicitlyAccepted
+                        && accepted > 0))
+        }
+        crate::domain::ExperienceOutcome::Failure => {
+            failed > 0
+                && passed + accepted == 0
+                && verification.status == crate::domain::VerificationStatus::VerifiedFailed
+        }
+        crate::domain::ExperienceOutcome::PartialSuccess => {
+            failed > 0
+                && passed + accepted > 0
+                && verification.status == crate::domain::VerificationStatus::Conflicting
+                && positive_subjects
+                    .iter()
+                    .any(|subject| failed_subjects.iter().any(|failed| failed != subject))
+        }
+        crate::domain::ExperienceOutcome::Inconclusive => matches!(
+            verification.status,
+            crate::domain::VerificationStatus::Conflicting
+                | crate::domain::VerificationStatus::Missing
+                | crate::domain::VerificationStatus::Unsupported
+        ),
+        crate::domain::ExperienceOutcome::Abandoned => matches!(
+            verification.status,
+            crate::domain::VerificationStatus::Missing
+                | crate::domain::VerificationStatus::Unsupported
+        ),
+    };
+    if !outcome_valid {
+        return Err(CortexError::Analysis(
+            "experience outcome is not supported by its scoped verification observations".into(),
+        ));
+    }
+    let unique_bases: BTreeSet<_> = experience.evidence_strength.bases.iter().copied().collect();
+    if unique_bases.len() != experience.evidence_strength.bases.len()
+        || experience.evidence_strength.bases.is_empty()
+    {
+        return Err(CortexError::Analysis(
+            "evidence strength bases must be non-empty and unique".into(),
+        ));
+    }
+    if matches!(
+        experience.outcome,
+        crate::domain::ExperienceOutcome::Success
+            | crate::domain::ExperienceOutcome::Failure
+            | crate::domain::ExperienceOutcome::PartialSuccess
+    ) && !matches!(
+        experience.evidence_strength.strength,
+        crate::domain::EvidenceStrength::Strong | crate::domain::EvidenceStrength::Moderate
+    ) {
+        return Err(CortexError::Analysis(
+            "a conclusive outcome requires at least moderate structured evidence".into(),
+        ));
+    }
+    if matches!(
+        experience.evidence_strength.strength,
+        crate::domain::EvidenceStrength::Strong | crate::domain::EvidenceStrength::Moderate
+    ) && !unique_bases.iter().any(|basis| {
+        matches!(
+            basis,
+            crate::domain::EvidenceBasis::DeterministicVerifier
+                | crate::domain::EvidenceBasis::RepeatedDeterministicEvidence
+                | crate::domain::EvidenceBasis::ExplicitUserAcceptance
+                | crate::domain::EvidenceBasis::ExplicitHarnessAssertion
+        )
+    }) {
+        return Err(CortexError::Analysis(
+            "moderate or strong evidence requires an explicit authoritative basis".into(),
+        ));
+    }
+    if accepted > 0 && !unique_bases.contains(&crate::domain::EvidenceBasis::ExplicitUserAcceptance)
+    {
+        return Err(CortexError::Analysis(
+            "explicit acceptance requires an explicit user acceptance evidence basis".into(),
+        ));
+    }
+    if passed + failed > 0
+        && !unique_bases.iter().any(|basis| {
+            matches!(
+                basis,
+                crate::domain::EvidenceBasis::DeterministicVerifier
+                    | crate::domain::EvidenceBasis::RepeatedDeterministicEvidence
+                    | crate::domain::EvidenceBasis::ExplicitHarnessAssertion
+            )
+        })
+    {
+        return Err(CortexError::Analysis(
+            "verifier observations require a deterministic or harness evidence basis".into(),
+        ));
+    }
+    if unique_bases.contains(&crate::domain::EvidenceBasis::RepeatedDeterministicEvidence)
+        && passed + failed < 2
+    {
+        return Err(CortexError::Analysis(
+            "repeated deterministic evidence requires at least two verifier observations".into(),
+        ));
+    }
+    if matches!(
+        verification.status,
+        crate::domain::VerificationStatus::Missing | crate::domain::VerificationStatus::Unsupported
+    ) && !verification.observations.is_empty()
+    {
+        return Err(CortexError::Analysis(
+            "missing or unsupported verification cannot contain observations".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_assessment(assessment: &ExperienceAssessment) -> Result<()> {
+    if assessment.id.trim().is_empty()
+        || assessment.workspace_id.trim().is_empty()
+        || assessment.experience_id.trim().is_empty()
+        || assessment.actor.trim().is_empty()
+        || assessment.reason.trim().is_empty()
+    {
+        return Err(CortexError::Analysis(
+            "experience assessment requires identity, actor, and reason".into(),
+        ));
+    }
+    if assessment.reason.len() > 4096
+        || assessment.evidence_event_ids.len() > crate::domain::MAX_EXPERIENCE_ASSESSMENT_EVIDENCE
+    {
+        return Err(CortexError::Analysis(
+            "experience assessment exceeds a hard bound".into(),
+        ));
+    }
+    if (assessment.kind == crate::domain::ExperienceAssessmentKind::Superseded)
+        != assessment.replacement_experience_id.is_some()
+        || assessment
+            .replacement_experience_id
+            .as_deref()
+            .is_some_and(|target| target == assessment.experience_id)
+    {
+        return Err(CortexError::Analysis(
+            "only a superseded assessment may name a distinct replacement experience".into(),
+        ));
+    }
+    let unique_evidence: HashSet<_> = assessment.evidence_event_ids.iter().collect();
+    if unique_evidence.len() != assessment.evidence_event_ids.len() {
+        return Err(CortexError::Analysis(
+            "assessment evidence event IDs must be unique".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ordinals(values: impl Iterator<Item = u64>, label: &str) -> Result<()> {
+    for (expected, actual) in values.enumerate() {
+        if u64::try_from(expected).ok() != Some(actual) {
+            return Err(CortexError::Analysis(format!(
+                "{label} ordinals must begin at zero and be contiguous"
+            )));
+        }
+    }
+    Ok(())
+}
+fn ordinal_from_u64(value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| CortexError::Analysis("ordinal exceeds SQLite range".into()))
+}
+fn ordinal_to_i64(value: u64) -> Result<i64> {
+    ordinal_from_u64(value)
+}
+fn ordinal_from_i64(value: i64) -> Result<u64> {
+    u64::try_from(value)
+        .map_err(|_| CortexError::Storage(sqlx::Error::Decode("negative ordinal".into())))
+}
+fn verification_subject_kind_name(kind: crate::domain::VerificationSubjectKind) -> &'static str {
+    match kind {
+        crate::domain::VerificationSubjectKind::Workspace => "workspace",
+        crate::domain::VerificationSubjectKind::Package => "package",
+        crate::domain::VerificationSubjectKind::Target => "target",
+        crate::domain::VerificationSubjectKind::Test => "test",
+        crate::domain::VerificationSubjectKind::Path => "path",
+    }
+}
+fn verification_subject_kind(value: &str) -> Result<crate::domain::VerificationSubjectKind> {
+    match value {
+        "workspace" => Ok(crate::domain::VerificationSubjectKind::Workspace),
+        "package" => Ok(crate::domain::VerificationSubjectKind::Package),
+        "target" => Ok(crate::domain::VerificationSubjectKind::Target),
+        "test" => Ok(crate::domain::VerificationSubjectKind::Test),
+        "path" => Ok(crate::domain::VerificationSubjectKind::Path),
+        _ => Err(CortexError::Storage(sqlx::Error::Decode(
+            "invalid verification subject kind".into(),
+        ))),
+    }
+}
+fn stable_experience_component(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.trim() == value
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'-' | b'.' | b':' | b'<' | b'>' | b',' | b' ' | b'&' | b'/'
+                )
+        })
+}
+fn valid_blake3_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+fn bounded_experience_key(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+fn workspace_relative_experience_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && !value.starts_with('/')
+        && !value.starts_with('\\')
+        && !value.contains(':')
+        && !value.split('/').any(|part| part.is_empty() || part == "..")
+}
+
+#[derive(FromRow)]
+struct EpisodeRow {
+    id: String,
+    workspace_id: String,
+    session_id: String,
+    task_id: Option<String>,
+    episode_type: String,
+    status: String,
+    title: Option<String>,
+    created_by: String,
+    version: i64,
+    started_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+}
+
+impl TryFrom<EpisodeRow> for Episode {
+    type Error = CortexError;
+
+    fn try_from(row: EpisodeRow) -> Result<Self> {
+        Ok(Self {
+            id: row.id,
+            workspace_id: row.workspace_id,
+            session_id: row.session_id,
+            task_id: row.task_id,
+            episode_type: crate::domain::EpisodeType::from_storage(&row.episode_type),
+            status: EpisodeStatus::from_storage(&row.status),
+            title: row.title,
+            created_by: crate::domain::EpisodeCreator::from_storage(&row.created_by),
+            version: u64::try_from(row.version).map_err(|_| {
+                CortexError::Storage(sqlx::Error::Decode("episode version is negative".into()))
+            })?,
+            started_at: row.started_at,
+            ended_at: row.ended_at,
+            created_at: row.created_at,
+        })
+    }
+}
+
+#[derive(FromRow)]
+struct EpisodeEventRow {
+    workspace_id: String,
+    episode_id: String,
+    event_id: String,
+    ordinal: i64,
+    associated_at: DateTime<Utc>,
+}
+
+impl TryFrom<EpisodeEventRow> for EpisodeEvent {
+    type Error = CortexError;
+
+    fn try_from(row: EpisodeEventRow) -> Result<Self> {
+        Ok(Self {
+            workspace_id: row.workspace_id,
+            episode_id: row.episode_id,
+            event_id: row.event_id,
+            ordinal: u64::try_from(row.ordinal).map_err(|_| {
+                CortexError::Storage(sqlx::Error::Decode(
+                    "episode event ordinal is negative".into(),
+                ))
+            })?,
+            associated_at: row.associated_at,
+        })
+    }
+}
+
+#[derive(FromRow)]
+struct EpisodeMutationRequestRow {
+    operation: String,
+    request_hash: String,
+    resulting_version: i64,
+}
+
+async fn episode_mutation_request(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+    episode_id: &str,
+    request_key: &str,
+) -> Result<Option<EpisodeMutationRequestRow>> {
+    sqlx::query_as::<_, EpisodeMutationRequestRow>(
+        "SELECT operation, request_hash, resulting_version FROM episode_mutation_requests WHERE workspace_id = ? AND episode_id = ? AND request_key = ?",
+    )
+    .bind(workspace_id)
+    .bind(episode_id)
+    .bind(request_key)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(Into::into)
+}
+
+async fn validate_consolidation_input_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    experience: &Experience,
+    expected: &ConsolidationInputIdentity,
+) -> Result<()> {
+    if expected.workspace_id != experience.workspace_id
+        || expected.episode_id != experience.episode_id
+    {
+        return Err(CortexError::Conflict(
+            "consolidation input identity does not match the experience scope".into(),
+        ));
+    }
+    let rows = sqlx::query(
+        "SELECT member.ordinal, event.id, event.event_type, event.payload_json \
+         FROM episode_events member \
+         JOIN events event ON event.workspace_id = member.workspace_id AND event.id = member.event_id \
+         WHERE member.workspace_id = ? AND member.episode_id = ? \
+         ORDER BY member.ordinal ASC",
+    )
+    .bind(&experience.workspace_id)
+    .bind(&experience.episode_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let actual = rows
+        .into_iter()
+        .map(|row| {
+            let ordinal = ordinal_from_i64(row.try_get("ordinal")?)?;
+            let payload: Value = serde_json::from_str(&row.try_get::<String, _>("payload_json")?)?;
+            Ok(ConsolidationInputMember {
+                ordinal,
+                event_id: row.try_get("id")?,
+                event_type: row.try_get("event_type")?,
+                payload_hash: crate::domain::canonical_event_payload_hash(&payload)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if actual != expected.members {
+        return Err(CortexError::Conflict(
+            "episode membership or event identity changed after consolidation preview".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn episode_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+    episode_id: &str,
+) -> Result<Option<Episode>> {
+    let row = sqlx::query_as::<_, EpisodeRow>(
+        "SELECT id, workspace_id, session_id, task_id, episode_type, status, title, created_by, version, started_at, ended_at, created_at FROM episodes WHERE workspace_id = ? AND id = ?",
+    )
+    .bind(workspace_id)
+    .bind(episode_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    row.map(TryInto::try_into).transpose()
+}
+
+async fn episode_mutation_conflict(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+    episode_id: &str,
+    expected_version: i64,
+) -> Result<Episode> {
+    let episode = episode_in_transaction(transaction, workspace_id, episode_id)
+        .await?
+        .ok_or_else(|| CortexError::NotFound(format!("episode {episode_id}")))?;
+    let detail = if episode.status.is_terminal() {
+        format!("episode {episode_id} is terminal")
+    } else {
+        format!(
+            "episode {episode_id} version {} does not match expected version {expected_version}",
+            episode.version
+        )
+    };
+    Err(CortexError::Conflict(detail))
+}
+
+fn episode_version(version: u64) -> Result<i64> {
+    i64::try_from(version)
+        .map_err(|_| CortexError::Conflict("episode version exceeds SQLite integer range".into()))
+}
+
+fn episode_result_version(version: i64) -> Result<u64> {
+    u64::try_from(version).map_err(|_| {
+        CortexError::Storage(sqlx::Error::Decode(
+            "episode mutation result version is negative".into(),
+        ))
+    })
+}
+
 #[derive(FromRow)]
 struct WorkingSetEntryRow {
     id: String,
@@ -4289,8 +6285,19 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::domain::{
-        GraphEdgeType, GraphNode, GraphNodeType, GraphRepairGeneration, GraphRepairMode,
-        GraphRepairState, UnresolvedRelationship,
+        AttemptResult, Document, Episode, EpisodeCreator, EpisodeType, EvidenceBasis,
+        EvidenceStrength, EvidenceStrengthAssessment, Experience, ExperienceAssessment,
+        ExperienceAssessmentKind, ExperienceAttempt, ExperienceCodeSnapshot, ExperienceDraft,
+        ExperienceEligibilityInclusion, ExperienceEvidenceLink, ExperienceEvidenceRelation,
+        ExperienceGraphSnapshot, ExperienceLifecycle, ExperienceOutcome, ExperienceRecord,
+        ExperienceSearchRequest, ExperienceVerification, ExperienceVerificationObservation,
+        FailureNormalizationResult, GraphEdgeType, GraphNode, GraphNodeType, GraphRepairGeneration,
+        GraphRepairMode, GraphRepairState, HistoricalGraphReferenceStatus,
+        HistoricalReferenceStatus, StoredChunk, UnresolvedRelationship, VerificationKind,
+        VerificationStatus, VerificationSubject, VerificationSubjectKind,
+    };
+    use crate::service::{
+        EventEvidenceDecoderRegistry, ExperienceSearchService, FailureNormalizationService,
     };
 
     use super::*;
@@ -5078,6 +7085,1170 @@ mod tests {
         assert_eq!(
             storage.recent_events(&workspace.id, 10).await.unwrap(),
             vec![event]
+        );
+    }
+
+    #[tokio::test]
+    async fn experience_repository_is_atomic_immutable_scoped_and_fts_projected() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let workspace = Workspace::new("C:/experience", "experience");
+        let foreign_workspace = Workspace::new("C:/experience-foreign", "experience-foreign");
+        storage.insert_workspace(&workspace).await.unwrap();
+        storage.insert_workspace(&foreign_workspace).await.unwrap();
+        let session = Session::new(&workspace.id, serde_json::json!({}));
+        storage.insert_session(&session).await.unwrap();
+        let task = Task::new(
+            &workspace.id,
+            Some(session.id.clone()),
+            "experience persistence",
+            serde_json::json!({}),
+        );
+        storage.insert_task(&task).await.unwrap();
+        let episode = Episode::new(
+            &workspace.id,
+            &session.id,
+            Some(task.id.clone()),
+            EpisodeType::Debugging,
+            None,
+            EpisodeCreator::User,
+        );
+        storage.insert_episode(&episode).await.unwrap();
+        let snapshot_content = "fn run() {}";
+        let snapshot_hash = blake3::hash(snapshot_content.as_bytes())
+            .to_hex()
+            .to_string();
+        let mut events = Vec::new();
+        for (event_type, payload) in [
+            (
+                EventType::CompilerResult,
+                serde_json::json!({
+                    "contract": "cortexweave.rust_compiler_result",
+                    "version": 1,
+                    "subject": { "kind": "target", "value": "core-tests" },
+                    "exit_code": 1,
+                    "diagnostics": [{
+                        "level": "error",
+                        "code": "E0308",
+                        "message": "mismatched types",
+                        "expected_type": "String",
+                        "actual_type": "u32",
+                        "path": "src/lib.rs",
+                        "start_line": 1,
+                        "start_column": 1
+                    }]
+                }),
+            ),
+            (
+                EventType::FileModified,
+                serde_json::json!({
+                    "contract": "cortexweave.source_change_observation",
+                    "version": 1,
+                    "change": "modified",
+                    "path": "src/lib.rs",
+                    "previous_path": null,
+                    "workspace_content_revision": 12,
+                    "document_content_revision": 3,
+                    "content_hash": snapshot_hash
+                }),
+            ),
+            (
+                EventType::TestResult,
+                serde_json::json!({
+                    "contract": "cortexweave.cargo_test_result",
+                    "version": 1,
+                    "subject": { "kind": "target", "value": "core-tests" },
+                    "exit_code": 0,
+                    "executed_test_count": 1,
+                    "failures": []
+                }),
+            ),
+            (
+                EventType::TestResult,
+                serde_json::json!({
+                    "contract": "cortexweave.cargo_test_result",
+                    "version": 1,
+                    "subject": { "kind": "test", "value": "other::still_fails" },
+                    "exit_code": 101,
+                    "executed_test_count": 1,
+                    "failures": [{
+                        "test_name": "other::still_fails",
+                        "assertion_class": "assert_eq",
+                        "message": "left != right"
+                    }]
+                }),
+            ),
+            (
+                EventType::CompilerResult,
+                serde_json::json!({
+                    "contract": "cortexweave.rust_compiler_result",
+                    "version": 1,
+                    "subject": { "kind": "target", "value": "core-tests" },
+                    "exit_code": 1,
+                    "diagnostics": [{
+                        "level": "error",
+                        "code": "E0308",
+                        "message": "mismatched types",
+                        "expected_type": "String",
+                        "actual_type": "u32",
+                        "path": "src/lib.rs",
+                        "start_line": 1,
+                        "start_column": 1
+                    }]
+                }),
+            ),
+            (
+                EventType::CompilerResult,
+                serde_json::json!({
+                    "contract": "cortexweave.rust_compiler_result",
+                    "version": 1,
+                    "subject": { "kind": "target", "value": "core-tests" },
+                    "exit_code": 1,
+                    "diagnostics": [{
+                        "level": "error",
+                        "code": "E0425",
+                        "message": "cannot find value",
+                        "path": "src/lib.rs",
+                        "start_line": 1,
+                        "start_column": 1
+                    }]
+                }),
+            ),
+        ]
+        .into_iter()
+        {
+            let mut event = CortexEvent::new(&workspace.id, event_type, payload);
+            event.session_id = Some(session.id.clone());
+            event.task_id = Some(task.id.clone());
+            storage.insert_event(&event).await.unwrap();
+            events.push(event);
+        }
+        storage
+            .associate_episode_events(
+                &EpisodeEventAssociationRequest {
+                    workspace_id: workspace.id.clone(),
+                    episode_id: episode.id.clone(),
+                    expected_version: 0,
+                    request_key: "experience-test-members".into(),
+                    event_ids: events.iter().map(|event| event.id.clone()).collect(),
+                },
+                &"f".repeat(64),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let foreign = CortexEvent::new(
+            &foreign_workspace.id,
+            EventType::CompilerResult,
+            serde_json::json!({}),
+        );
+        storage.insert_event(&foreign).await.unwrap();
+
+        let decoder = EventEvidenceDecoderRegistry::standard().unwrap();
+        for event in &events {
+            assert!(
+                decoder.decode(event).decoded().is_some(),
+                "the hand-constructed proof uses only valid typed evidence"
+            );
+        }
+        let decoded_failure = decoder.decode(&events[0]);
+        let failure_signature = match FailureNormalizationService::standard()
+            .unwrap()
+            .normalize(decoded_failure.decoded().unwrap())
+        {
+            FailureNormalizationResult::Normalized { normalization } => normalization.signature,
+            FailureNormalizationResult::Unsupported { reason } => {
+                panic!("hand-constructed failure must normalize: {}", reason.code)
+            }
+        };
+        let repeated_failure = decoder.decode(&events[4]);
+        let changed_failure = decoder.decode(&events[5]);
+        let normalizer = FailureNormalizationService::standard().unwrap();
+        let signature_key = |result| match result {
+            FailureNormalizationResult::Normalized { normalization } => {
+                normalization.signature.normalized_key
+            }
+            FailureNormalizationResult::Unsupported { reason } => {
+                panic!("comparison failure must normalize: {}", reason.code)
+            }
+        };
+        assert_eq!(
+            signature_key(normalizer.normalize(repeated_failure.decoded().unwrap())),
+            failure_signature.normalized_key,
+            "still_failing is backed by the exact normalized failure"
+        );
+        assert_ne!(
+            signature_key(normalizer.normalize(changed_failure.decoded().unwrap())),
+            failure_signature.normalized_key,
+            "verification_changed_failure is backed by a distinct normalized failure"
+        );
+
+        let make_record = |id: &str, fingerprint: &str| {
+            let experience = Experience::from_draft(ExperienceDraft {
+                workspace_id: workspace.id.clone(),
+                session_id: session.id.clone(),
+                task_id: Some(task.id.clone()),
+                episode_id: episode.id.clone(),
+                failure_signature: Some(failure_signature.clone()),
+                outcome: ExperienceOutcome::Inconclusive,
+                verification: ExperienceVerification {
+                    status: VerificationStatus::Missing,
+                    observations: Vec::new(),
+                    reasons: vec!["no scoped verifier".into()],
+                },
+                evidence_strength: EvidenceStrengthAssessment {
+                    strength: EvidenceStrength::Weak,
+                    bases: vec![EvidenceBasis::TemporalAssociation],
+                },
+                extractor_id: "test.extractor".into(),
+                extractor_version: "1".into(),
+                canonicalization_version: crate::domain::EXPERIENCE_CANONICALIZATION_VERSION.into(),
+                consolidation_fingerprint: fingerprint.into(),
+                proposal_hash: "b".repeat(64),
+                attempts: 1,
+            });
+            let mut experience = experience;
+            experience.id = id.into();
+            ExperienceRecord {
+                attempts: vec![ExperienceAttempt {
+                    id: format!("{id}-attempt"),
+                    workspace_id: workspace.id.clone(),
+                    experience_id: id.into(),
+                    ordinal: 0,
+                    result: AttemptResult::Inconclusive,
+                    change_evidence_ordinals: vec![1],
+                    following_verification_ordinal: None,
+                }],
+                evidence: vec![
+                    ExperienceEvidenceLink {
+                        ordinal: 0,
+                        relation: ExperienceEvidenceRelation::InitialFailure,
+                        event_id: events[0].id.clone(),
+                    },
+                    ExperienceEvidenceLink {
+                        ordinal: 1,
+                        relation: ExperienceEvidenceRelation::AttemptChange,
+                        event_id: events[1].id.clone(),
+                    },
+                ],
+                code_snapshots: vec![ExperienceCodeSnapshot {
+                    ordinal: 0,
+                    source_event_id: events[1].id.clone(),
+                    relative_path: "src/lib.rs".into(),
+                    workspace_content_revision: 12,
+                    document_content_revision: 3,
+                    document_content_hash: snapshot_hash.clone(),
+                    content: snapshot_content.into(),
+                    chunk_stable_key: Some("rust:function:crate::run".into()),
+                    chunk_content_hash: Some(snapshot_hash.clone()),
+                    symbol_logical_key: Some("crate::run".into()),
+                    symbol_label: Some("run".into()),
+                    source_start_byte: Some(0),
+                    source_end_byte: Some(snapshot_content.len() as i64),
+                }],
+                graph_snapshots: vec![ExperienceGraphSnapshot {
+                    ordinal: 0,
+                    code_snapshot_ordinal: 0,
+                    graph_content_revision: 12,
+                    graph_schema_version: 1,
+                    graph_state: crate::domain::GraphState::Current,
+                    analyzer_id: "rust".into(),
+                    analyzer_version: "1".into(),
+                    structure_version: "1".into(),
+                    node_stable_key: "rust:function:crate::run".into(),
+                    node_type: crate::domain::GraphNodeType::Function,
+                    resolution_provenance: serde_json::json!({"edges": 2}),
+                }],
+                experience,
+            }
+        };
+        let record = make_record("experience-1", &"a".repeat(64));
+        assert!(matches!(
+            storage.insert_experience(&record).await,
+            Err(CortexError::Analysis(message)) if message.contains("closed")
+        ));
+        storage
+            .transition_episode(
+                &EpisodeTerminalRequest {
+                    workspace_id: workspace.id.clone(),
+                    episode_id: episode.id.clone(),
+                    expected_version: 1,
+                    request_key: "experience-test-close".into(),
+                },
+                EpisodeStatus::Closed,
+                &"e".repeat(64),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let mut mismatched_scope = make_record("experience-mismatched-scope", &"9".repeat(64));
+        mismatched_scope.experience.task_id = None;
+        assert!(matches!(
+            storage.insert_experience(&mismatched_scope).await,
+            Err(CortexError::Analysis(message)) if message.contains("scope")
+        ));
+        assert_eq!(storage.insert_experience(&record).await.unwrap(), record);
+        assert_eq!(
+            storage
+                .experience(&workspace.id, "experience-1")
+                .await
+                .unwrap(),
+            Some(record.clone())
+        );
+        let document = Document::new(&workspace.id, "src/lib.rs");
+        storage.insert_document(&document).await.unwrap();
+        let chunk = StoredChunk::new(&document.id, "crate::run", "fn run() {}");
+        storage.insert_chunk(&chunk).await.unwrap();
+        sqlx::query("DELETE FROM chunks WHERE id = ?")
+            .bind(&chunk.id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .experience(&workspace.id, "experience-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .code_snapshots[0]
+                .content,
+            "fn run() {}",
+            "historical code snapshots do not depend on current chunks"
+        );
+        let fts_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM experience_fts WHERE experience_id = ?")
+                .bind("experience-1")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(fts_count, 1);
+        let candidates = storage
+            .experience_search_candidates(ExperienceCandidateQuery {
+                workspace_id: &workspace.id,
+                exact_failure_key: Some(&failure_signature.normalized_key),
+                components: &failure_signature.components,
+                lexical_query: Some("\"Observed\""),
+                path: Some("src/lib.rs"),
+                graph_stable_key: Some("rust:function:crate::run"),
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(candidates.exact_signature, vec!["experience-1"]);
+        assert!(
+            candidates
+                .compatible_components
+                .contains(&"experience-1".into())
+        );
+        assert_eq!(candidates.lexical, vec!["experience-1"]);
+        assert_eq!(candidates.path, vec!["experience-1"]);
+        assert_eq!(candidates.graph_stable_key, vec!["experience-1"]);
+
+        let assessment = ExperienceAssessment {
+            id: "assessment-1".into(),
+            workspace_id: workspace.id.clone(),
+            experience_id: "experience-1".into(),
+            kind: ExperienceAssessmentKind::Confirmed,
+            actor: "reviewer".into(),
+            reason: "historical inspection".into(),
+            replacement_experience_id: None,
+            evidence_event_ids: vec![events[2].id.clone()],
+            created_at: Utc::now(),
+        };
+        storage
+            .append_experience_assessment(&assessment)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .experience_assessments(&workspace.id, "experience-1")
+                .await
+                .unwrap(),
+            vec![assessment]
+        );
+        assert!(
+            sqlx::query("UPDATE experiences SET summary = 'rewritten' WHERE id = ?")
+                .bind("experience-1")
+                .execute(storage.pool())
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query("UPDATE experience_assessments SET reason = 'rewritten' WHERE id = ?")
+                .bind("assessment-1")
+                .execute(storage.pool())
+                .await
+                .is_err()
+        );
+
+        let mut foreign_record = make_record("experience-foreign", &"c".repeat(64));
+        foreign_record.evidence[1].event_id = foreign.id;
+        assert!(storage.insert_experience(&foreign_record).await.is_err());
+        let mut invalid_relation = make_record("experience-invalid-relation", &"f".repeat(64));
+        invalid_relation.evidence[1].relation = ExperienceEvidenceRelation::InitialFailure;
+        assert!(
+            storage.insert_experience(&invalid_relation).await.is_err(),
+            "SQLite rejects a file-change event labeled as initial failure evidence"
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM experiences WHERE workspace_id = ?")
+                .bind(&workspace.id)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 1,
+            "failed evidence link rolls back its parent and children"
+        );
+
+        assert_eq!(
+            storage.insert_experience(&record).await.unwrap(),
+            record,
+            "same fingerprint and proposal is idempotent"
+        );
+        let mut conflicting = make_record("experience-conflict", &"a".repeat(64));
+        conflicting.experience.proposal_hash = "c".repeat(64);
+        assert!(matches!(
+            storage.insert_experience(&conflicting).await,
+            Err(CortexError::Conflict(_))
+        ));
+
+        let mut unsupported_success = make_record("unsupported-success", &"d".repeat(64));
+        unsupported_success.experience.outcome = ExperienceOutcome::Success;
+        unsupported_success.experience.summary = crate::domain::render_summary(
+            unsupported_success.experience.failure_signature.as_ref(),
+            ExperienceOutcome::Success,
+            &unsupported_success.experience.verification,
+            1,
+        );
+        assert!(matches!(
+            validate_experience_record(&unsupported_success),
+            Err(CortexError::Analysis(message)) if message.contains("outcome")
+        ));
+
+        let make_failed_attempt = |id: &str, event_index: usize, result| {
+            let mut failed = make_record(id, &"7".repeat(64));
+            failed.experience.outcome = ExperienceOutcome::Failure;
+            failed.evidence.push(ExperienceEvidenceLink {
+                ordinal: 2,
+                relation: ExperienceEvidenceRelation::AttemptVerification,
+                event_id: events[event_index].id.clone(),
+            });
+            failed.attempts[0].result = result;
+            failed.attempts[0].following_verification_ordinal = Some(2);
+            failed.experience.verification = ExperienceVerification {
+                status: VerificationStatus::VerifiedFailed,
+                observations: vec![ExperienceVerificationObservation {
+                    ordinal: 0,
+                    status: VerificationStatus::VerifiedFailed,
+                    kind: VerificationKind::RustCompiler,
+                    subject: VerificationSubject {
+                        kind: VerificationSubjectKind::Target,
+                        value: "core-tests".into(),
+                    },
+                    evidence_event_id: events[event_index].id.clone(),
+                    rule_id: "rust.compiler".into(),
+                    rule_version: "1".into(),
+                }],
+                reasons: vec!["scoped compiler verification failed".into()],
+            };
+            failed.experience.evidence_strength = EvidenceStrengthAssessment {
+                strength: EvidenceStrength::Moderate,
+                bases: vec![EvidenceBasis::DeterministicVerifier],
+            };
+            failed.experience.summary = crate::domain::render_summary(
+                failed.experience.failure_signature.as_ref(),
+                ExperienceOutcome::Failure,
+                &failed.experience.verification,
+                1,
+            );
+            failed
+        };
+        validate_experience_record(&make_failed_attempt(
+            "still-failing",
+            4,
+            AttemptResult::StillFailing,
+        ))
+        .unwrap();
+        validate_experience_record(&make_failed_attempt(
+            "changed-failure",
+            5,
+            AttemptResult::VerificationChangedFailure,
+        ))
+        .unwrap();
+
+        let mut verified_success = make_record("verified-success", &"e".repeat(64));
+        verified_success.experience.outcome = ExperienceOutcome::Success;
+        verified_success.evidence.push(ExperienceEvidenceLink {
+            ordinal: 2,
+            relation: ExperienceEvidenceRelation::AttemptVerification,
+            event_id: events[2].id.clone(),
+        });
+        verified_success.experience.verification = ExperienceVerification {
+            status: VerificationStatus::VerifiedPassed,
+            observations: vec![ExperienceVerificationObservation {
+                ordinal: 0,
+                status: VerificationStatus::VerifiedPassed,
+                kind: VerificationKind::CargoTest,
+                subject: VerificationSubject {
+                    kind: VerificationSubjectKind::Target,
+                    value: "core-tests".into(),
+                },
+                evidence_event_id: events[2].id.clone(),
+                rule_id: "cargo.test".into(),
+                rule_version: "1".into(),
+            }],
+            reasons: vec!["scoped verifier passed".into()],
+        };
+        verified_success.experience.evidence_strength = EvidenceStrengthAssessment {
+            strength: EvidenceStrength::Moderate,
+            bases: vec![EvidenceBasis::DeterministicVerifier],
+        };
+        verified_success.attempts[0].result = AttemptResult::VerificationPassed;
+        verified_success.attempts[0].following_verification_ordinal = Some(2);
+        verified_success.experience.summary = crate::domain::render_summary(
+            verified_success.experience.failure_signature.as_ref(),
+            ExperienceOutcome::Success,
+            &verified_success.experience.verification,
+            1,
+        );
+        validate_experience_record(&verified_success).unwrap();
+        assert_eq!(
+            storage.insert_experience(&verified_success).await.unwrap(),
+            verified_success,
+            "ordered verification observations round-trip through their own table"
+        );
+
+        let distinct_record =
+            |id: &str, fingerprint: &str, signature: crate::domain::FailureSignature| {
+                let mut value = make_record(id, fingerprint);
+                value.experience.failure_signature = Some(signature);
+                value.experience.summary = crate::domain::render_summary(
+                    value.experience.failure_signature.as_ref(),
+                    value.experience.outcome,
+                    &value.experience.verification,
+                    value.attempts.len(),
+                );
+                value
+            };
+        let mut other_symbol_scope = failure_signature.scope.clone();
+        other_symbol_scope.symbol_key = Some("crate::other_symbol".into());
+        let other_symbol_signature = crate::domain::FailureSignature::new(
+            failure_signature.domain,
+            failure_signature.identity_capability,
+            failure_signature.components.clone(),
+            failure_signature.normalizer_id.clone(),
+            failure_signature.normalizer_version.clone(),
+            other_symbol_scope,
+        )
+        .unwrap();
+        let other_symbol = distinct_record(
+            "experience-other-symbol",
+            &"1".repeat(64),
+            other_symbol_signature,
+        );
+        storage.insert_experience(&other_symbol).await.unwrap();
+
+        let mut other_components = failure_signature.components.clone();
+        other_components.insert("diagnostic_code".into(), "E0425".into());
+        let other_failure_signature = crate::domain::FailureSignature::new(
+            failure_signature.domain,
+            failure_signature.identity_capability,
+            other_components,
+            failure_signature.normalizer_id.clone(),
+            failure_signature.normalizer_version.clone(),
+            failure_signature.scope.clone(),
+        )
+        .unwrap();
+        let other_failure = distinct_record(
+            "experience-other-failure",
+            &"2".repeat(64),
+            other_failure_signature,
+        );
+        assert_eq!(
+            other_failure.experience.summary, record.experience.summary,
+            "the lexical torture case deliberately has a similar summary"
+        );
+        storage.insert_experience(&other_failure).await.unwrap();
+
+        let disputed = make_record("experience-disputed", &"3".repeat(64));
+        storage.insert_experience(&disputed).await.unwrap();
+        storage
+            .append_experience_assessment(&ExperienceAssessment {
+                id: "assessment-disputed".into(),
+                workspace_id: workspace.id.clone(),
+                experience_id: disputed.experience.id.clone(),
+                kind: ExperienceAssessmentKind::Disputed,
+                actor: "reviewer".into(),
+                reason: "retrieval exclusion proof".into(),
+                replacement_experience_id: None,
+                evidence_event_ids: Vec::new(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let foreign_session = Session::new(&foreign_workspace.id, serde_json::json!({}));
+        storage.insert_session(&foreign_session).await.unwrap();
+        let foreign_task = Task::new(
+            &foreign_workspace.id,
+            Some(foreign_session.id.clone()),
+            "identical failure in another workspace",
+            serde_json::json!({}),
+        );
+        storage.insert_task(&foreign_task).await.unwrap();
+        let foreign_episode = Episode::new(
+            &foreign_workspace.id,
+            &foreign_session.id,
+            Some(foreign_task.id.clone()),
+            EpisodeType::Debugging,
+            None,
+            EpisodeCreator::User,
+        );
+        storage.insert_episode(&foreign_episode).await.unwrap();
+        let mut foreign_events = Vec::new();
+        for event_type in [EventType::CompilerResult, EventType::FileModified] {
+            let mut event = CortexEvent::new(
+                &foreign_workspace.id,
+                event_type,
+                serde_json::json!({"workspace_isolation": true}),
+            );
+            event.session_id = Some(foreign_session.id.clone());
+            event.task_id = Some(foreign_task.id.clone());
+            storage.insert_event(&event).await.unwrap();
+            foreign_events.push(event);
+        }
+        storage
+            .associate_episode_events(
+                &EpisodeEventAssociationRequest {
+                    workspace_id: foreign_workspace.id.clone(),
+                    episode_id: foreign_episode.id.clone(),
+                    expected_version: 0,
+                    request_key: "foreign-experience-members".into(),
+                    event_ids: foreign_events
+                        .iter()
+                        .map(|event| event.id.clone())
+                        .collect(),
+                },
+                &"4".repeat(64),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        storage
+            .transition_episode(
+                &EpisodeTerminalRequest {
+                    workspace_id: foreign_workspace.id.clone(),
+                    episode_id: foreign_episode.id.clone(),
+                    expected_version: 1,
+                    request_key: "foreign-experience-close".into(),
+                },
+                EpisodeStatus::Closed,
+                &"5".repeat(64),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let mut foreign_scope = failure_signature.scope.clone();
+        foreign_scope.workspace_id = foreign_workspace.id.clone();
+        let foreign_signature = crate::domain::FailureSignature::new(
+            failure_signature.domain,
+            failure_signature.identity_capability,
+            failure_signature.components.clone(),
+            failure_signature.normalizer_id.clone(),
+            failure_signature.normalizer_version.clone(),
+            foreign_scope,
+        )
+        .unwrap();
+        let mut identical_foreign = distinct_record(
+            "experience-identical-foreign",
+            &"6".repeat(64),
+            foreign_signature.clone(),
+        );
+        identical_foreign.experience.workspace_id = foreign_workspace.id.clone();
+        identical_foreign.experience.session_id = foreign_session.id.clone();
+        identical_foreign.experience.task_id = Some(foreign_task.id.clone());
+        identical_foreign.experience.episode_id = foreign_episode.id.clone();
+        for attempt in &mut identical_foreign.attempts {
+            attempt.workspace_id = foreign_workspace.id.clone();
+        }
+        identical_foreign.evidence[0].event_id = foreign_events[0].id.clone();
+        identical_foreign.evidence[1].event_id = foreign_events[1].id.clone();
+        identical_foreign.code_snapshots[0].source_event_id = foreign_events[1].id.clone();
+        storage.insert_experience(&identical_foreign).await.unwrap();
+
+        let search = ExperienceSearchService::new(std::sync::Arc::new(storage.clone()));
+        let request = |query: Option<&str>| ExperienceSearchRequest {
+            workspace_id: workspace.id.clone(),
+            query: query.map(str::to_owned),
+            exact_failure_signature: Some(failure_signature.clone()),
+            compatible_components: BTreeMap::new(),
+            path: None,
+            graph_stable_key: None,
+            outcomes: Vec::new(),
+            strengths: Vec::new(),
+            lifecycles: Vec::new(),
+            include_historical: false,
+            created_after: None,
+            created_before: None,
+            limit: 20,
+        };
+        let exact_and_lexical = search.search(&request(Some("Observed"))).await.unwrap();
+        let by_id = exact_and_lexical
+            .iter()
+            .map(|hit| (hit.experience.id.as_str(), hit))
+            .collect::<BTreeMap<_, _>>();
+        assert!(by_id.contains_key("experience-1"));
+        assert!(by_id.contains_key("verified-success"));
+        assert!(by_id.contains_key("experience-other-symbol"));
+        assert!(by_id.contains_key("experience-other-failure"));
+        assert!(!by_id.contains_key("experience-disputed"));
+        assert!(!by_id.contains_key("experience-identical-foreign"));
+        assert!(
+            by_id["experience-1"].explanation.scores.exact_signature
+                > by_id["experience-other-failure"].explanation.scores.total
+        );
+        assert_eq!(
+            by_id["experience-other-symbol"]
+                .explanation
+                .scores
+                .exact_signature,
+            0
+        );
+        assert!(
+            by_id["experience-other-symbol"]
+                .explanation
+                .scores
+                .compatible_components
+                > 0
+        );
+        assert!(
+            by_id["experience-other-failure"]
+                .explanation
+                .scores
+                .compatible_components
+                < by_id["experience-other-symbol"]
+                    .explanation
+                    .scores
+                    .compatible_components
+        );
+
+        let mut query_only = request(Some("term-that-does-not-exist"));
+        query_only.exact_failure_signature = None;
+        assert!(search.search(&query_only).await.unwrap().is_empty());
+        let mut path_only = request(None);
+        path_only.exact_failure_signature = None;
+        path_only.path = Some("src/lib.rs".into());
+        assert!(!search.search(&path_only).await.unwrap().is_empty());
+        let mut graph_only = path_only.clone();
+        graph_only.path = None;
+        graph_only.graph_stable_key = Some("rust:function:crate::run".into());
+        assert!(!search.search(&graph_only).await.unwrap().is_empty());
+
+        let mut successful = request(None);
+        successful.outcomes = vec![ExperienceOutcome::Success];
+        assert_eq!(
+            search
+                .search(&successful)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.experience.id)
+                .collect::<Vec<_>>(),
+            vec!["verified-success"]
+        );
+        let mut disputed_only = request(None);
+        disputed_only.lifecycles = vec![ExperienceLifecycle::Disputed];
+        assert_eq!(
+            search.search(&disputed_only).await.unwrap()[0]
+                .experience
+                .id,
+            "experience-disputed"
+        );
+        let mut historical = request(None);
+        historical.include_historical = true;
+        let historical_hits = search.search(&historical).await.unwrap();
+        let disputed = historical_hits
+            .iter()
+            .find(|hit| hit.experience.id == "experience-disputed")
+            .expect("explicit historical inspection returns disputed history");
+        assert_eq!(
+            disputed.explanation.eligibility.inclusion,
+            ExperienceEligibilityInclusion::HistoricalInspection
+        );
+        let foreign_request = ExperienceSearchRequest {
+            workspace_id: foreign_workspace.id.clone(),
+            query: Some("Observed".into()),
+            exact_failure_signature: Some(foreign_signature),
+            compatible_components: BTreeMap::new(),
+            path: None,
+            graph_stable_key: None,
+            outcomes: Vec::new(),
+            strengths: Vec::new(),
+            lifecycles: Vec::new(),
+            include_historical: false,
+            created_after: None,
+            created_before: None,
+            limit: 20,
+        };
+        assert_eq!(
+            search.search(&foreign_request).await.unwrap()[0]
+                .experience
+                .id,
+            "experience-identical-foreign"
+        );
+
+        let mut current_node = GraphNode::new(
+            &workspace.id,
+            GraphNodeType::Function,
+            "rust:function:crate::run",
+            "run",
+        );
+        current_node.document_id = Some(document.id.clone());
+        let graph_revision = storage
+            .workspace_graph_revision(&workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        current_node.content_revision = graph_revision.content_revision;
+        let current_node = storage.upsert_graph_node(&current_node).await.unwrap();
+        assert!(
+            storage
+                .acknowledge_graph_revision(
+                    &workspace.id,
+                    graph_revision.content_revision,
+                    Utc::now(),
+                )
+                .await
+                .unwrap()
+        );
+        let explanation = search
+            .get(&workspace.id, "experience-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            explanation.references[0].status,
+            HistoricalReferenceStatus::ContentChanged
+        );
+        assert_eq!(
+            explanation.references[0].graph_status,
+            HistoricalGraphReferenceStatus::Current
+        );
+        assert_eq!(
+            explanation.references[0].current_graph_node_id,
+            Some(current_node.id.clone())
+        );
+        sqlx::query(
+            "UPDATE workspace_graph_revisions SET graph_state = 'stale' WHERE workspace_id = ?",
+        )
+        .bind(&workspace.id)
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        let stale_graph = search
+            .get(&workspace.id, "experience-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stale_graph.references[0].status,
+            HistoricalReferenceStatus::ContentChanged,
+            "current document evidence stays independently visible"
+        );
+        assert_eq!(
+            stale_graph.references[0].graph_status,
+            HistoricalGraphReferenceStatus::Unavailable,
+            "a stale graph cannot resolve historical symbols as current"
+        );
+        sqlx::query(
+            "UPDATE workspace_graph_revisions SET graph_state = 'current' WHERE workspace_id = ?",
+        )
+        .bind(&workspace.id)
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        storage
+            .delete_graph_node(&workspace.id, &current_node.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            search
+                .get(&workspace.id, "experience-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .references[0]
+                .graph_status,
+            HistoricalGraphReferenceStatus::Missing
+        );
+        storage
+            .delete_document(&workspace.id, "src/lib.rs")
+            .await
+            .unwrap();
+        assert_eq!(
+            search
+                .get(&workspace.id, "experience-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .references[0]
+                .status,
+            HistoricalReferenceStatus::Deleted
+        );
+
+        storage
+            .append_experience_assessment(&ExperienceAssessment {
+                id: "assessment-superseded".into(),
+                workspace_id: workspace.id.clone(),
+                experience_id: "experience-1".into(),
+                kind: ExperienceAssessmentKind::Superseded,
+                actor: "reviewer".into(),
+                reason: "new immutable interpretation".into(),
+                replacement_experience_id: Some("verified-success".into()),
+                evidence_event_ids: Vec::new(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .append_experience_assessment(&ExperienceAssessment {
+                    id: "assessment-cycle".into(),
+                    workspace_id: workspace.id.clone(),
+                    experience_id: "verified-success".into(),
+                    kind: ExperienceAssessmentKind::Superseded,
+                    actor: "reviewer".into(),
+                    reason: "would form a cycle".into(),
+                    replacement_experience_id: Some("experience-1".into()),
+                    evidence_event_ids: Vec::new(),
+                    created_at: Utc::now(),
+                })
+                .await
+                .is_err(),
+            "SQLite rejects experience supersession cycles"
+        );
+
+        let mut partial = verified_success.clone();
+        partial.experience.id = "partial-success".into();
+        partial.experience.outcome = ExperienceOutcome::PartialSuccess;
+        partial.attempts[0].experience_id = partial.experience.id.clone();
+        partial.evidence.push(ExperienceEvidenceLink {
+            ordinal: 3,
+            relation: ExperienceEvidenceRelation::TerminalVerification,
+            event_id: events[3].id.clone(),
+        });
+        partial
+            .experience
+            .verification
+            .observations
+            .push(ExperienceVerificationObservation {
+                ordinal: 1,
+                status: VerificationStatus::VerifiedFailed,
+                kind: VerificationKind::CargoTest,
+                subject: VerificationSubject {
+                    kind: VerificationSubjectKind::Test,
+                    value: "other::still_fails".into(),
+                },
+                evidence_event_id: events[3].id.clone(),
+                rule_id: "cargo.test".into(),
+                rule_version: "1".into(),
+            });
+        partial.experience.verification.status = VerificationStatus::Conflicting;
+        partial.experience.summary = crate::domain::render_summary(
+            partial.experience.failure_signature.as_ref(),
+            ExperienceOutcome::PartialSuccess,
+            &partial.experience.verification,
+            1,
+        );
+        validate_experience_record(&partial).unwrap();
+        let mut same_scope_conflict = partial;
+        same_scope_conflict.experience.verification.observations[1].subject = VerificationSubject {
+            kind: VerificationSubjectKind::Target,
+            value: "core-tests".into(),
+        };
+        same_scope_conflict.experience.summary = crate::domain::render_summary(
+            same_scope_conflict.experience.failure_signature.as_ref(),
+            ExperienceOutcome::PartialSuccess,
+            &same_scope_conflict.experience.verification,
+            1,
+        );
+        assert!(matches!(
+            validate_experience_record(&same_scope_conflict),
+            Err(CortexError::Analysis(message)) if message.contains("outcome")
+        ));
+    }
+
+    #[tokio::test]
+    async fn episode_repository_enforces_primary_scope_order_and_terminal_membership() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let workspace = Workspace::new("C:/episodes", "episodes");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let session = Session::new(&workspace.id, serde_json::json!({}));
+        storage.insert_session(&session).await.unwrap();
+        let task = Task::new(
+            &workspace.id,
+            Some(session.id.clone()),
+            "persist episode",
+            serde_json::json!({}),
+        );
+        storage.insert_task(&task).await.unwrap();
+        let episode = Episode::new(
+            &workspace.id,
+            &session.id,
+            Some(task.id.clone()),
+            crate::domain::EpisodeType::Debugging,
+            None,
+            crate::domain::EpisodeCreator::User,
+        );
+        storage.insert_episode(&episode).await.unwrap();
+
+        let mut mismatched = CortexEvent::new(
+            &workspace.id,
+            EventType::FileModified,
+            serde_json::json!({}),
+        );
+        mismatched.session_id = Some(session.id.clone());
+        storage.insert_event(&mismatched).await.unwrap();
+        let mismatch = sqlx::query(
+            "INSERT INTO episode_events(workspace_id, episode_id, event_id, ordinal, associated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&workspace.id)
+        .bind(&episode.id)
+        .bind(&mismatched.id)
+        .bind(0_i64)
+        .bind(Utc::now())
+        .execute(storage.pool())
+        .await
+        .unwrap_err();
+        assert!(
+            mismatch
+                .to_string()
+                .contains("episode event provenance mismatch")
+        );
+
+        let mut matching =
+            CortexEvent::new(&workspace.id, EventType::TaskUpdated, serde_json::json!({}));
+        matching.session_id = Some(session.id.clone());
+        matching.task_id = Some(task.id.clone());
+        storage.insert_event(&matching).await.unwrap();
+        let associated = storage
+            .associate_episode_events(
+                &EpisodeEventAssociationRequest {
+                    workspace_id: workspace.id.clone(),
+                    episode_id: episode.id.clone(),
+                    expected_version: 0,
+                    request_key: "repository-add".into(),
+                    event_ids: vec![matching.id.clone()],
+                },
+                &"a".repeat(64),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(associated.version, 1);
+        assert_eq!(
+            storage
+                .episode_events(&workspace.id, &episode.id, 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|member| member.ordinal)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+
+        let mut fill_ids = Vec::new();
+        for index in 1..MAX_EPISODE_EVENTS {
+            let mut event = CortexEvent::new(
+                &workspace.id,
+                EventType::TaskUpdated,
+                serde_json::json!({"index": index}),
+            );
+            event.session_id = Some(session.id.clone());
+            event.task_id = Some(task.id.clone());
+            storage.insert_event(&event).await.unwrap();
+            fill_ids.push(event.id);
+        }
+        let filled = storage
+            .associate_episode_events(
+                &EpisodeEventAssociationRequest {
+                    workspace_id: workspace.id.clone(),
+                    episode_id: episode.id.clone(),
+                    expected_version: 1,
+                    request_key: "repository-fill".into(),
+                    event_ids: fill_ids,
+                },
+                &"c".repeat(64),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filled.version, 2);
+        let mut overflow = CortexEvent::new(
+            &workspace.id,
+            EventType::TaskUpdated,
+            serde_json::json!({"overflow": true}),
+        );
+        overflow.session_id = Some(session.id.clone());
+        overflow.task_id = Some(task.id.clone());
+        storage.insert_event(&overflow).await.unwrap();
+        assert!(matches!(
+            storage
+                .associate_episode_events(
+                    &EpisodeEventAssociationRequest {
+                        workspace_id: workspace.id.clone(),
+                        episode_id: episode.id.clone(),
+                        expected_version: 2,
+                        request_key: "repository-overflow".into(),
+                        event_ids: vec![overflow.id],
+                    },
+                    &"d".repeat(64),
+                    Utc::now(),
+                )
+                .await,
+            Err(CortexError::Analysis(_))
+        ));
+        assert_eq!(
+            storage
+                .episode(&workspace.id, &episode.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            2,
+            "a rejected over-cap batch rolls back its optimistic version"
+        );
+
+        let closed = storage
+            .transition_episode(
+                &EpisodeTerminalRequest {
+                    workspace_id: workspace.id.clone(),
+                    episode_id: episode.id.clone(),
+                    expected_version: 2,
+                    request_key: "repository-close".into(),
+                },
+                EpisodeStatus::Closed,
+                &"b".repeat(64),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(closed.status, EpisodeStatus::Closed);
+        let after_close = sqlx::query(
+            "INSERT INTO episode_events(workspace_id, episode_id, event_id, ordinal, associated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&workspace.id)
+        .bind(&episode.id)
+        .bind(&matching.id)
+        .bind(1_i64)
+        .bind(Utc::now())
+        .execute(storage.pool())
+        .await
+        .unwrap_err();
+        assert!(
+            after_close
+                .to_string()
+                .contains("episode membership requires an open episode")
         );
     }
 

@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -9,6 +12,10 @@ use serde::Serialize;
 
 use crate::{
     CortexError, Result,
+    domain::{
+        ConsolidationAcceptance, ConsolidationPreview, ContextPacket, ExperienceSearchRequest,
+        FailureNormalizationResult,
+    },
     embedding::{EmbeddingLimits, EmbeddingProvider, TokenCountAccuracy},
     storage::SqliteStorage,
 };
@@ -39,6 +46,9 @@ pub struct InstrumentationSnapshot {
     pub fallback_usage: usize,
     pub memories: usize,
     pub events: usize,
+    pub episodes: usize,
+    pub experiences: usize,
+    pub experience_assessments: usize,
     pub pending_jobs: usize,
     pub failed_jobs: usize,
     pub embedding_calls: usize,
@@ -58,6 +68,19 @@ pub struct InstrumentationSnapshot {
     pub embedding_latency: LatencySummary,
     pub search_latency: LatencySummary,
     pub analyzer_latency: LatencySummary,
+    pub episode_mutation_latency: LatencySummary,
+    pub consolidation_latency: LatencySummary,
+    pub experience_search_latency: LatencySummary,
+    pub context_assembly_latency: LatencySummary,
+    pub consolidation_previews: usize,
+    pub consolidation_acceptance_attempts: usize,
+    pub consolidation_accepted: usize,
+    pub consolidation_preview_no_results: BTreeMap<String, usize>,
+    pub consolidation_acceptance_no_results: BTreeMap<String, usize>,
+    pub failure_signature_outcomes: BTreeMap<String, usize>,
+    pub experience_search_components: BTreeMap<String, usize>,
+    pub context_items_by_source_type: BTreeMap<String, usize>,
+    pub context_tokens_by_source_type: BTreeMap<String, usize>,
     pub filesystem_events: usize,
     pub coalesced_events: usize,
     pub chunks_added: usize,
@@ -95,6 +118,19 @@ pub(crate) struct RuntimeMetrics {
     embedding_latency: LatencyAccumulator,
     search_latency: LatencyAccumulator,
     analyzer_latency: LatencyAccumulator,
+    episode_mutation_latency: LatencyAccumulator,
+    consolidation_latency: LatencyAccumulator,
+    experience_search_latency: LatencyAccumulator,
+    context_assembly_latency: LatencyAccumulator,
+    consolidation_previews: AtomicUsize,
+    consolidation_acceptance_attempts: AtomicUsize,
+    consolidation_accepted: AtomicUsize,
+    consolidation_preview_no_results: Mutex<BTreeMap<String, usize>>,
+    consolidation_acceptance_no_results: Mutex<BTreeMap<String, usize>>,
+    failure_signature_outcomes: Mutex<BTreeMap<String, usize>>,
+    experience_search_components: Mutex<BTreeMap<String, usize>>,
+    context_items_by_source_type: Mutex<BTreeMap<String, usize>>,
+    context_tokens_by_source_type: Mutex<BTreeMap<String, usize>>,
     filesystem_events: AtomicUsize,
     coalesced_events: AtomicUsize,
     chunks_added: AtomicUsize,
@@ -193,6 +229,105 @@ impl RuntimeMetrics {
         self.analyzer_latency.record(elapsed);
     }
 
+    pub(crate) fn record_episode_mutation(&self, elapsed: Duration) {
+        self.episode_mutation_latency.record(elapsed);
+    }
+
+    pub(crate) fn record_consolidation_preview(
+        &self,
+        preview: &ConsolidationPreview,
+        elapsed: Duration,
+    ) {
+        self.consolidation_previews.fetch_add(1, Ordering::Relaxed);
+        self.consolidation_latency.record(elapsed);
+        if let ConsolidationPreview::NoResult { reason, .. } = preview {
+            increment(
+                &self.consolidation_preview_no_results,
+                serde_json::to_string(reason)
+                    .unwrap_or_else(|_| "serialization_error".into())
+                    .trim_matches('"'),
+            );
+        }
+    }
+
+    pub(crate) fn record_consolidation_acceptance(
+        &self,
+        acceptance: &ConsolidationAcceptance,
+        elapsed: Duration,
+    ) {
+        self.consolidation_acceptance_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        self.consolidation_latency.record(elapsed);
+        match acceptance {
+            ConsolidationAcceptance::Accepted { .. } => {
+                self.consolidation_accepted.fetch_add(1, Ordering::Relaxed);
+            }
+            ConsolidationAcceptance::NoResult { reason, .. } => {
+                increment(
+                    &self.consolidation_acceptance_no_results,
+                    serde_json::to_string(reason)
+                        .unwrap_or_else(|_| "serialization_error".into())
+                        .trim_matches('"'),
+                );
+            }
+        }
+    }
+
+    pub(crate) fn record_failure_normalization(&self, result: &FailureNormalizationResult) {
+        let outcome = match result {
+            FailureNormalizationResult::Normalized { normalization } => {
+                format!("normalized:{}", normalization.signature.domain.as_str())
+            }
+            FailureNormalizationResult::Unsupported { reason } => {
+                format!("unsupported:{}", reason.code)
+            }
+        };
+        increment(&self.failure_signature_outcomes, &outcome);
+    }
+
+    pub(crate) fn record_experience_search(
+        &self,
+        request: &ExperienceSearchRequest,
+        elapsed: Duration,
+    ) {
+        self.experience_search_latency.record(elapsed);
+        for component in [
+            request.query.as_ref().map(|_| "query"),
+            request
+                .exact_failure_signature
+                .as_ref()
+                .map(|_| "exact_failure_signature"),
+            (!request.compatible_components.is_empty()).then_some("compatible_components"),
+            request.path.as_ref().map(|_| "path"),
+            request
+                .graph_stable_key
+                .as_ref()
+                .map(|_| "graph_stable_key"),
+            (!request.outcomes.is_empty()).then_some("outcomes"),
+            (!request.strengths.is_empty()).then_some("strengths"),
+            (!request.lifecycles.is_empty()).then_some("lifecycles"),
+            request.include_historical.then_some("include_historical"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            increment(&self.experience_search_components, component);
+        }
+    }
+
+    pub(crate) fn record_context_packet(&self, packet: &ContextPacket, elapsed: Duration) {
+        self.context_assembly_latency.record(elapsed);
+        for item in &packet.items {
+            let source_type = item.source_type.storage_name();
+            increment(&self.context_items_by_source_type, &source_type);
+            increment_by(
+                &self.context_tokens_by_source_type,
+                &source_type,
+                item.estimated_tokens,
+            );
+        }
+    }
+
     pub(crate) fn record_filesystem_events(&self, raw: usize, coalesced: usize) {
         self.filesystem_events.fetch_add(raw, Ordering::Relaxed);
         self.coalesced_events
@@ -236,6 +371,45 @@ impl RuntimeMetrics {
         snapshot.embedding_latency = self.embedding_latency.snapshot();
         snapshot.search_latency = self.search_latency.snapshot();
         snapshot.analyzer_latency = self.analyzer_latency.snapshot();
+        snapshot.episode_mutation_latency = self.episode_mutation_latency.snapshot();
+        snapshot.consolidation_latency = self.consolidation_latency.snapshot();
+        snapshot.experience_search_latency = self.experience_search_latency.snapshot();
+        snapshot.context_assembly_latency = self.context_assembly_latency.snapshot();
+        snapshot.consolidation_previews = self.consolidation_previews.load(Ordering::Relaxed);
+        snapshot.consolidation_acceptance_attempts = self
+            .consolidation_acceptance_attempts
+            .load(Ordering::Relaxed);
+        snapshot.consolidation_accepted = self.consolidation_accepted.load(Ordering::Relaxed);
+        snapshot.consolidation_preview_no_results = self
+            .consolidation_preview_no_results
+            .lock()
+            .expect("metrics lock poisoned")
+            .clone();
+        snapshot.consolidation_acceptance_no_results = self
+            .consolidation_acceptance_no_results
+            .lock()
+            .expect("metrics lock poisoned")
+            .clone();
+        snapshot.failure_signature_outcomes = self
+            .failure_signature_outcomes
+            .lock()
+            .expect("metrics lock poisoned")
+            .clone();
+        snapshot.experience_search_components = self
+            .experience_search_components
+            .lock()
+            .expect("metrics lock poisoned")
+            .clone();
+        snapshot.context_items_by_source_type = self
+            .context_items_by_source_type
+            .lock()
+            .expect("metrics lock poisoned")
+            .clone();
+        snapshot.context_tokens_by_source_type = self
+            .context_tokens_by_source_type
+            .lock()
+            .expect("metrics lock poisoned")
+            .clone();
         snapshot.filesystem_events = self.filesystem_events.load(Ordering::Relaxed);
         snapshot.coalesced_events = self.coalesced_events.load(Ordering::Relaxed);
         snapshot.chunks_added = self.chunks_added.load(Ordering::Relaxed);
@@ -316,6 +490,24 @@ pub(crate) async fn snapshot(
         filter,
     )
     .await?;
+    result.episodes = count(
+        storage,
+        "SELECT COUNT(*) FROM episodes WHERE (? = '' OR workspace_id = ?)",
+        filter,
+    )
+    .await?;
+    result.experiences = count(
+        storage,
+        "SELECT COUNT(*) FROM experiences WHERE (? = '' OR workspace_id = ?)",
+        filter,
+    )
+    .await?;
+    result.experience_assessments = count(
+        storage,
+        "SELECT COUNT(*) FROM experience_assessments WHERE (? = '' OR workspace_id = ?)",
+        filter,
+    )
+    .await?;
     result.chunks_by_language = grouped_counts(
         storage,
         "SELECT c.language, COUNT(*) FROM chunks c JOIN documents d ON d.id = c.document_id WHERE (? = '' OR d.workspace_id = ?) GROUP BY c.language ORDER BY c.language",
@@ -353,6 +545,15 @@ pub(crate) async fn snapshot(
         .or_else(|| stored_dimension.and_then(|dimension| usize::try_from(dimension).ok()));
     runtime.apply_to(&mut result);
     Ok(result)
+}
+
+fn increment(metrics: &Mutex<BTreeMap<String, usize>>, key: &str) {
+    increment_by(metrics, key, 1);
+}
+
+fn increment_by(metrics: &Mutex<BTreeMap<String, usize>>, key: &str, amount: usize) {
+    let mut metrics = metrics.lock().expect("metrics lock poisoned");
+    *metrics.entry(key.to_owned()).or_default() += amount;
 }
 
 async fn count(storage: &SqliteStorage, query: &str, filter: &str) -> Result<usize> {
@@ -415,5 +616,56 @@ mod tests {
         assert_eq!(snapshot.embedding_latency.samples, 1);
         assert_eq!(snapshot.search_latency.samples, 1);
         assert_eq!(snapshot.analyzer_latency.samples, 1);
+    }
+
+    #[test]
+    fn experience_metrics_are_bounded_and_observational() {
+        let metrics = RuntimeMetrics::default();
+        let preview = ConsolidationPreview::NoResult {
+            reason: crate::domain::ConsolidationNoResultReason::EpisodeEmpty,
+            diagnostics: Vec::new(),
+        };
+        metrics.record_consolidation_preview(&preview, Duration::from_micros(9));
+        let acceptance = ConsolidationAcceptance::NoResult {
+            reason: crate::domain::ConsolidationNoResultReason::ReviewRequired,
+            diagnostics: Vec::new(),
+        };
+        metrics.record_consolidation_acceptance(&acceptance, Duration::from_micros(7));
+        let request = ExperienceSearchRequest {
+            workspace_id: "workspace".into(),
+            query: Some("compiler".into()),
+            exact_failure_signature: None,
+            compatible_components: BTreeMap::new(),
+            path: Some("src/lib.rs".into()),
+            graph_stable_key: None,
+            outcomes: Vec::new(),
+            strengths: Vec::new(),
+            lifecycles: Vec::new(),
+            include_historical: true,
+            created_after: None,
+            created_before: None,
+            limit: 5,
+        };
+        metrics.record_experience_search(&request, Duration::from_micros(11));
+        let mut snapshot = InstrumentationSnapshot::default();
+        metrics.apply_to(&mut snapshot);
+        assert_eq!(snapshot.consolidation_previews, 1);
+        assert_eq!(snapshot.consolidation_acceptance_attempts, 1);
+        assert_eq!(snapshot.consolidation_accepted, 0);
+        assert_eq!(
+            snapshot.consolidation_preview_no_results["episode_empty"],
+            1
+        );
+        assert_eq!(
+            snapshot.consolidation_acceptance_no_results["review_required"],
+            1
+        );
+        assert_eq!(snapshot.experience_search_components["query"], 1);
+        assert_eq!(snapshot.experience_search_components["path"], 1);
+        assert_eq!(
+            snapshot.experience_search_components["include_historical"],
+            1
+        );
+        assert_eq!(snapshot.experience_search_latency.samples, 1);
     }
 }

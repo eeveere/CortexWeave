@@ -4,6 +4,9 @@ For a plain-language guide to registering multiple projects and making Crush
 select the right one automatically, see [Using CortexWeave with More Than One
 Crush Project](crush-workspaces.md).
 
+For the transport-neutral Episode and Experience rules, see
+[Verified Experience Core](verified-experience.md).
+
 Build the release binary and register every workspace before starting an MCP
 client. Use absolute executable and configuration paths because clients commonly
 launch servers from an unrelated working directory.
@@ -60,6 +63,12 @@ Core tools are `semantic_search`, `semantic_context`, `resume_context`,
 `graph_dependencies`, `graph_dependents`, `graph_impact_symbol`, and
 `session_start`, `session_end`, and `event_record`.
 
+Episode tools are `episode_start`, `episode_add_events`, `episode_close`,
+`episode_abandon`, `episode_get`, and `episode_list`. Experience tools are
+`experience_preview`, `experience_consolidate`, `experience_search`,
+`experience_get`, `experience_explain`, `experience_history`,
+`experience_assess_reviewed`, and `experience_propose_dispute`.
+
 The [Structural Graph Architecture](graph-architecture.md) describes graph
 semantics, current-state behavior, analyzer capabilities, and limitations.
 
@@ -78,6 +87,40 @@ returns the requested budget and the actual selected-item estimate.
 Set `include_explanation` on `semantic_context` or `resume_context` to include
 the selected items' reasons, component scores, token estimates, and truncation
 status. This diagnostic is outside the prompt packet budget.
+
+`semantic_context` also accepts an optional canonical `active_failure_signature`
+object. It can request a bounded historical Experience supplement only after
+ordinary context selection, and never establishes a present code or task fact.
+
+## Episodes and Experiences
+
+These tools serialize the native service contract. They do not cause MCP to
+interpret an agent message, tool completion, or old verification as a current
+fact.
+
+Start an episode with a session ID and an explicit type, then associate one to
+100 existing Event IDs with `episode_add_events`. Association and terminal
+operations require `expected_version` and `request_key`; callers must handle a
+conflict rather than relying on silent retry or merge.
+
+`experience_preview` is read-only. `experience_consolidate` accepts only an
+`automatic` proposal and requires that prior preview's `expected_fingerprint`
+and `expected_proposal_hash`. A `review_required` proposal remains inspection-
+only in v0.5; no MCP operation silently accepts it or bypasses review.
+`experience_search` returns active records unless `include_historical` is set,
+and its response is capped at 50 records.
+
+`experience_assess_reviewed` records a caller-declared reviewed assessment only
+when the caller supplies a reviewer identity, reason, and one to 64 evidence
+event IDs. This is provenance supplied by the caller, not authentication, and
+does not claim that a connected agent followed Experience policy.
+`experience_propose_dispute` is read-only; it cannot apply a dispute,
+supersession, or any other lifecycle change.
+
+Historical-staleness warnings are expected when an Experience references an
+older source or graph revision. They scope the record to its original episode
+and do not assert that the current workspace still has the same code, failure,
+or verification state.
 
 Use `graph_find` to resolve an exact graph symbol or source path, then pass a
 returned node ID to a graph relation tool. All graph tools accept optional

@@ -47,6 +47,8 @@ impl AppConfig {
 
 pub const MAX_CONTEXT_CANDIDATE_POOL_LIMIT: usize = 10_000;
 pub const MAX_CONTEXT_STRUCTURAL_EXPANSION_LIMIT: usize = 64;
+pub const MAX_CONTEXT_EXPERIENCE_CANDIDATE_LIMIT: usize = 50;
+pub const MAX_CONTEXT_EXPERIENCE_TOKEN_BUDGET: usize = 2_048;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -457,6 +459,7 @@ impl TemporalConfig {
 pub struct ContextConfig {
     pub candidate_pool_limit: usize,
     pub structural_expansion_limit: usize,
+    pub experience: ExperienceContextConfig,
     pub ranking: ContextRankingConfig,
     pub budget: ContextBudgetConfig,
 }
@@ -466,6 +469,7 @@ impl Default for ContextConfig {
         Self {
             candidate_pool_limit: 50,
             structural_expansion_limit: 4,
+            experience: ExperienceContextConfig::default(),
             ranking: ContextRankingConfig::default(),
             budget: ContextBudgetConfig::default(),
         }
@@ -494,8 +498,45 @@ impl ContextConfig {
                 "context.structural_expansion_limit must not exceed {MAX_CONTEXT_STRUCTURAL_EXPANSION_LIMIT}"
             )));
         }
+        self.experience.validate()?;
         self.ranking.validate()?;
         self.budget.validate()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExperienceContextConfig {
+    pub enabled: bool,
+    pub candidate_limit: usize,
+    pub token_budget: usize,
+}
+
+impl Default for ExperienceContextConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            candidate_limit: 8,
+            token_budget: 768,
+        }
+    }
+}
+
+impl ExperienceContextConfig {
+    fn validate(&self) -> Result<()> {
+        if self.candidate_limit == 0
+            || self.candidate_limit > MAX_CONTEXT_EXPERIENCE_CANDIDATE_LIMIT
+        {
+            return Err(CortexError::Configuration(format!(
+                "context.experience.candidate_limit must be between 1 and {MAX_CONTEXT_EXPERIENCE_CANDIDATE_LIMIT}"
+            )));
+        }
+        if self.token_budget > MAX_CONTEXT_EXPERIENCE_TOKEN_BUDGET {
+            return Err(CortexError::Configuration(format!(
+                "context.experience.token_budget must not exceed {MAX_CONTEXT_EXPERIENCE_TOKEN_BUDGET}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -663,6 +704,9 @@ mod tests {
         assert_eq!(config.temporal.recency_half_life_hours, 72.0);
         assert_eq!(config.context.candidate_pool_limit, 50);
         assert_eq!(config.context.structural_expansion_limit, 4);
+        assert!(config.context.experience.enabled);
+        assert_eq!(config.context.experience.candidate_limit, 8);
+        assert_eq!(config.context.experience.token_budget, 768);
         assert_eq!(config.context.ranking.semantic_weight, 0.24);
         assert_eq!(config.context.budget.code_fraction, 0.50);
         assert!(config.languages.rust);
@@ -743,6 +787,17 @@ mod tests {
         let invalid: AppConfig = toml::from_str(&format!(
             "[context]\ncandidate_pool_limit = {}",
             MAX_CONTEXT_CANDIDATE_POOL_LIMIT + 1
+        ))
+        .unwrap();
+        assert!(invalid.validate().is_err());
+
+        let invalid: AppConfig =
+            toml::from_str("[context.experience]\ncandidate_limit = 0").unwrap();
+        assert!(invalid.validate().is_err());
+
+        let invalid: AppConfig = toml::from_str(&format!(
+            "[context.experience]\ntoken_budget = {}",
+            MAX_CONTEXT_EXPERIENCE_TOKEN_BUDGET + 1
         ))
         .unwrap();
         assert!(invalid.validate().is_err());

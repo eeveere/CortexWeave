@@ -3,6 +3,11 @@
 CortexWeave distinguishes memory origin from memory trust. This keeps imported
 material inspectable without letting it silently become context evidence.
 
+Memory is intentionally distinct from v0.5 Experience. Memory is explicit
+durable knowledge with its own trust-review workflow; Experience is an immutable
+historical interpretation of an explicit evidence-backed episode. See
+[Verified Experience Core](verified-experience.md).
+
 ## Origin and Trust
 
 `human_authorized` memory is trusted when recorded. `imported` memory must be
