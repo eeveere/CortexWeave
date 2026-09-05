@@ -149,6 +149,10 @@ Use [`.crushrc.example`](.crushrc.example) as the project-local Crush template.
 - `docs/v0.5-release-boundary.md`: accepted verified-experience release scope and deferred research
 - [v0.5.1 implementation plan](<CortexWeave v0.5.1 Test Evidence and Vitest Integration Plan.md>): proposed Vitest and Python unittest evidence, with Crush qualification on emCP and PiHype
 
+## Known Issues/Limitation
+- *Verified Experience is **incomplete***. the foundation is present, rust+`cargo test` support is present; but test verifiers for other currently supported languages still need to be written. v0.5.1 will contain vitest support and python unitest support.
+- ***v0.5 contains no safe method to deregister a workspace.*** current behavior *may* lead to unintended deletion0s. safe deletion will be included in v0.5.1 in addition to vitest/unitest support for Verified Experience.
+
 ## Context and Memory Boundaries
 
 `semantic_context` is the primary one-call MCP retrieval operation. It produces
