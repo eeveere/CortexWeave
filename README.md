@@ -35,6 +35,35 @@ to call it and owns any subsequent tool use.
   bounded historical retrieval and reviewed assessment history.
 - Pluggable language analyzers that produce normalized chunks; unsupported text
   formats use deterministic generic chunking.
+- External test evidence capture for the qualified Vitest 4.1.10/Node 24.19.0
+  and Python `unittest` 3.14.7 profiles. Capture helpers produce inspectable
+  bundles; CortexWeave decides whether a run is eligible for verification.
+
+## Test Evidence
+
+Capture helpers are run from the target project's own environment. They do not
+install dependencies, edit source files, retry repairs, or submit data:
+
+```text
+node integrations/vitest/capture_vitest.mjs --workspace C:/dev/project --test-file tests/unit/example.test.ts --output .cortexweave/run.json
+python integrations/unittest/capture_unittest.py tests.test_core.ExampleTests --workspace C:/dev/project --output .cortexweave/run.json
+```
+
+Record a completed bundle through the CLI, then inspect the stored Event:
+
+```text
+cortexweave evidence record <workspace-id> --session-id <session-id> --request-key <unique-key> --bundle .cortexweave/run.json
+cortexweave evidence inspect <workspace-id> <event-id>
+cortexweave evidence capabilities
+```
+
+The equivalent MCP tools are `test_evidence_record`,
+`event_evidence_inspect`, and `evidence_capabilities`. Start an explicit
+episode, associate the captured Event, close it, and use the Experience preview
+and acceptance calls when the episode contains a supported failure and later
+verification. A complete file or module/class is required; watch mode,
+focused or filtered runs, compound check commands, snapshot updates, retries,
+and unittest subtest-containing scopes remain diagnostic or unsupported.
 
 ## Quick Start
 
@@ -116,6 +145,7 @@ Use [`.crushrc.example`](.crushrc.example) as the project-local Crush template.
 - `docs/native-adapter.md`: direct-harness compatibility constraints
 - `docs/graph-architecture.md`: structural graph semantics, provenance, freshness, and extension boundaries
 - `docs/verified-experience.md`: v0.5 episodes, typed evidence, Experience, retrieval, authority, and limits
+- `docs/test-evidence-workflow.md`: supported Vitest/unittest capture and Crush episode workflow
 - `docs/v0.5-release-boundary.md`: accepted verified-experience release scope and deferred research
 - [v0.5.1 implementation plan](<CortexWeave v0.5.1 Test Evidence and Vitest Integration Plan.md>): proposed Vitest and Python unittest evidence, with Crush qualification on emCP and PiHype
 
