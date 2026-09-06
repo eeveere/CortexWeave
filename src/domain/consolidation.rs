@@ -6,7 +6,7 @@ use crate::{CortexError, Result};
 use super::ExperienceRecord;
 
 pub const FAILURE_TO_VERIFICATION_EXTRACTOR_ID: &str = "cortexweave.failure_to_verification";
-pub const FAILURE_TO_VERIFICATION_EXTRACTOR_VERSION: &str = "1";
+pub const FAILURE_TO_VERIFICATION_EXTRACTOR_VERSION: &str = "2";
 
 /// The only caller supplied authority for consolidation.  The episode version
 /// makes a preview a proposal over one immutable membership frontier.
@@ -96,6 +96,7 @@ pub(crate) fn canonical_event_payload_hash(value: &Value) -> Result<String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsolidationNoResultReason {
+    AlreadyConsolidated,
     EpisodeNotClosed,
     EpisodeIneligible,
     StaleEpisodeVersion,

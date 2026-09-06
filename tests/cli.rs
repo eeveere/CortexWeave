@@ -12,7 +12,7 @@ fn version_reports_the_release_identity() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        "cortexweave 0.5.0"
+        "cortexweave 0.5.1"
     );
 }
 
@@ -220,6 +220,31 @@ fn episode_and_experience_commands_expose_explicit_lifecycle_controls() {
             assessment.contains(option),
             "missing assessment option {option}"
         );
+    }
+}
+
+#[test]
+fn evidence_commands_expose_capture_ingress_and_inspection() {
+    let evidence = Command::new(env!("CARGO_BIN_EXE_cortexweave"))
+        .args(["evidence", "--help"])
+        .output()
+        .unwrap();
+    assert!(evidence.status.success());
+    let evidence = String::from_utf8(evidence.stdout).unwrap();
+    for command in ["record", "inspect", "capabilities"] {
+        assert!(
+            evidence.contains(command),
+            "missing evidence command {command}"
+        );
+    }
+    let record = Command::new(env!("CARGO_BIN_EXE_cortexweave"))
+        .args(["evidence", "record", "--help"])
+        .output()
+        .unwrap();
+    assert!(record.status.success());
+    let record = String::from_utf8(record.stdout).unwrap();
+    for option in ["--session-id", "--request-key", "--bundle"] {
+        assert!(record.contains(option), "missing evidence option {option}");
     }
 }
 

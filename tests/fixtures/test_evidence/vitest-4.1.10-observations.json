@@ -1,0 +1,49 @@
+{
+  "fixture_format": "cortexweave.bp0.runner_observations.v1",
+  "runner": { "id": "vitest", "version": "4.1.10" },
+  "runtime": { "id": "node", "version": "24.19.0" },
+  "public_api": {
+    "completion_callback": "onTestRunEnd(testModules, unhandledErrors, reason)",
+    "module_fields": ["relativeModuleId", "state()", "errors()", "children.allTests()"],
+    "case_fields": ["module", "name", "parent", "options", "result()", "diagnostic()"]
+  },
+  "completed_run": {
+    "reason": "failed",
+    "unhandled_errors": [],
+    "modules": [
+      {
+        "relative_module_id": "fixtures/reporter-fixture.test.ts",
+        "state": "failed",
+        "errors": [],
+        "cases": [
+          { "namespace": ["reporter fixture"], "name": "passes", "mode": "run", "state": "passed", "error_class": null, "retry_count": 0, "repeat_count": 0, "flaky": false },
+          { "namespace": ["reporter fixture"], "name": "reports an assertion failure", "mode": "run", "state": "failed", "error_class": "AssertionError", "retry_count": 0, "repeat_count": 0, "flaky": false },
+          { "namespace": ["reporter fixture"], "name": "reports an execution error", "mode": "run", "state": "failed", "error_class": "TypeError", "retry_count": 0, "repeat_count": 0, "flaky": false },
+          { "namespace": ["reporter fixture"], "name": "is skipped", "mode": "skip", "state": "skipped", "error_class": null, "retry_count": null, "repeat_count": null, "flaky": null },
+          { "namespace": ["reporter fixture"], "name": "is todo", "mode": "todo", "state": "skipped", "error_class": null, "retry_count": null, "repeat_count": null, "flaky": null },
+          { "namespace": ["reporter fixture"], "name": "passes after a retry", "mode": "run", "state": "passed", "error_class": "AssertionError", "retry_count": 1, "repeat_count": 0, "flaky": true },
+          { "namespace": ["reporter fixture"], "name": "is repeated", "mode": "run", "state": "passed", "error_class": null, "retry_count": 0, "repeat_count": 1, "flaky": false }
+        ]
+      }
+    ]
+  },
+  "emcp_positive_scope": {
+    "relative_file": "tests/unit/hybrid-retrieval.test.ts",
+    "case_count": 7,
+    "passed": 7,
+    "failed": 0,
+    "module_errors": 0,
+    "unhandled_errors": 0
+  },
+  "observed_default_config": {
+    "run": true,
+    "watch": false,
+    "allow_only": true,
+    "snapshot_update": "new",
+    "cache_enabled": true
+  },
+  "qualification_override": {
+    "snapshot_update": "none",
+    "reason": "The capture helper disables snapshot writes instead of accepting Vitest's create-missing default."
+  }
+}

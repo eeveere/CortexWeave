@@ -15,14 +15,21 @@ use crate::{
         Checkpoint, ContextCandidatePool, ContextPacket, ContextPin, ContextRequest,
         ContextSourceType, CortexEvent, DecodedEvidence, Document, Episode, EpisodeEvent,
         EpisodeEventAssociationRequest, EpisodeListRequest, EpisodeStartRequest, EpisodeStatus,
-        EpisodeTerminalRequest, EventType, EvidenceDecodeResult, ExperienceAssessment,
+        EpisodeTerminalRequest, EventEvidenceInspection, EventType, EvidenceCapabilities,
+        EvidenceCapabilityLimits, EvidenceDecodeResult, ExperienceAssessment,
         ExperienceAssessmentReviewRequest, ExperienceDisputeProposal,
         ExperienceDisputeProposalRequest, ExperienceExplanation, ExperienceRecord,
         ExperienceSearchHit, ExperienceSearchRequest, FailureNormalizationResult, GraphRepairMode,
-        GraphRepairOutcome, ImpactReport, MAX_EPISODE_EVENTS, MemoryOrigin, MemoryRecord,
-        MemorySupersession, MemoryTrust, MemoryTrustReview, ResumeContext, ResumeContextRequest,
-        Session, StructuralReadOptions, StructuralResult, Task, TaskStatus, TemporalContextItem,
-        TemporalQuery, WorkingSetEntry, WorkingSetSnapshot, Workspace,
+        GraphRepairOutcome, ImpactReport, MAX_EPISODE_EVENTS, MAX_EVIDENCE_IDENTIFIER_BYTES,
+        MAX_EVIDENCE_PAYLOAD_BYTES, MAX_EVIDENCE_TEXT_BYTES, MAX_FAILURE_COMPONENT_BYTES,
+        MAX_TEST_ARTIFACTS, MAX_TEST_CASES, MAX_TEST_CHILD_OBSERVATIONS,
+        MAX_TEST_NAMESPACE_COMPONENTS, MAX_TEST_RUN_ERRORS, MAX_TEST_VERIFICATION_INPUTS,
+        MemoryOrigin, MemoryRecord, MemorySupersession, MemoryTrust, MemoryTrustReview,
+        ResumeContext, ResumeContextRequest, Session, StructuralReadOptions, StructuralResult,
+        Task, TaskStatus, TemporalContextItem, TemporalQuery, TestEvidenceRecordRequest,
+        TestEvidenceRecordResult, TestRunEligibility, WorkingSetEntry, WorkingSetSnapshot,
+        Workspace, WorkspaceDeregistrationOutcome, WorkspaceDeregistrationPreview,
+        WorkspaceDeregistrationRequest,
     },
     embedding::{
         EmbeddingLimits, EmbeddingProvider, OpenAiCompatibleEmbeddingProvider, TokenCount,
@@ -38,7 +45,7 @@ use crate::{
         HarnessContextRequest, HarnessHydrationRequest, HarnessSelectedSource,
         HydratedContextSource, HydrationAuthorization, HydrationScoreProvenance,
         MemoryConsolidationReport, MemoryConsolidationRequest, MemorySupersessionReviewRequest,
-        MemoryTrustReviewRequest, StructuralService,
+        MemoryTrustReviewRequest, StructuralService, TestEvidenceService,
     },
     storage::SqliteStorage,
     workspace::{PathIdentity, WorkspaceScanner, WorkspaceSelector},
@@ -185,6 +192,7 @@ pub struct CortexWeaveService {
     structural: Arc<StructuralService>,
     context: Arc<ContextService>,
     evidence: Arc<EvidenceService>,
+    test_evidence: Arc<TestEvidenceService>,
     failure_normalization: Arc<FailureNormalizationService>,
     consolidation: Arc<ConsolidationService>,
     experience_search: Arc<ExperienceSearchService>,
@@ -246,10 +254,12 @@ impl CortexWeaveService {
             }),
         )?);
         let evidence = Arc::new(EvidenceService::standard()?);
+        let test_evidence = Arc::new(TestEvidenceService::standard()?);
         let failure_normalization = Arc::new(FailureNormalizationService::standard()?);
         let consolidation = Arc::new(ConsolidationService::new(
             Arc::clone(&storage),
             Arc::clone(&evidence),
+            Arc::clone(&test_evidence),
             Arc::clone(&failure_normalization),
         ));
         let experience_search = Arc::new(ExperienceSearchService::new(Arc::clone(&storage)));
@@ -269,6 +279,7 @@ impl CortexWeaveService {
             structural,
             context,
             evidence,
+            test_evidence,
             failure_normalization,
             consolidation,
             experience_search,
@@ -317,6 +328,10 @@ impl CortexWeaveService {
         &self.evidence
     }
 
+    pub fn test_evidence(&self) -> &TestEvidenceService {
+        &self.test_evidence
+    }
+
     pub fn failure_normalization(&self) -> &FailureNormalizationService {
         &self.failure_normalization
     }
@@ -360,6 +375,145 @@ impl CortexWeaveService {
         self.evidence.diagnose(event)
     }
 
+    /// Applies the exact qualified runner profile to an already-decoded test
+    /// observation. Unknown versions and unsupported execution shapes remain
+    /// visible but cannot become automatic verification evidence.
+    pub fn assess_decoded_test_run(&self, evidence: &DecodedEvidence) -> TestRunEligibility {
+        self.test_evidence.assess(evidence)
+    }
+
+    /// Records one normalized captured run with capture-specific idempotency.
+    /// Generic Event ingress deliberately cannot create this contract.
+    pub async fn record_test_evidence(
+        &self,
+        request: TestEvidenceRecordRequest,
+    ) -> Result<TestEvidenceRecordResult> {
+        if request.request_key.trim().is_empty()
+            || request.request_key.len() > MAX_EVIDENCE_IDENTIFIER_BYTES
+            || request.request_key.contains('\0')
+        {
+            return Err(CortexError::Analysis(
+                "test evidence request key must contain 1..=256 bytes and no NUL".into(),
+            ));
+        }
+        let mut proposed_event = CortexEvent::new(
+            &request.workspace_id,
+            EventType::TestResult,
+            request.bundle.clone(),
+        );
+        proposed_event.session_id = Some(request.session_id.clone());
+        proposed_event.task_id = request.task_id.clone();
+        let decoded = match self.evidence.diagnose(&proposed_event) {
+            EvidenceDecodeResult::Decoded { evidence } => evidence,
+            EvidenceDecodeResult::Unsupported { reason } => {
+                return Err(CortexError::Analysis(format!(
+                    "unsupported test evidence contract: {reason:?}"
+                )));
+            }
+            EvidenceDecodeResult::Invalid { issue } => {
+                return Err(CortexError::Analysis(format!(
+                    "invalid test evidence {}: {}",
+                    issue.code, issue.message
+                )));
+            }
+        };
+        let crate::domain::EvidenceObservation::TestRunResult(report) = &decoded.observation else {
+            return Err(CortexError::Analysis(
+                "test evidence importer accepts cortexweave.test_run_result only".into(),
+            ));
+        };
+        let imported = self
+            .storage
+            .import_test_evidence(
+                &request,
+                &report.producer.id,
+                &report.producer.version,
+                &report.run_id,
+                &proposed_event,
+            )
+            .await?;
+        let stored_decoded = match self.evidence.diagnose(&imported.event) {
+            EvidenceDecodeResult::Decoded { evidence } => evidence,
+            _ => {
+                return Err(CortexError::Storage(sqlx::Error::Decode(
+                    "stored test evidence no longer decodes".into(),
+                )));
+            }
+        };
+        Ok(TestEvidenceRecordResult {
+            event: imported.event,
+            replayed: imported.replayed,
+            eligibility: self.test_evidence.assess(&stored_decoded),
+            failure_normalization: self.failure_normalization.normalize(&stored_decoded),
+        })
+    }
+
+    pub async fn inspect_event_evidence(
+        &self,
+        workspace_id: &str,
+        event_id: &str,
+    ) -> Result<EventEvidenceInspection> {
+        let event = self
+            .storage
+            .event(workspace_id, event_id)
+            .await?
+            .ok_or_else(|| CortexError::NotFound(format!("event {event_id}")))?;
+        let decoding = self.evidence.diagnose(&event);
+        let (test_run_eligibility, failure_normalization) = match decoding.decoded() {
+            Some(decoded) => (
+                matches!(
+                    decoded.observation,
+                    crate::domain::EvidenceObservation::TestRunResult(_)
+                )
+                .then(|| self.test_evidence.assess(decoded)),
+                Some(self.failure_normalization.normalize(decoded)),
+            ),
+            None => (None, None),
+        };
+        Ok(EventEvidenceInspection {
+            event,
+            decoding,
+            test_run_eligibility,
+            failure_normalization,
+        })
+    }
+
+    pub fn evidence_capabilities(&self) -> EvidenceCapabilities {
+        EvidenceCapabilities {
+            contracts: self.evidence.registry().identities(),
+            test_profiles: self.test_evidence.profiles().catalog(),
+            failure_normalizers: self.failure_normalization.normalizer_identities(),
+            generic_verifier_rules: self.failure_normalization.verifier_rules().catalog(),
+            limits: EvidenceCapabilityLimits {
+                normalized_payload_bytes: MAX_EVIDENCE_PAYLOAD_BYTES,
+                identifier_bytes: MAX_EVIDENCE_IDENTIFIER_BYTES,
+                text_bytes: MAX_EVIDENCE_TEXT_BYTES,
+                parent_cases: MAX_TEST_CASES,
+                child_observations: MAX_TEST_CHILD_OBSERVATIONS,
+                namespace_components: MAX_TEST_NAMESPACE_COMPONENTS,
+                run_errors: MAX_TEST_RUN_ERRORS,
+                verification_inputs: MAX_TEST_VERIFICATION_INPUTS,
+                artifacts: MAX_TEST_ARTIFACTS,
+                failure_component_bytes: MAX_FAILURE_COMPONENT_BYTES,
+            },
+            code_analyzer_capabilities_are_separate: true,
+            unsupported_test_integrations: vec![
+                "pytest".into(),
+                "jest".into(),
+                "mocha".into(),
+                "node_test_runner".into(),
+                "go_test".into(),
+                "dotnet_test".into(),
+            ],
+            unsupported_aggregate_proof: vec![
+                "compound_command_exit".into(),
+                "typecheck".into(),
+                "lint".into(),
+                "format".into(),
+            ],
+        }
+    }
+
     pub fn storage_handle(&self) -> Arc<SqliteStorage> {
         Arc::clone(&self.storage)
     }
@@ -389,6 +543,45 @@ impl CortexWeaveService {
 
     pub async fn list_workspaces(&self) -> Result<Vec<Workspace>> {
         self.storage.list_workspaces().await
+    }
+
+    pub async fn preview_workspace_deregistration(
+        &self,
+        selector: WorkspaceSelector,
+    ) -> Result<WorkspaceDeregistrationPreview> {
+        if matches!(selector, WorkspaceSelector::Default) {
+            return Err(CortexError::Analysis(
+                "workspace deregistration preview requires an explicit selector".into(),
+            ));
+        }
+        let workspace = self.resolve_workspace(selector, None).await?;
+        self.storage
+            .create_workspace_deregistration_plan(&workspace.id, Utc::now())
+            .await
+    }
+
+    pub async fn deregister_workspace(
+        &self,
+        request: WorkspaceDeregistrationRequest,
+    ) -> Result<WorkspaceDeregistrationOutcome> {
+        if uuid::Uuid::parse_str(&request.workspace_id).is_err()
+            || uuid::Uuid::parse_str(&request.plan_id).is_err()
+        {
+            return Err(CortexError::Analysis(
+                "workspace deregistration requires exact workspace and plan UUIDs".into(),
+            ));
+        }
+        if request.request_key.trim().is_empty()
+            || request.request_key.len() > MAX_EVIDENCE_IDENTIFIER_BYTES
+            || request.request_key.contains('\0')
+        {
+            return Err(CortexError::Analysis(
+                "workspace deregistration request key must contain 1..=256 bytes and no NUL".into(),
+            ));
+        }
+        self.storage
+            .deregister_workspace(&request, Utc::now())
+            .await
     }
 
     pub async fn resolve_workspace(
@@ -920,7 +1113,33 @@ impl CortexWeaveService {
         self.context.build_candidate_pool(request).await
     }
 
-    pub async fn semantic_context(&self, request: ContextRequest) -> Result<ContextPacket> {
+    pub async fn semantic_context(&self, mut request: ContextRequest) -> Result<ContextPacket> {
+        if request.active_failure_signature.is_some() && request.active_failure_event_id.is_some() {
+            return Err(CortexError::Analysis(
+                "semantic context accepts either an active failure signature or an active failure event ID, not both".into(),
+            ));
+        }
+        if let Some(event_id) = request.active_failure_event_id.take() {
+            let inspection = self
+                .inspect_event_evidence(&request.workspace_id, &event_id)
+                .await?;
+            request.active_failure_signature = match inspection.failure_normalization {
+                Some(FailureNormalizationResult::Normalized { normalization }) => {
+                    Some(normalization.signature)
+                }
+                Some(FailureNormalizationResult::Unsupported { reason }) => {
+                    return Err(CortexError::Analysis(format!(
+                        "event {event_id} has no usable normalized failure signature: {}",
+                        reason.message
+                    )));
+                }
+                None => {
+                    return Err(CortexError::Analysis(format!(
+                        "event {event_id} does not contain decodable failure evidence"
+                    )));
+                }
+            };
+        }
         let started = Instant::now();
         let packet = self.context.assemble_context_packet(request).await?;
         self.metrics
@@ -1508,6 +1727,30 @@ impl CortexWeaveService {
             .await?;
         self.storage.insert_event(&event).await?;
         Ok(event)
+    }
+
+    /// Deliver a native operation once, even if the previous acknowledgement was lost.
+    /// The receipt is immutable historical commit evidence; it is not a current-state read.
+    pub async fn deliver_native(
+        &self,
+        request: crate::domain::NativeDeliveryRequest,
+    ) -> Result<crate::domain::NativeDeliveryReceipt> {
+        let key = &request.request_key;
+        if key.trim().is_empty() || key.len() > 256 || key.contains('\0') {
+            return Err(CortexError::Analysis(
+                "native request key must contain 1..=256 bytes and no NUL".into(),
+            ));
+        }
+        match &request.operation {
+            crate::domain::NativeOperation::StartTask { title, .. } if title.trim().is_empty() => {
+                return Err(CortexError::Analysis("task title cannot be empty".into()));
+            }
+            crate::domain::NativeOperation::StartEpisode { request } => {
+                validate_episode_title(request.title.as_deref())?;
+            }
+            _ => {}
+        }
+        self.storage.deliver_native(&request).await
     }
 
     pub async fn recent_events(
@@ -2230,6 +2473,54 @@ mod tests {
                 .for_path(std::path::Path::new("x.unknown"))
                 .analyzer_id(),
             "generic"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_context_resolves_a_stored_failure_event() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let workspace = Workspace::new("C:/stored-failure-event", "stored-failure-event");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let service = CortexWeaveService::from_parts(AppConfig::default(), storage).unwrap();
+        let session = service
+            .start_session(&workspace.id, json!({}))
+            .await
+            .unwrap();
+        let mut event = crate::domain::CortexEvent::new(
+            &workspace.id,
+            EventType::CompilerResult,
+            json!({
+                "contract": "cortexweave.rust_compiler_result",
+                "version": 1,
+                "subject": { "kind": "target", "value": "core" },
+                "exit_code": 1,
+                "diagnostics": [{
+                    "level": "error",
+                    "code": "E0308",
+                    "message": "mismatched types",
+                    "expected_type": "String",
+                    "actual_type": "u32",
+                    "path": "src/lib.rs",
+                    "start_line": 1,
+                    "start_column": 1
+                }]
+            }),
+        );
+        event.session_id = Some(session.id);
+        service.storage.insert_event(&event).await.unwrap();
+
+        let mut request = ContextRequest::new(&workspace.id);
+        request.active_failure_event_id = Some(event.id);
+        request.include_code = false;
+        request.include_documents = false;
+        request.include_memories = false;
+        request.include_events = false;
+        request.include_explanation = true;
+
+        let packet = service.semantic_context(request).await.unwrap();
+        assert_eq!(
+            packet.explanation.unwrap().experience.degradation,
+            Some(crate::domain::ExperienceContextDegradation::NoEligibleResult)
         );
     }
 

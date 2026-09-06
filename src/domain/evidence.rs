@@ -14,6 +14,7 @@ pub enum EvidenceContract {
     ExternalToolCompletion,
     RustCompilerResult,
     CargoTestResult,
+    TestRunResult,
     GenericVerifierResult,
     SourceChangeObservation,
     UserAcceptance,
@@ -25,6 +26,7 @@ impl EvidenceContract {
             Self::ExternalToolCompletion => "cortexweave.external_tool_completion",
             Self::RustCompilerResult => "cortexweave.rust_compiler_result",
             Self::CargoTestResult => "cortexweave.cargo_test_result",
+            Self::TestRunResult => "cortexweave.test_run_result",
             Self::GenericVerifierResult => "cortexweave.generic_verifier_result",
             Self::SourceChangeObservation => "cortexweave.source_change_observation",
             Self::UserAcceptance => "cortexweave.user_acceptance",
@@ -36,6 +38,7 @@ impl EvidenceContract {
             "cortexweave.external_tool_completion" => Some(Self::ExternalToolCompletion),
             "cortexweave.rust_compiler_result" => Some(Self::RustCompilerResult),
             "cortexweave.cargo_test_result" => Some(Self::CargoTestResult),
+            "cortexweave.test_run_result" => Some(Self::TestRunResult),
             "cortexweave.generic_verifier_result" => Some(Self::GenericVerifierResult),
             "cortexweave.source_change_observation" => Some(Self::SourceChangeObservation),
             "cortexweave.user_acceptance" => Some(Self::UserAcceptance),
@@ -66,12 +69,14 @@ pub struct DecodedEvidence {
     pub observation: EvidenceObservation,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum EvidenceObservation {
     ExternalToolCompletion(ToolCompletionEvidence),
     RustCompilerResult(RustCompilerResultEvidence),
     CargoTestResult(CargoTestResultEvidence),
+    TestRunResult(super::TestRunResultEvidence),
     GenericVerifierResult(GenericVerifierResultEvidence),
     SourceChange(SourceChangeEvidence),
     UserAcceptance(UserAcceptanceEvidence),

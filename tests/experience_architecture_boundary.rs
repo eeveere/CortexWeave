@@ -35,12 +35,15 @@ fn experience_domain_and_services_are_transport_independent() {
         "src/domain/evidence.rs",
         "src/domain/experience.rs",
         "src/domain/failure.rs",
+        "src/domain/test_evidence.rs",
+        "src/domain/workspace_deregistration.rs",
         "src/service/consolidation.rs",
         "src/service/context.rs",
         "src/service/evidence.rs",
         "src/service/experience_assessment.rs",
         "src/service/experience_search.rs",
         "src/service/failure.rs",
+        "src/service/test_evidence.rs",
     ] {
         assert_absent(&production_source(path), path, &forbidden);
     }

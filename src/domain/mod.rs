@@ -7,8 +7,11 @@ mod experience;
 mod failure;
 mod graph;
 mod models;
+mod native_delivery;
 mod repair;
 mod structural;
+mod test_evidence;
+mod workspace_deregistration;
 
 pub use chunk::{
     AnalysisResult, AnalyzedChunk, AnalyzedRelationship, AnalyzedSymbol, AnalyzerCapabilities,
@@ -84,6 +87,9 @@ pub use models::{
     MemoryRecord, MemoryTrust, MemoryTrustReview, Session, SourceSegment, StoredChunk, Task,
     TaskStatus, Workspace,
 };
+pub use native_delivery::{
+    NativeDeliveryReceipt, NativeDeliveryRequest, NativeOperation, NativeRecord,
+};
 pub use repair::{
     GraphProjectionManifest, GraphRepairDisposition, GraphRepairDocumentPlan,
     GraphRepairGeneration, GraphRepairMode, GraphRepairOutcome, GraphRepairPlan, GraphRepairReason,
@@ -93,4 +99,21 @@ pub use structural::{
     ImpactItem, ImpactReport, MAX_STRUCTURAL_DEPTH, MAX_STRUCTURAL_EDGES, MAX_STRUCTURAL_NODES,
     StructuralDirection, StructuralEvidence, StructuralPath, StructuralReadOptions,
     StructuralResult,
+};
+pub use test_evidence::{
+    ChildTestCounts, EventEvidenceInspection, EvidenceCapabilities, EvidenceCapabilityLimits,
+    MAX_TEST_ARTIFACTS, MAX_TEST_CASES, MAX_TEST_CHILD_OBSERVATIONS, MAX_TEST_NAMESPACE_COMPONENTS,
+    MAX_TEST_RUN_ERRORS, MAX_TEST_VERIFICATION_INPUTS, ParentTestCounts, TestArtifactEvidence,
+    TestCaseIdentity, TestCaseObservation, TestCaseStatus, TestChildObservation,
+    TestEvidenceProfile, TestEvidenceRecordRequest, TestEvidenceRecordResult, TestExecutionOrigin,
+    TestRunCounts, TestRunEligibility, TestRunEligibilityIssue, TestRunEligibilityStatus,
+    TestRunError, TestRunErrorPhase, TestRunResultEvidence, TestRunSelection, TestRunSettings,
+    TestSelectionKind, TestSnapshotMode, TestVerificationInput, VerificationInputKind,
+    VerificationInputState, VersionedTestComponent,
+};
+pub use workspace_deregistration::{
+    WORKSPACE_DEREGISTRATION_PLAN_TTL_SECONDS, WorkspaceDeregistrationCounts,
+    WorkspaceDeregistrationOutcome, WorkspaceDeregistrationPreview, WorkspaceDeregistrationReceipt,
+    WorkspaceDeregistrationRequest, WorkspaceDeregistrationStaleReason,
+    WorkspaceDeregistrationState,
 };

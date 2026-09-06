@@ -15,10 +15,11 @@ use crate::{
         ExperienceProposal, ExperienceRecord, ExperienceVerification,
         ExperienceVerificationObservation, FAILURE_TO_VERIFICATION_EXTRACTOR_ID,
         FAILURE_TO_VERIFICATION_EXTRACTOR_VERSION, MAX_EPISODE_EVENTS, ProcessOutcome,
-        ProposalDisposition, VerificationKind, VerificationStatus, VerificationSubject,
-        VerificationSubjectKind, canonical_event_payload_hash,
+        ProposalDisposition, TestRunEligibilityStatus, TestSelectionKind, VerificationKind,
+        VerificationStatus, VerificationSubject, VerificationSubjectKind,
+        canonical_event_payload_hash,
     },
-    service::{EvidenceService, FailureNormalizationService},
+    service::{EvidenceService, FailureNormalizationService, TestEvidenceService},
     storage::SqliteStorage,
 };
 
@@ -32,6 +33,7 @@ const CARGO_TEST_RULE_VERSION: &str = "1";
 pub struct ConsolidationService {
     storage: Arc<SqliteStorage>,
     evidence: Arc<EvidenceService>,
+    test_evidence: Arc<TestEvidenceService>,
     normalization: Arc<FailureNormalizationService>,
 }
 
@@ -39,11 +41,13 @@ impl ConsolidationService {
     pub fn new(
         storage: Arc<SqliteStorage>,
         evidence: Arc<EvidenceService>,
+        test_evidence: Arc<TestEvidenceService>,
         normalization: Arc<FailureNormalizationService>,
     ) -> Self {
         Self {
             storage,
             evidence,
+            test_evidence,
             normalization,
         }
     }
@@ -79,6 +83,22 @@ impl ConsolidationService {
                 ConsolidationNoResultReason::EpisodeNotClosed,
                 "episode_not_terminal",
                 "only terminal episodes can be consolidated",
+                None,
+                None,
+            ));
+        }
+        if let Some(existing) = self
+            .storage
+            .experience_for_episode(&request.workspace_id, &request.episode_id)
+            .await?
+        {
+            return Ok(no_result(
+                ConsolidationNoResultReason::AlreadyConsolidated,
+                "episode_already_consolidated",
+                &format!(
+                    "episode {} was already consolidated as experience {}",
+                    request.episode_id, existing.experience.id
+                ),
                 None,
                 None,
             ));
@@ -129,10 +149,16 @@ impl ConsolidationService {
             }
             events.push((member.ordinal, event));
         }
-        let fingerprint =
-            input_fingerprint(&episode, &events, &self.evidence, &self.normalization)?;
+        let fingerprint = input_fingerprint(
+            &episode,
+            &events,
+            &self.evidence,
+            &self.test_evidence,
+            &self.normalization,
+        )?;
         extract_proposal(
             &self.evidence,
+            &self.test_evidence,
             &self.normalization,
             &episode,
             &events,
@@ -144,12 +170,47 @@ impl ConsolidationService {
         &self,
         request: &ConsolidationAcceptanceRequest,
     ) -> Result<ConsolidationAcceptance> {
+        if let Some(existing) = self
+            .storage
+            .experience_for_episode(&request.request.workspace_id, &request.request.episode_id)
+            .await?
+        {
+            if existing.experience.consolidation_fingerprint == request.expected_fingerprint
+                && existing.experience.proposal_hash == request.expected_proposal_hash
+            {
+                return Ok(ConsolidationAcceptance::Accepted {
+                    record: Box::new(existing),
+                });
+            }
+            return Ok(no_accept(
+                ConsolidationNoResultReason::AlreadyConsolidated,
+                "episode_already_consolidated",
+                "the episode already has a different consolidated experience",
+            ));
+        }
         let preview = self.preview(&request.request).await?;
         let ConsolidationPreview::Proposal {
             proposal,
             disposition,
         } = preview
         else {
+            if matches!(
+                preview,
+                ConsolidationPreview::NoResult {
+                    reason: ConsolidationNoResultReason::AlreadyConsolidated,
+                    ..
+                }
+            ) && let Some(existing) = self
+                .storage
+                .experience_for_episode(&request.request.workspace_id, &request.request.episode_id)
+                .await?
+                && existing.experience.consolidation_fingerprint == request.expected_fingerprint
+                && existing.experience.proposal_hash == request.expected_proposal_hash
+            {
+                return Ok(ConsolidationAcceptance::Accepted {
+                    record: Box::new(existing),
+                });
+            }
             return Ok(match preview {
                 ConsolidationPreview::NoResult {
                     reason,
@@ -243,6 +304,7 @@ struct VerificationScopeKey {
     rule_id: String,
     rule_version: String,
     subject: VerificationSubject,
+    detail_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +344,7 @@ enum ClassifiedObservation {
 
 fn extract_proposal(
     evidence_service: &EvidenceService,
+    test_evidence: &TestEvidenceService,
     normalization: &FailureNormalizationService,
     episode: &crate::domain::Episode,
     events: &[(u64, crate::domain::CortexEvent)],
@@ -326,27 +389,28 @@ fn extract_proposal(
             }
         };
 
-        let classified = match classify_observation(normalization, &decoded, event_index) {
-            Ok(Some(classified)) => classified,
-            Ok(None) => {
-                diagnostics.push(diag(
-                    "nonmaterial_observation_excluded",
-                    "decoded evidence does not establish an attempt action or verifier result",
-                    Some(*membership_ordinal),
-                    Some(event.id.clone()),
-                ));
-                continue;
-            }
-            Err((reason, code, message)) => {
-                return Ok(no_result(
-                    reason,
-                    code,
-                    &message,
-                    Some(*membership_ordinal),
-                    Some(event.id.clone()),
-                ));
-            }
-        };
+        let classified =
+            match classify_observation(test_evidence, normalization, &decoded, event_index) {
+                Ok(Some(classified)) => classified,
+                Ok(None) => {
+                    diagnostics.push(diag(
+                        "nonmaterial_observation_excluded",
+                        "decoded evidence does not establish an attempt action or verifier result",
+                        Some(*membership_ordinal),
+                        Some(event.id.clone()),
+                    ));
+                    continue;
+                }
+                Err((reason, code, message)) => {
+                    return Ok(no_result(
+                        reason,
+                        code,
+                        &message,
+                        Some(*membership_ordinal),
+                        Some(event.id.clone()),
+                    ));
+                }
+            };
 
         match classified {
             ClassifiedObservation::AttemptAction { source_change } => {
@@ -695,6 +759,7 @@ fn extract_proposal(
 }
 
 fn classify_observation(
+    test_evidence: &TestEvidenceService,
     normalization: &FailureNormalizationService,
     decoded: &DecodedEvidence,
     event_index: usize,
@@ -725,6 +790,7 @@ fn classify_observation(
                 rule_id: RUST_COMPILER_RULE_ID.into(),
                 rule_version: RUST_COMPILER_RULE_VERSION.into(),
                 subject: subject(report.subject.kind, &report.subject.value),
+                detail_fingerprint: None,
             },
             normalized_failure: normalized_failure(normalization, decoded),
         },
@@ -750,6 +816,55 @@ fn classify_observation(
                     rule_id: CARGO_TEST_RULE_ID.into(),
                     rule_version: CARGO_TEST_RULE_VERSION.into(),
                     subject: subject(report.subject.kind, &report.subject.value),
+                    detail_fingerprint: None,
+                },
+                normalized_failure: normalized_failure(normalization, decoded),
+            }
+        }
+        EvidenceObservation::TestRunResult(report) => {
+            let assessment = test_evidence.assess_report(report);
+            let status = match assessment.status {
+                TestRunEligibilityStatus::EligiblePassed => VerificationStatus::VerifiedPassed,
+                TestRunEligibilityStatus::EligibleFailed => VerificationStatus::VerifiedFailed,
+                TestRunEligibilityStatus::Ineligible => {
+                    let issue = assessment.issues.first();
+                    return Err((
+                        ConsolidationNoResultReason::NoSupportedFailure,
+                        "ineligible_test_run",
+                        issue.map_or_else(
+                            || {
+                                "test-run evidence is not eligible for automatic verification"
+                                    .into()
+                            },
+                            |issue| format!("{}: {}", issue.code, issue.message),
+                        ),
+                    ));
+                }
+            };
+            let scope_fingerprint = test_evidence.scope_fingerprint(report).map_err(|error| {
+                (
+                    ConsolidationNoResultReason::NoSupportedFailure,
+                    "invalid_test_scope",
+                    error.to_string(),
+                )
+            })?;
+            let subject = VerificationSubject {
+                kind: if report.selection.kind == TestSelectionKind::File {
+                    VerificationSubjectKind::Path
+                } else {
+                    VerificationSubjectKind::Test
+                },
+                value: report.selection.value.clone(),
+            };
+            VerificationFact {
+                event_index,
+                status,
+                kind: VerificationKind::TestRun,
+                scope: VerificationScopeKey {
+                    rule_id: report.profile.id.clone(),
+                    rule_version: report.profile.version.clone(),
+                    subject,
+                    detail_fingerprint: Some(scope_fingerprint),
                 },
                 normalized_failure: normalized_failure(normalization, decoded),
             }
@@ -793,6 +908,7 @@ fn classify_observation(
                     rule_id: rule.id.clone(),
                     rule_version: rule.version.clone(),
                     subject: subject(report.subject.kind, &report.subject.value),
+                    detail_fingerprint: None,
                 },
                 normalized_failure: normalized_failure(normalization, decoded),
             }
@@ -805,6 +921,7 @@ fn classify_observation(
                 rule_id: "cortexweave.user_acceptance".into(),
                 rule_version: "1".into(),
                 subject: subject(report.subject.kind, &report.subject.value),
+                detail_fingerprint: None,
             },
             normalized_failure: None,
         },
@@ -843,6 +960,7 @@ fn eligible_terminal_fact(fact: &VerificationFact, initial: &VerificationFact) -
     } else {
         fact.scope.rule_id == initial.scope.rule_id
             && fact.scope.rule_version == initial.scope.rule_version
+            && (initial.scope.detail_fingerprint.is_none() || fact.scope == initial.scope)
     }
 }
 
@@ -854,8 +972,10 @@ fn attempt_result(fact: &VerificationFact, initial: &VerificationFact) -> Option
     let initial_failure = initial.normalized_failure.as_ref()?;
     Some(if exact_failure_equals(failure, initial_failure) {
         AttemptResult::StillFailing
-    } else {
+    } else if failure.is_exact_capable() && initial_failure.is_exact_capable() {
         AttemptResult::VerificationChangedFailure
+    } else {
+        AttemptResult::VerificationFailed
     })
 }
 
@@ -1023,6 +1143,7 @@ fn input_fingerprint(
     episode: &crate::domain::Episode,
     events: &[(u64, crate::domain::CortexEvent)],
     evidence: &EvidenceService,
+    test_evidence: &TestEvidenceService,
     normalization: &FailureNormalizationService,
 ) -> Result<String> {
     let members = events
@@ -1038,7 +1159,7 @@ fn input_fingerprint(
         .collect::<Result<Vec<_>>>()?;
     digest(
         FINGERPRINT_DOMAIN,
-        &json!({"workspace_id":episode.workspace_id,"episode_id":episode.id,"session_id":episode.session_id,"task_id":episode.task_id,"status":episode.status.as_str(),"creator":episode.created_by.as_str(),"version":episode.version,"members":members,"extractor":[FAILURE_TO_VERIFICATION_EXTRACTOR_ID,FAILURE_TO_VERIFICATION_EXTRACTOR_VERSION],"decoders":evidence.registry().identities(),"normalizers":normalization.normalizer_identities(),"verifier_rules":normalization.verifier_rules().catalog(),"built_in_verifiers":[[RUST_COMPILER_RULE_ID,RUST_COMPILER_RULE_VERSION],[CARGO_TEST_RULE_ID,CARGO_TEST_RULE_VERSION]],"summary_renderer":crate::domain::EXPERIENCE_SUMMARY_RENDERER_VERSION,"canonicalizer":EXPERIENCE_CANONICALIZATION_VERSION}),
+        &json!({"workspace_id":episode.workspace_id,"episode_id":episode.id,"session_id":episode.session_id,"task_id":episode.task_id,"status":episode.status.as_str(),"creator":episode.created_by.as_str(),"version":episode.version,"members":members,"extractor":[FAILURE_TO_VERIFICATION_EXTRACTOR_ID,FAILURE_TO_VERIFICATION_EXTRACTOR_VERSION],"decoders":evidence.registry().identities(),"test_profiles":test_evidence.profiles().catalog(),"normalizers":normalization.normalizer_identities(),"verifier_rules":normalization.verifier_rules().catalog(),"built_in_verifiers":[[RUST_COMPILER_RULE_ID,RUST_COMPILER_RULE_VERSION],[CARGO_TEST_RULE_ID,CARGO_TEST_RULE_VERSION]],"summary_renderer":crate::domain::EXPERIENCE_SUMMARY_RENDERER_VERSION,"canonicalizer":EXPERIENCE_CANONICALIZATION_VERSION}),
     )
 }
 fn proposal_hash(record: &ExperienceRecord) -> Result<String> {
@@ -1078,7 +1199,7 @@ mod tests {
             ExperienceEvidenceRelation, ExperienceOutcome, ProposalDisposition, Session,
             VerificationStatus, Workspace,
         },
-        service::{EvidenceService, FailureNormalizationService},
+        service::{EvidenceService, FailureNormalizationService, TestEvidenceService},
         storage::SqliteStorage,
     };
 
@@ -1157,6 +1278,103 @@ mod tests {
         )
     }
 
+    fn normalized_test_result(outcomes: &[(&str, bool)], settings_digest: &str) -> CortexEvent {
+        let failed = outcomes.iter().filter(|(_, passed)| !passed).count();
+        let cases = outcomes
+            .iter()
+            .map(|(name, passed)| {
+                json!({
+                    "identity": {"namespace": ["scope"], "name": name},
+                    "status": if *passed { "passed" } else { "assertion_failed" },
+                    "error_class": if *passed { None::<&str> } else { Some("AssertionError") },
+                    "retry_configured": false,
+                    "retry_count": 0,
+                    "repeat_configured": false,
+                    "repeat_count": 0,
+                    "flaky": false
+                })
+            })
+            .collect::<Vec<_>>();
+        event(
+            EventType::TestResult,
+            json!({
+                "contract": "cortexweave.test_run_result",
+                "version": 1,
+                "producer": {"id": "cortexweave.vitest_capture", "version": "1"},
+                "runner": {"id": "vitest", "version": "4.1.10"},
+                "runtime": {"id": "node", "version": "24.19.0"},
+                "profile": {"id": "cortexweave.vitest.file", "version": "1"},
+                "run_id": uuid::Uuid::new_v4().to_string(),
+                "operation": "test",
+                "completed": true,
+                "exit_code": if failed == 0 { 0 } else { 1 },
+                "language": "typescript",
+                "environment_fingerprint": "a".repeat(64),
+                "selection": {
+                    "project_root": ".",
+                    "import_root": ".",
+                    "test_file": "tests/scope.test.ts",
+                    "kind": "file",
+                    "value": "tests/scope.test.ts",
+                    "settings_digest": settings_digest,
+                    "inventory_complete": true
+                },
+                "cases": cases,
+                "children": [],
+                "counts": {
+                    "parents": {
+                        "discovered": outcomes.len(),
+                        "executed": outcomes.len(),
+                        "passed": outcomes.len() - failed,
+                        "assertion_failed": failed,
+                        "errored": 0,
+                        "skipped": 0,
+                        "todo": 0,
+                        "pending": 0,
+                        "expected_failed": 0,
+                        "unexpected_successful": 0
+                    },
+                    "children": {
+                        "observed": 0,
+                        "passed": 0,
+                        "assertion_failed": 0,
+                        "errored": 0,
+                        "skipped": 0,
+                        "todo": 0,
+                        "pending": 0,
+                        "expected_failed": 0,
+                        "unexpected_successful": 0
+                    }
+                },
+                "errors": [],
+                "settings": {
+                    "focused_only": false,
+                    "name_filter": false,
+                    "sharded": false,
+                    "bail": false,
+                    "watch": false,
+                    "snapshot_mode": "disabled",
+                    "pass_with_no_tests": false,
+                    "execution_origin": "current"
+                },
+                "verification_inputs": [{
+                    "kind": "test_file",
+                    "path": "tests/scope.test.ts",
+                    "observed": {
+                        "state": "present",
+                        "before_digest": "b".repeat(64),
+                        "after_digest": "b".repeat(64)
+                    }
+                }],
+                "artifacts": [{
+                    "kind": "normalized_report",
+                    "digest": "c".repeat(64),
+                    "reference": "capture/report.json"
+                }]
+            }),
+        )
+    }
+
     fn tool_action(operation: &str) -> CortexEvent {
         event(
             EventType::ExternalToolFinished,
@@ -1204,6 +1422,7 @@ mod tests {
 
     fn extract(events: Vec<CortexEvent>) -> ConsolidationPreview {
         let evidence = EvidenceService::standard().unwrap();
+        let test_evidence = TestEvidenceService::standard().unwrap();
         let normalization = FailureNormalizationService::standard().unwrap();
         let events = events
             .into_iter()
@@ -1212,6 +1431,7 @@ mod tests {
             .collect::<Vec<_>>();
         extract_proposal(
             &evidence,
+            &test_evidence,
             &normalization,
             &episode(EpisodeStatus::Closed),
             &events,
@@ -1254,6 +1474,7 @@ mod tests {
         ConsolidationService::new(
             storage,
             Arc::new(EvidenceService::standard().unwrap()),
+            Arc::new(TestEvidenceService::standard().unwrap()),
             Arc::new(FailureNormalizationService::standard().unwrap()),
         )
     }
@@ -1470,6 +1691,28 @@ mod tests {
     }
 
     #[test]
+    fn normalized_test_pass_requires_the_same_inventory_and_settings() {
+        let failure =
+            normalized_test_result(&[("target", false), ("control", true)], &"a".repeat(64));
+        assert_no_result(
+            extract(vec![
+                failure.clone(),
+                tool_action("missing-case-edit"),
+                normalized_test_result(&[("target", true)], &"a".repeat(64)),
+            ]),
+            ConsolidationNoResultReason::AmbiguousVerificationScope,
+        );
+        assert_no_result(
+            extract(vec![
+                failure,
+                tool_action("changed-settings-edit"),
+                normalized_test_result(&[("target", true), ("control", true)], &"d".repeat(64)),
+            ]),
+            ConsolidationNoResultReason::AmbiguousVerificationScope,
+        );
+    }
+
+    #[test]
     fn verifier_rule_identity_does_not_authorize_a_different_tool_or_operation() {
         assert_no_result(
             extract(vec![
@@ -1586,7 +1829,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_initial_failure_is_supporting_and_changed_failure_is_historical() {
+    fn repeated_initial_failure_is_supporting_and_coarse_failure_stays_factual() {
         let proposal = proposal(extract(vec![
             rust_failure("target", "core", "E0308"),
             rust_failure("target", "core", "E0308"),
@@ -1595,7 +1838,7 @@ mod tests {
         ]));
         assert_eq!(
             proposal.record.attempts[0].result,
-            crate::domain::AttemptResult::VerificationChangedFailure
+            crate::domain::AttemptResult::VerificationFailed
         );
         assert_eq!(
             proposal.record.experience.outcome,
@@ -1638,10 +1881,19 @@ mod tests {
     async fn acceptance_is_idempotent_through_ten_retries_restart_and_assessment() {
         let fixture = durable_fixture().await;
         let consolidator = service(Arc::clone(&fixture.storage));
-        let first = accept_once(&consolidator, &fixture.request).await;
+        let acceptance = acceptance_request(&consolidator, &fixture.request).await;
+        let first = match consolidator.accept(&acceptance).await.unwrap() {
+            crate::domain::ConsolidationAcceptance::Accepted { record } => *record,
+            result => panic!("expected accepted consolidation, got {result:?}"),
+        };
 
         for _ in 1..10 {
-            assert_eq!(accept_once(&consolidator, &fixture.request).await, first);
+            assert_eq!(
+                consolidator.accept(&acceptance).await.unwrap(),
+                crate::domain::ConsolidationAcceptance::Accepted {
+                    record: Box::new(first.clone())
+                }
+            );
         }
         assert_eq!(experience_count(&fixture.storage).await, 1);
         assert_eq!(experience_fts_count(&fixture.storage).await, 1);
@@ -1670,7 +1922,12 @@ mod tests {
                 .unwrap(),
             vec![assessment]
         );
-        assert_eq!(accept_once(&consolidator, &fixture.request).await, first);
+        assert_eq!(
+            consolidator.accept(&acceptance).await.unwrap(),
+            crate::domain::ConsolidationAcceptance::Accepted {
+                record: Box::new(first.clone())
+            }
+        );
 
         for event in &fixture.raw_events {
             assert_eq!(
@@ -1685,7 +1942,12 @@ mod tests {
 
         let restarted_storage = Arc::new(SqliteStorage::open(&fixture.database).await.unwrap());
         let restarted = service(Arc::clone(&restarted_storage));
-        assert_eq!(accept_once(&restarted, &fixture.request).await, first);
+        assert_eq!(
+            restarted.accept(&acceptance).await.unwrap(),
+            crate::domain::ConsolidationAcceptance::Accepted {
+                record: Box::new(first.clone())
+            }
+        );
         assert_eq!(experience_count(&restarted_storage).await, 1);
         assert_eq!(experience_fts_count(&restarted_storage).await, 1);
         let persisted = restarted_storage
@@ -1709,12 +1971,10 @@ mod tests {
         let second = service(Arc::new(
             SqliteStorage::open(&fixture.database).await.unwrap(),
         ));
+        let acceptance = acceptance_request(&first, &fixture.request).await;
 
-        let (left, right) = tokio::join!(
-            accept_once(&first, &fixture.request),
-            accept_once(&second, &fixture.request)
-        );
-        assert_eq!(left, right);
+        let (left, right) = tokio::join!(first.accept(&acceptance), second.accept(&acceptance));
+        assert_eq!(left.unwrap(), right.unwrap());
         assert_eq!(experience_count(&fixture.storage).await, 1);
         assert_eq!(experience_fts_count(&fixture.storage).await, 1);
     }
@@ -1818,15 +2078,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extractor_version_is_persisted_as_a_distinct_interpretation() {
+    async fn extractor_version_cannot_duplicate_an_accepted_episode() {
         let fixture = durable_fixture().await;
         let consolidator = service(Arc::clone(&fixture.storage));
         let first = accept_once(&consolidator, &fixture.request).await;
-        let preview = consolidator.preview(&fixture.request).await.unwrap();
-        let mut evolved = match preview {
-            ConsolidationPreview::Proposal { proposal, .. } => proposal.record.clone(),
-            other => panic!("expected proposal, got {other:?}"),
-        };
+        let mut evolved = first.clone();
         evolved.experience.id = uuid::Uuid::new_v4().to_string();
         evolved.experience.extractor_version = "2".into();
         evolved.experience.consolidation_fingerprint = "e".repeat(64);
@@ -1839,7 +2095,7 @@ mod tests {
             .acceptance_input_identity(&fixture.request)
             .await
             .unwrap();
-        let stored = fixture
+        let error = fixture
             .storage
             .insert_consolidated_experience(
                 &evolved,
@@ -1847,14 +2103,22 @@ mod tests {
                 &identity,
             )
             .await
-            .unwrap();
-        assert_ne!(stored.experience.id, first.experience.id);
-        assert_eq!(stored.experience.extractor_version, "2");
-        assert_eq!(
-            stored.experience.canonicalization_version,
-            crate::domain::EXPERIENCE_CANONICALIZATION_VERSION
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("already has a consolidated experience")
         );
-        assert_eq!(experience_count(&fixture.storage).await, 2);
-        assert_eq!(experience_fts_count(&fixture.storage).await, 2);
+        assert_eq!(experience_count(&fixture.storage).await, 1);
+        assert_eq!(experience_fts_count(&fixture.storage).await, 1);
+        assert_eq!(
+            fixture
+                .storage
+                .experience_for_episode(&fixture.request.workspace_id, &fixture.request.episode_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            first
+        );
     }
 }

@@ -3,7 +3,7 @@
 ## Purpose and baseline
 
 This directory is the canonical, maintainable C4 model for CortexWeave
-**v0.5.0 as implemented**. It is a model of the current repository, not a
+**v0.5.1 as implemented**. It is a model of the current repository, not a
 roadmap or a proposal. Its root is [workspace.dsl](workspace.dsl), which
 includes the model, views, and visual vocabulary.
 

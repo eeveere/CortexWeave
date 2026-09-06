@@ -24,6 +24,6 @@ pub use service::{
     HydrationAuthorization, HydrationScoreProvenance, LanguageReadiness,
     MemoryConsolidationProposal, MemoryConsolidationReport, MemoryConsolidationRequest,
     MemoryContradiction, MemorySupersessionReviewRequest, MemoryTrustReviewRequest,
-    ProposedMemorySupersession, RebuildCost, StructuralService, VerifierRuleRegistry,
-    WorkspaceGraphStatus, WorkspaceReadiness,
+    ProposedMemorySupersession, RebuildCost, StructuralService, TestEvidenceProfileRegistry,
+    TestEvidenceService, VerifierRuleRegistry, WorkspaceGraphStatus, WorkspaceReadiness,
 };

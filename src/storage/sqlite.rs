@@ -33,7 +33,9 @@ impl SqliteStorage {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
+            // Native delivery acknowledgements must have the same commit durability
+            // as the external journal that records them.
+            .synchronous(SqliteSynchronous::Full)
             .busy_timeout(SQLITE_BUSY_TIMEOUT)
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
@@ -141,10 +143,10 @@ mod tests {
         AppConfig, CortexWeaveService,
         domain::{
             Checkpoint, ContextPin, ContextSourceType, CortexEvent, Document, EmbeddingRecord,
-            EventType, GraphAnalysisState, GraphRepairDisposition, GraphRepairGeneration,
-            GraphRepairMode, GraphRepairReason, GraphRepairState, GraphState, MemoryKind,
-            MemoryRecord, Session, StoredChunk, StructuralReadOptions, Task, WorkingSetEntry,
-            Workspace,
+            Episode, EpisodeCreator, EpisodeStatus, EpisodeType, EventType, GraphAnalysisState,
+            GraphRepairDisposition, GraphRepairGeneration, GraphRepairMode, GraphRepairReason,
+            GraphRepairState, GraphState, MemoryKind, MemoryRecord, Session, StoredChunk,
+            StructuralReadOptions, Task, WorkingSetEntry, Workspace,
         },
         embedding::provider::MockEmbeddingProvider,
         indexing::{IndexingService, WorkspaceWatcher},
@@ -179,6 +181,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mode, "wal");
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(synchronous, 2);
     }
 
     #[tokio::test]
@@ -327,7 +334,10 @@ mod tests {
                 .fetch_all(upgraded.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(
+            applied,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
     }
 
     #[tokio::test]
@@ -366,7 +376,10 @@ mod tests {
                 .fetch_all(upgraded.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(
+            applied,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
         assert_eq!(
             upgraded.recent_memories(&workspace.id, 10).await.unwrap(),
             vec![memory]
@@ -420,6 +433,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(experiences, 0, "legacy events do not fabricate experiences");
+    }
+
+    #[tokio::test]
+    async fn migration_0015_preserves_populated_v05_experience_and_embedding_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cortexweave.sqlite");
+        let legacy = storage_at_migration(&path, 12).await;
+        let workspace = Workspace::new("C:/v05-upgrade", "v05-upgrade");
+        legacy.insert_workspace(&workspace).await.unwrap();
+        let session = Session::new(&workspace.id, serde_json::json!({"release": "v0.5"}));
+        legacy.insert_session(&session).await.unwrap();
+        let task = Task::new(
+            &workspace.id,
+            Some(session.id.clone()),
+            "preserve accepted experience",
+            serde_json::json!({}),
+        );
+        legacy.insert_task(&task).await.unwrap();
+        let document = Document::new(&workspace.id, "src/upgrade.rs");
+        legacy.insert_document(&document).await.unwrap();
+        let chunk = StoredChunk::new(&document.id, "upgrade::marker", "fn marker() {}");
+        legacy.insert_chunk(&chunk).await.unwrap();
+        let embedding = EmbeddingRecord::new(&chunk.id, "v0.5-model", vec![0.25, 0.75]);
+        legacy.insert_embedding(&embedding).await.unwrap();
+        let episode = Episode::new(
+            &workspace.id,
+            &session.id,
+            Some(task.id.clone()),
+            EpisodeType::Debugging,
+            Some("v0.5 accepted episode".into()),
+            EpisodeCreator::User,
+        );
+        legacy.insert_episode(&episode).await.unwrap();
+        let now = Utc::now();
+        sqlx::query("UPDATE episodes SET status = ?, version = ?, ended_at = ? WHERE workspace_id = ? AND id = ?")
+            .bind(EpisodeStatus::Closed.as_str())
+            .bind(1_i64)
+            .bind(now)
+            .bind(&workspace.id)
+            .bind(&episode.id)
+            .execute(legacy.pool())
+            .await
+            .unwrap();
+        let experience_id = "v05-experience";
+        sqlx::query(
+            "INSERT INTO experiences(id, workspace_id, session_id, task_id, episode_id, failure_signature_json, failure_key, failure_components, failure_path, failure_symbol_key, outcome, verification_status, verification_reasons_json, evidence_strength, summary, extractor_id, extractor_version, summary_renderer_version, canonicalization_version, consolidation_fingerprint, proposal_hash, created_at) VALUES (?, ?, ?, ?, ?, NULL, NULL, '', NULL, NULL, 'success', 'explicitly_accepted', '[]', 'moderate', 'Preserved v0.5 Experience.', 'cortexweave.failure_to_verification', '1', '1', '1', ?, ?, ?)",
+        )
+        .bind(experience_id)
+        .bind(&workspace.id)
+        .bind(&session.id)
+        .bind(&task.id)
+        .bind(&episode.id)
+        .bind("a".repeat(64))
+        .bind("b".repeat(64))
+        .bind(now)
+        .execute(legacy.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO experience_seals(workspace_id, experience_id, acceptance_order) VALUES (?, ?, NULL)",
+        )
+        .bind(&workspace.id)
+        .bind(experience_id)
+        .execute(legacy.pool())
+        .await
+        .unwrap();
+        legacy.pool.close().await;
+
+        let upgraded = SqliteStorage::open(&path).await.unwrap();
+        upgraded.experience_health_check().await.unwrap();
+        let preserved = upgraded
+            .experience(&workspace.id, experience_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.experience.extractor_version, "1");
+        assert_eq!(
+            upgraded.get_embedding(&embedding.chunk_id).await.unwrap(),
+            Some(embedding)
+        );
+        let receipt_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'test_evidence_import_receipts'",
+        )
+        .fetch_one(upgraded.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipt_table, 1);
     }
 
     #[tokio::test]

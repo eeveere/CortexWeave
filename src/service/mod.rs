@@ -8,6 +8,7 @@ mod failure;
 mod harness;
 mod memory;
 mod structural;
+mod test_evidence;
 
 pub use consolidation::ConsolidationService;
 pub use context::ContextService;
@@ -32,3 +33,4 @@ pub use memory::{
     ProposedMemorySupersession,
 };
 pub use structural::StructuralService;
+pub use test_evidence::{TestEvidenceProfileRegistry, TestEvidenceService};

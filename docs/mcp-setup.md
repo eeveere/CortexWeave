@@ -88,9 +88,20 @@ Set `include_explanation` on `semantic_context` or `resume_context` to include
 the selected items' reasons, component scores, token estimates, and truncation
 status. This diagnostic is outside the prompt packet budget.
 
-`semantic_context` also accepts an optional canonical `active_failure_signature`
-object. It can request a bounded historical Experience supplement only after
-ordinary context selection, and never establishes a present code or task fact.
+`semantic_context` accepts preferred `active_failure_event_id` for a stored
+failure Event, or an optional canonical `active_failure_signature` object for
+callers that already possess one. Supply one, never both. The Event-ID route
+resolves the workspace-checked stored Event and normalization inside
+CortexWeave. An eligible historical Experience receives bounded reserved packet
+capacity when ordinary context would otherwise consume the packet; current
+Events, required task/state, and pins retain authority.
+
+`test_evidence_record` accepts an inline normalized capture bundle. When a
+capture helper has already written its JSON inside the selected workspace, use
+`test_evidence_record_file` with its workspace-relative `.json` path instead.
+That route resolves the file beneath the registered root, rejects escapes and
+non-files, bounds the read, parses JSON, and sends the same native validation
+request. It does not expose arbitrary local file reads through MCP.
 
 ## Episodes and Experiences
 

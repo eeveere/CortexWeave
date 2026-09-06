@@ -47,19 +47,26 @@ trust review accepts it; see [Memory Integrity](memory-integrity.md).
 
 ## Historical Experience
 
-An optional canonical active failure signature may request Experience-aware
-context. The ordinary packet is selected first from current source, task,
-state, and Event evidence. Only then can the service add eligible active
-Experience from a separately bounded historical pool. The item is explicitly
-`historical_supplemental`; its explanation reports lifecycle, outcome,
-verification, strength, search score, and exact or compatible signature reason.
+An optional stored active failure Event ID or canonical active failure signature
+may request Experience-aware context. The Event-ID route resolves the stored,
+workspace-checked evidence and its canonical signature inside CortexWeave, so a
+client does not need to copy a large structured signature through a tool call.
 
-Experience never substitutes for current code or a current compiler/test Event.
-It cannot reclaim ordinary context capacity or displace required task, source,
-or pinned evidence. Its past verification is historical scope, not a claim
-about present code. Explicit search filters remain exact; compatible active
-failure matching may retrieve a verified Experience from a different path or
-symbol within the workspace.
+The service first builds ordinary current source, task, state, and Event
+context. If an eligible matching Experience cannot fit only because that packet
+used the available budget, CortexWeave reserves the selected historical item's
+bounded token cost and rebuilds the ordinary packet in the remaining capacity.
+Required task/state and current Event evidence retain authority; an Experience
+that duplicates a selected current member Event remains excluded. The item is
+explicitly `historical_supplemental`; its explanation reports lifecycle,
+outcome, verification, strength, search score, and exact or compatible
+signature reason.
+
+Experience never substitutes for a current compiler/test Event, required task
+state, or pinned evidence. Its past verification is historical scope, not a
+claim about present code. Explicit search filters remain exact; compatible
+active failure matching may retrieve a verified Experience from a different
+path or symbol within the workspace.
 
 ## Working Set and Time
 

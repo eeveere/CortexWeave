@@ -105,10 +105,13 @@ selected item: source identity, selection reasons, component scores, token
 estimate, and truncation status. Explanation is not prompt content and does not
 consume the packet token budget.
 
-`--active-failure-signature` accepts the canonical JSON `FailureSignature`
-returned by CortexWeave. It may add bounded historical Experience material only
-after ordinary context has been selected; it neither asserts present code state
-nor replaces current task or Event evidence.
+`--active-failure-event-id` is the preferred route for a stored failure Event:
+CortexWeave resolves its canonical signature internally. Alternatively,
+`--active-failure-signature` accepts canonical `FailureSignature` JSON returned
+by CortexWeave. Supply one, never both. A matching eligible Experience can
+reserve bounded packet capacity when ordinary context is full; it neither
+asserts present code state nor replaces current Event, required task/state, or
+pinned evidence.
 
 ## Episodes and Experiences
 

@@ -608,12 +608,43 @@ impl ContextService {
         let include_explanation = request.include_explanation;
         let pool = self.build_candidate_pool(request.clone()).await?;
         let mut packet = build_context_packet(
-            pool,
+            pool.clone(),
             token_budget,
             &self.context.budget,
             self.token_counter.as_ref(),
         );
-        let experience = self.append_experience_context(&request, &mut packet).await;
+        let mut experience = self.append_experience_context(&request, &mut packet).await;
+        if experience.selected_experience_ids.is_empty()
+            && experience.degradation == Some(ExperienceContextDegradation::BudgetExhausted)
+        {
+            let mut reservation = ContextPacket {
+                workspace_id: request.workspace_id.clone(),
+                session_id: request.session_id.clone(),
+                task_id: request.task_id.clone(),
+                summary: None,
+                items: Vec::new(),
+                token_budget,
+                estimated_tokens: 0,
+                generated_at: pool.generated_at,
+                explanation: None,
+            };
+            let reservation_experience = self
+                .append_experience_context(&request, &mut reservation)
+                .await;
+            if reservation_experience.selected_experience_ids.is_empty() {
+                experience = reservation_experience;
+            } else {
+                let ordinary_budget = token_budget.saturating_sub(reservation.estimated_tokens);
+                packet = build_context_packet(
+                    pool,
+                    ordinary_budget,
+                    &self.context.budget,
+                    self.token_counter.as_ref(),
+                );
+                packet.token_budget = token_budget;
+                experience = self.append_experience_context(&request, &mut packet).await;
+            }
+        }
         attach_explanation(&mut packet, include_explanation, experience);
         Ok(packet)
     }
@@ -2933,6 +2964,7 @@ mod tests {
         let consolidator = ConsolidationService::new(
             Arc::clone(&storage),
             Arc::new(decoder),
+            Arc::new(crate::service::TestEvidenceService::standard().unwrap()),
             Arc::new(normalizer),
         );
         let request = ConsolidationRequest {
@@ -5007,6 +5039,58 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn matching_experience_reserves_packet_capacity_from_ordinary_code() {
+        let (mut service, workspace, _session, _task, signature, _, _) =
+            experience_context_fixture().await;
+        service.context.budget.code_fraction = 1.0;
+        service.context.budget.structural_fraction = 0.0;
+        service.context.budget.memory_fraction = 0.0;
+        service.context.budget.event_fraction = 0.0;
+        service.context.budget.state_fraction = 0.0;
+
+        let document = Document::new(&workspace.id, "src/current.rs");
+        service.storage.insert_document(&document).await.unwrap();
+        let mut current_code_ids = Vec::new();
+        for index in 0..8 {
+            let current_code = StoredChunk::new(
+                &document.id,
+                format!("rust:function:current_authoritative_repair_{index}"),
+                format!(
+                    "fn current_authoritative_repair_{index}() {{ {} }}",
+                    "authoritative repair context ".repeat(20)
+                ),
+            );
+            current_code_ids.push(current_code.id.clone());
+            service.storage.insert_chunk(&current_code).await.unwrap();
+        }
+
+        let mut request = ContextRequest::new(&workspace.id);
+        request.query = Some("current_authoritative_repair".into());
+        request.active_failure_signature = Some(signature);
+        request.token_budget = 1_024;
+        request.include_documents = false;
+        request.include_memories = false;
+        request.include_events = false;
+        request.include_explanation = true;
+
+        let packet = service.assemble_context_packet(request).await.unwrap();
+
+        assert!(
+            packet
+                .items
+                .iter()
+                .any(|item| current_code_ids.contains(&item.source_id))
+        );
+        assert!(
+            packet
+                .items
+                .iter()
+                .any(|item| item.source_type == ContextSourceType::Experience)
+        );
+        assert!(packet.estimated_tokens <= packet.token_budget);
     }
 
     #[tokio::test]

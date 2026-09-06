@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -6,14 +9,18 @@ use serde_json::Value;
 use crate::{
     CortexError, Result,
     domain::{
-        CargoTestResultEvidence, DecodedEvidence, DiagnosticLevel, EvidenceContract,
-        EvidenceDecodeIssue, EvidenceDecodeResult, EvidenceEnvelope, EvidenceObservation,
-        EvidenceSubject, EvidenceSubjectKind, GenericVerifierResultEvidence,
+        CargoTestResultEvidence, ChildTestCounts, DecodedEvidence, DiagnosticLevel,
+        EvidenceContract, EvidenceDecodeIssue, EvidenceDecodeResult, EvidenceEnvelope,
+        EvidenceObservation, EvidenceSubject, EvidenceSubjectKind, GenericVerifierResultEvidence,
         MAX_EVIDENCE_IDENTIFIER_BYTES, MAX_EVIDENCE_PAYLOAD_BYTES, MAX_EVIDENCE_TEXT_BYTES,
-        MAX_RUST_DIAGNOSTICS, MAX_TEST_FAILURES, ProcessOutcome, RustCompilerResultEvidence,
-        RustDiagnosticEvidence, SourceChangeEvidence, SourceChangeKind, TestFailureEvidence,
-        ToolCompletionEvidence, UnsupportedEvidenceReason, UserAcceptanceEvidence,
-        VerificationResult,
+        MAX_RUST_DIAGNOSTICS, MAX_TEST_ARTIFACTS, MAX_TEST_CASES, MAX_TEST_CHILD_OBSERVATIONS,
+        MAX_TEST_FAILURES, MAX_TEST_NAMESPACE_COMPONENTS, MAX_TEST_RUN_ERRORS,
+        MAX_TEST_VERIFICATION_INPUTS, ProcessOutcome, RustCompilerResultEvidence,
+        RustDiagnosticEvidence, SourceChangeEvidence, SourceChangeKind, TestArtifactEvidence,
+        TestCaseIdentity, TestCaseObservation, TestCaseStatus, TestChildObservation,
+        TestFailureEvidence, TestRunCounts, TestRunError, TestRunResultEvidence, TestRunSelection,
+        TestRunSettings, TestVerificationInput, ToolCompletionEvidence, UnsupportedEvidenceReason,
+        UserAcceptanceEvidence, VerificationInputState, VerificationResult, VersionedTestComponent,
     },
 };
 
@@ -58,6 +65,7 @@ impl EventEvidenceDecoderRegistry {
             Arc::new(ExternalToolCompletionDecoder),
             Arc::new(RustCompilerResultDecoder),
             Arc::new(CargoTestResultDecoder),
+            Arc::new(TestRunResultDecoder),
             Arc::new(GenericVerifierResultDecoder),
             Arc::new(SourceChangeObservationDecoder),
             Arc::new(UserAcceptanceDecoder),
@@ -475,6 +483,403 @@ fn validate_test_failure(payload: TestFailurePayload) -> DecodeResult<TestFailur
         assertion_class: payload.assertion_class,
         message: payload.message,
     })
+}
+
+struct TestRunResultDecoder;
+
+impl EventEvidenceDecoder for TestRunResultDecoder {
+    fn contract(&self) -> EvidenceContract {
+        EvidenceContract::TestRunResult
+    }
+
+    fn version(&self) -> u16 {
+        1
+    }
+
+    fn supports_event_type(&self, event_type: &crate::domain::EventType) -> bool {
+        *event_type == crate::domain::EventType::TestResult
+    }
+
+    fn decode_observation(
+        &self,
+        event: &crate::domain::CortexEvent,
+    ) -> DecodeResult<EvidenceObservation> {
+        let payload: TestRunResultPayload = parse_payload(&event.payload)?;
+        validate_contract_fields(
+            &payload.contract,
+            payload.version,
+            self.contract(),
+            self.version(),
+        )?;
+        validate_versioned_component(&payload.producer, "producer")?;
+        validate_versioned_component(&payload.runner, "runner")?;
+        validate_versioned_component(&payload.runtime, "runtime")?;
+        validate_versioned_component(&payload.profile, "profile")?;
+        identifier(&payload.run_id, "run_id")?;
+        identifier(&payload.operation, "operation")?;
+        optional_identifier(payload.language.as_deref(), "language")?;
+        blake3_hash(&payload.environment_fingerprint, "environment_fingerprint")?;
+        validate_test_selection(&payload.selection)?;
+
+        if payload.cases.len() > MAX_TEST_CASES {
+            return Err(issue(
+                "too_many_test_cases",
+                Some("cases"),
+                format!("at most {MAX_TEST_CASES} parent cases are allowed"),
+            ));
+        }
+        if payload.children.len() > MAX_TEST_CHILD_OBSERVATIONS {
+            return Err(issue(
+                "too_many_child_observations",
+                Some("children"),
+                format!("at most {MAX_TEST_CHILD_OBSERVATIONS} child observations are allowed"),
+            ));
+        }
+        if payload.errors.len() > MAX_TEST_RUN_ERRORS {
+            return Err(issue(
+                "too_many_test_run_errors",
+                Some("errors"),
+                format!("at most {MAX_TEST_RUN_ERRORS} run errors are allowed"),
+            ));
+        }
+        if payload.verification_inputs.len() > MAX_TEST_VERIFICATION_INPUTS {
+            return Err(issue(
+                "too_many_verification_inputs",
+                Some("verification_inputs"),
+                format!("at most {MAX_TEST_VERIFICATION_INPUTS} verification inputs are allowed"),
+            ));
+        }
+        if payload.artifacts.len() > MAX_TEST_ARTIFACTS {
+            return Err(issue(
+                "too_many_test_artifacts",
+                Some("artifacts"),
+                format!("at most {MAX_TEST_ARTIFACTS} artifact references are allowed"),
+            ));
+        }
+
+        let mut parent_identities = BTreeSet::new();
+        for case in &payload.cases {
+            validate_test_identity(&case.identity, "cases[].identity")?;
+            validate_case_outcome(case.status, case.error_class.as_deref(), "cases[]")?;
+            if case.retry_count > 0 && !case.retry_configured {
+                return Err(issue(
+                    "unconfigured_test_retry",
+                    Some("cases[].retry_count"),
+                    "an observed retry requires an explicit retry configuration marker",
+                ));
+            }
+            if case.repeat_count > 0 && !case.repeat_configured {
+                return Err(issue(
+                    "unconfigured_test_repeat",
+                    Some("cases[].repeat_count"),
+                    "an observed repeat requires an explicit repeat configuration marker",
+                ));
+            }
+            if case.flaky && case.retry_count == 0 {
+                return Err(issue(
+                    "flaky_without_retry",
+                    Some("cases[].flaky"),
+                    "a flaky case requires at least one observed retry",
+                ));
+            }
+            if !parent_identities.insert(case.identity.clone()) {
+                return Err(issue(
+                    "duplicate_test_case_identity",
+                    Some("cases[].identity"),
+                    "parent case identities must be unique within a run",
+                ));
+            }
+        }
+
+        let mut child_identities = BTreeSet::new();
+        for child in &payload.children {
+            validate_test_identity(&child.parent, "children[].parent")?;
+            if !parent_identities.contains(&child.parent) {
+                return Err(issue(
+                    "unknown_child_parent",
+                    Some("children[].parent"),
+                    "every child observation must refer to an inventoried parent case",
+                ));
+            }
+            optional_text(child.description.as_deref(), "children[].description")?;
+            validate_case_outcome(child.status, child.error_class.as_deref(), "children[]")?;
+            if !child_identities.insert((child.parent.clone(), child.ordinal)) {
+                return Err(issue(
+                    "duplicate_child_observation",
+                    Some("children[].ordinal"),
+                    "child ordinals must be unique within each parent case",
+                ));
+            }
+        }
+
+        let derived_counts = derive_test_counts(&payload.cases, &payload.children)?;
+        if payload.counts != derived_counts {
+            return Err(issue(
+                "test_count_mismatch",
+                Some("counts"),
+                "reported parent or child counts do not match the bounded observations",
+            ));
+        }
+
+        for error in &payload.errors {
+            identifier(&error.error_class, "errors[].error_class")?;
+            optional_text(error.message.as_deref(), "errors[].message")?;
+        }
+        validate_verification_inputs(&payload.verification_inputs)?;
+        validate_test_artifacts(&payload.artifacts)?;
+
+        if payload.completed && payload.exit_code.is_none() {
+            return Err(issue(
+                "missing_completed_exit_code",
+                Some("exit_code"),
+                "a completed test run requires an observed process exit code",
+            ));
+        }
+        if payload.completed {
+            validate_test_exit_consistency(
+                payload.exit_code.expect("checked completed exit code"),
+                &derived_counts,
+                &payload.errors,
+            )?;
+        }
+
+        Ok(EvidenceObservation::TestRunResult(TestRunResultEvidence {
+            producer: payload.producer,
+            runner: payload.runner,
+            runtime: payload.runtime,
+            profile: payload.profile,
+            run_id: payload.run_id,
+            operation: payload.operation,
+            completed: payload.completed,
+            process_outcome: payload.exit_code.map(process_outcome),
+            exit_code: payload.exit_code,
+            language: payload.language,
+            environment_fingerprint: payload.environment_fingerprint,
+            selection: payload.selection,
+            cases: payload.cases,
+            children: payload.children,
+            counts: derived_counts,
+            errors: payload.errors,
+            settings: payload.settings,
+            verification_inputs: payload.verification_inputs,
+            artifacts: payload.artifacts,
+        }))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestRunResultPayload {
+    contract: String,
+    version: u16,
+    producer: VersionedTestComponent,
+    runner: VersionedTestComponent,
+    runtime: VersionedTestComponent,
+    profile: VersionedTestComponent,
+    run_id: String,
+    operation: String,
+    completed: bool,
+    exit_code: Option<i64>,
+    language: Option<String>,
+    environment_fingerprint: String,
+    selection: TestRunSelection,
+    cases: Vec<TestCaseObservation>,
+    children: Vec<TestChildObservation>,
+    counts: TestRunCounts,
+    errors: Vec<TestRunError>,
+    settings: TestRunSettings,
+    verification_inputs: Vec<TestVerificationInput>,
+    artifacts: Vec<TestArtifactEvidence>,
+}
+
+fn validate_versioned_component(
+    component: &VersionedTestComponent,
+    field: &str,
+) -> DecodeResult<()> {
+    identifier(&component.id, &format!("{field}.id"))?;
+    identifier(&component.version, &format!("{field}.version"))
+}
+
+fn validate_test_selection(selection: &TestRunSelection) -> DecodeResult<()> {
+    workspace_relative_root(&selection.project_root, "selection.project_root")?;
+    workspace_relative_root(&selection.import_root, "selection.import_root")?;
+    workspace_relative_path(&selection.test_file, "selection.test_file")?;
+    text(&selection.value, "selection.value")?;
+    blake3_hash(&selection.settings_digest, "selection.settings_digest")
+}
+
+fn validate_test_identity(identity: &TestCaseIdentity, field: &str) -> DecodeResult<()> {
+    if identity.namespace.len() > MAX_TEST_NAMESPACE_COMPONENTS {
+        return Err(issue(
+            "too_many_test_namespace_components",
+            Some(field),
+            format!(
+                "test identities allow at most {MAX_TEST_NAMESPACE_COMPONENTS} namespace components"
+            ),
+        ));
+    }
+    for component in &identity.namespace {
+        text(component, field)?;
+    }
+    text(&identity.name, field)
+}
+
+fn validate_case_outcome(
+    status: TestCaseStatus,
+    error_class: Option<&str>,
+    field: &str,
+) -> DecodeResult<()> {
+    optional_identifier(error_class, &format!("{field}.error_class"))?;
+    let requires_error = matches!(
+        status,
+        TestCaseStatus::AssertionFailed | TestCaseStatus::Errored | TestCaseStatus::ExpectedFailed
+    );
+    if requires_error != error_class.is_some() {
+        return Err(issue(
+            "test_error_class_mismatch",
+            Some(format!("{field}.error_class")),
+            "assertion_failed, errored, and expected_failed require an error class; other statuses forbid one",
+        ));
+    }
+    Ok(())
+}
+
+fn derive_test_counts(
+    cases: &[TestCaseObservation],
+    children: &[TestChildObservation],
+) -> DecodeResult<TestRunCounts> {
+    let mut counts = TestRunCounts::default();
+    counts.parents.discovered = u64::try_from(cases.len()).map_err(|_| {
+        issue(
+            "test_count_overflow",
+            Some("cases"),
+            "parent test count exceeds the supported range",
+        )
+    })?;
+    for case in cases {
+        if case.status.was_executed() {
+            checked_increment(&mut counts.parents.executed, "counts.parents.executed")?;
+        }
+        increment_parent_status(&mut counts.parents, case.status)?;
+    }
+    counts.children.observed = u64::try_from(children.len()).map_err(|_| {
+        issue(
+            "test_count_overflow",
+            Some("children"),
+            "child observation count exceeds the supported range",
+        )
+    })?;
+    for child in children {
+        increment_child_status(&mut counts.children, child.status)?;
+    }
+    Ok(counts)
+}
+
+fn checked_increment(value: &mut u64, field: &str) -> DecodeResult<()> {
+    *value = value.checked_add(1).ok_or_else(|| {
+        issue(
+            "test_count_overflow",
+            Some(field),
+            "test outcome count exceeds the supported range",
+        )
+    })?;
+    Ok(())
+}
+
+fn increment_parent_status(
+    counts: &mut crate::domain::ParentTestCounts,
+    status: TestCaseStatus,
+) -> DecodeResult<()> {
+    let field = match status {
+        TestCaseStatus::Passed => &mut counts.passed,
+        TestCaseStatus::AssertionFailed => &mut counts.assertion_failed,
+        TestCaseStatus::Errored => &mut counts.errored,
+        TestCaseStatus::Skipped => &mut counts.skipped,
+        TestCaseStatus::Todo => &mut counts.todo,
+        TestCaseStatus::Pending => &mut counts.pending,
+        TestCaseStatus::ExpectedFailed => &mut counts.expected_failed,
+        TestCaseStatus::UnexpectedSuccessful => &mut counts.unexpected_successful,
+    };
+    checked_increment(field, "counts.parents")
+}
+
+fn increment_child_status(
+    counts: &mut ChildTestCounts,
+    status: TestCaseStatus,
+) -> DecodeResult<()> {
+    let field = match status {
+        TestCaseStatus::Passed => &mut counts.passed,
+        TestCaseStatus::AssertionFailed => &mut counts.assertion_failed,
+        TestCaseStatus::Errored => &mut counts.errored,
+        TestCaseStatus::Skipped => &mut counts.skipped,
+        TestCaseStatus::Todo => &mut counts.todo,
+        TestCaseStatus::Pending => &mut counts.pending,
+        TestCaseStatus::ExpectedFailed => &mut counts.expected_failed,
+        TestCaseStatus::UnexpectedSuccessful => &mut counts.unexpected_successful,
+    };
+    checked_increment(field, "counts.children")
+}
+
+fn validate_verification_inputs(inputs: &[TestVerificationInput]) -> DecodeResult<()> {
+    let mut identities = BTreeSet::new();
+    for input in inputs {
+        workspace_relative_path(&input.path, "verification_inputs[].path")?;
+        if !identities.insert((input.kind, input.path.clone())) {
+            return Err(issue(
+                "duplicate_verification_input",
+                Some("verification_inputs"),
+                "verification input kind and path pairs must be unique",
+            ));
+        }
+        if let VerificationInputState::Present {
+            before_digest,
+            after_digest,
+        } = &input.observed
+        {
+            blake3_hash(before_digest, "verification_inputs[].before_digest")?;
+            blake3_hash(after_digest, "verification_inputs[].after_digest")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_test_artifacts(artifacts: &[TestArtifactEvidence]) -> DecodeResult<()> {
+    let mut identities = BTreeSet::new();
+    for artifact in artifacts {
+        identifier(&artifact.kind, "artifacts[].kind")?;
+        blake3_hash(&artifact.digest, "artifacts[].digest")?;
+        text(&artifact.reference, "artifacts[].reference")?;
+        if !identities.insert((artifact.kind.clone(), artifact.reference.clone())) {
+            return Err(issue(
+                "duplicate_test_artifact",
+                Some("artifacts"),
+                "artifact kind and reference pairs must be unique",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_test_exit_consistency(
+    exit_code: i64,
+    counts: &TestRunCounts,
+    errors: &[TestRunError],
+) -> DecodeResult<()> {
+    let failed = counts.parents.assertion_failed > 0
+        || counts.parents.errored > 0
+        || counts.parents.unexpected_successful > 0
+        || counts.children.assertion_failed > 0
+        || counts.children.errored > 0
+        || counts.children.unexpected_successful > 0
+        || !errors.is_empty();
+    if (exit_code == 0) == failed {
+        return Err(issue(
+            "conflicting_test_result_and_exit_code",
+            Some("exit_code"),
+            "the process exit code conflicts with observed failures or run errors",
+        ));
+    }
+    Ok(())
 }
 
 struct GenericVerifierResultDecoder;
@@ -981,6 +1386,14 @@ fn workspace_relative_path(value: &str, field: &str) -> DecodeResult<()> {
         ));
     }
     Ok(())
+}
+
+fn workspace_relative_root(value: &str, field: &str) -> DecodeResult<()> {
+    if value == "." {
+        Ok(())
+    } else {
+        workspace_relative_path(value, field)
+    }
 }
 
 fn blake3_hash(value: &str, field: &str) -> DecodeResult<()> {

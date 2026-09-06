@@ -6,9 +6,10 @@ use crate::{
         DecodedEvidence, DiagnosticLevel, EvidenceContract, EvidenceObservation, EvidenceSubject,
         FailureDomain, FailureIdentityCapability, FailureNormalization,
         FailureNormalizationDiagnostic, FailureNormalizationResult, FailureScope, FailureSignature,
-        ProcessOutcome, UnsupportedFailureNormalization, VerificationResult, VerificationSubject,
-        VerificationSubjectKind, VerifierRule,
+        ProcessOutcome, TestCaseStatus, TestRunEligibilityStatus, UnsupportedFailureNormalization,
+        VerificationResult, VerificationSubject, VerificationSubjectKind, VerifierRule,
     },
+    service::TestEvidenceService,
 };
 
 pub trait FailureNormalizer: Send + Sync {
@@ -45,9 +46,11 @@ impl FailureNormalizerRegistry {
     }
 
     pub fn standard(rules: Arc<VerifierRuleRegistry>) -> Result<Self> {
+        let test_evidence = Arc::new(TestEvidenceService::standard()?);
         Self::new(vec![
             Arc::new(RustCompilerFailureNormalizer),
             Arc::new(CargoTestFailureNormalizer),
+            Arc::new(TestRunFailureNormalizer { test_evidence }),
             Arc::new(RegisteredToolFailureNormalizer { rules }),
         ])
     }
@@ -261,6 +264,7 @@ impl FailureNormalizer for RustCompilerFailureNormalizer {
             self.version(),
             scope(
                 &evidence.envelope.workspace_id,
+                Some("rust"),
                 "rustc",
                 Some(subject.value),
                 path,
@@ -342,6 +346,7 @@ impl FailureNormalizer for CargoTestFailureNormalizer {
             self.version(),
             scope(
                 &evidence.envelope.workspace_id,
+                Some("rust"),
                 "cargo",
                 Some(subject.value),
                 None,
@@ -356,6 +361,95 @@ impl FailureNormalizer for CargoTestFailureNormalizer {
                     "a test name and assertion class do not identify one stable failing assertion or case, so this normalized class cannot support exact equality",
                 ),
             ],
+        )
+    }
+}
+
+struct TestRunFailureNormalizer {
+    test_evidence: Arc<TestEvidenceService>,
+}
+
+impl FailureNormalizer for TestRunFailureNormalizer {
+    fn id(&self) -> &'static str {
+        "cortexweave.test_run_failure"
+    }
+
+    fn version(&self) -> &'static str {
+        "1"
+    }
+
+    fn contract(&self) -> EvidenceContract {
+        EvidenceContract::TestRunResult
+    }
+
+    fn normalize(&self, evidence: &DecodedEvidence) -> FailureNormalizationResult {
+        let EvidenceObservation::TestRunResult(report) = &evidence.observation else {
+            return unsupported(
+                "evidence_contract_mismatch",
+                "test-run normalizer received another observation",
+            );
+        };
+        let assessment = self.test_evidence.assess_report(report);
+        if assessment.status != TestRunEligibilityStatus::EligibleFailed {
+            let detail = assessment
+                .issues
+                .first()
+                .map(|issue| issue.message.as_str())
+                .unwrap_or("a passing test run has no failure signature");
+            return unsupported("ineligible_test_run_failure", detail);
+        }
+        let failed: Vec<_> = report
+            .cases
+            .iter()
+            .filter(|case| case.status == TestCaseStatus::AssertionFailed)
+            .collect();
+        if failed.len() != 1 {
+            return unsupported(
+                "ambiguous_test_run_failure",
+                "exactly one assertion-failed parent case is required",
+            );
+        }
+        let failed = failed[0];
+        let namespace = encode_test_namespace(&failed.identity.namespace);
+        let components = BTreeMap::from([
+            ("profile_id".into(), report.profile.id.clone()),
+            ("profile_version".into(), report.profile.version.clone()),
+            ("runner_id".into(), report.runner.id.clone()),
+            ("runner_version".into(), report.runner.version.clone()),
+            ("project_root".into(), report.selection.project_root.clone()),
+            ("import_root".into(), report.selection.import_root.clone()),
+            (
+                "selection_kind".into(),
+                test_selection_kind_name(report.selection.kind).into(),
+            ),
+            ("selection_value".into(), report.selection.value.clone()),
+            ("case_namespace".into(), namespace),
+            ("case_name".into(), failed.identity.name.clone()),
+            (
+                "error_class".into(),
+                failed
+                    .error_class
+                    .clone()
+                    .expect("eligible assertion failure has an error class"),
+            ),
+        ]);
+        signature(
+            FailureDomain::TestRun,
+            FailureIdentityCapability::CompatibleOnly,
+            components,
+            self.id(),
+            self.version(),
+            scope(
+                &evidence.envelope.workspace_id,
+                report.language.as_deref(),
+                &report.runner.id,
+                Some(report.selection.value.clone()),
+                Some(report.selection.test_file.clone()),
+            ),
+            vec![diagnostic_note(
+                "compatible_only_identity",
+                "runner-qualified case identity does not identify one stable failing assertion, so it cannot support exact recurrence",
+            )],
         )
     }
 }
@@ -433,6 +527,7 @@ impl FailureNormalizer for RegisteredToolFailureNormalizer {
             self.version(),
             scope(
                 &evidence.envelope.workspace_id,
+                rule.language.as_deref(),
                 &report.tool,
                 Some(subject.value),
                 None,
@@ -467,17 +562,37 @@ fn signature(
 
 fn scope(
     workspace_id: &str,
+    language: Option<&str>,
     tool: &str,
     target: Option<String>,
     path: Option<String>,
 ) -> FailureScope {
     FailureScope {
         workspace_id: workspace_id.to_owned(),
-        language: Some("rust".into()),
+        language: language.map(Into::into),
         tool: tool.into(),
         target,
         path,
         symbol_key: None,
+    }
+}
+
+fn encode_test_namespace(namespace: &[String]) -> String {
+    let mut encoded = namespace.len().to_string();
+    encoded.push(':');
+    for component in namespace {
+        encoded.push_str(&component.len().to_string());
+        encoded.push(':');
+        encoded.push_str(component);
+    }
+    encoded
+}
+
+fn test_selection_kind_name(kind: crate::domain::TestSelectionKind) -> &'static str {
+    match kind {
+        crate::domain::TestSelectionKind::File => "file",
+        crate::domain::TestSelectionKind::Module => "module",
+        crate::domain::TestSelectionKind::Class => "class",
     }
 }
 

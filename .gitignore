@@ -18,6 +18,9 @@
 *.local.yml
 *.log
 *.pid
+__pycache__/
+*.py[cod]
+/cortexweave.toml
 
 # Local credentials belong in a root-level private directory or an env file.
 /.credentials/
@@ -26,6 +29,7 @@
 .env.*
 !.env.example
 
+# Documentation
 /CortexWeave v0.1 Revised Multi-Language Implementation Plan.md
 /CortexWeave v0.1.1 Indexing Hardening and Workspace Resolution Plan.md
 /CortexWeave v0.2 Context Orchestration Plan.md

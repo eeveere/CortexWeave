@@ -223,7 +223,8 @@ impl SqliteStorage {
             })
     }
 
-    pub async fn delete_workspace(&self, workspace_id: &str) -> Result<bool> {
+    #[cfg(test)]
+    pub(crate) async fn delete_workspace(&self, workspace_id: &str) -> Result<bool> {
         let result = sqlx::query("DELETE FROM workspaces WHERE id = ?")
             .bind(workspace_id)
             .execute(self.pool())
@@ -896,31 +897,13 @@ impl SqliteStorage {
     }
 
     pub async fn insert_event(&self, event: &CortexEvent) -> Result<()> {
-        let mut transaction = self.pool().begin().await?;
-        sqlx::query(
-            "INSERT INTO events(id, workspace_id, session_id, task_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&event.id)
-        .bind(&event.workspace_id)
-        .bind(&event.session_id)
-        .bind(&event.task_id)
-        .bind(event.event_type.storage_name())
-        .bind(serde_json::to_string(&event.payload)?)
-        .bind(event.created_at)
-        .execute(&mut *transaction)
-        .await?;
-        // Upgrade fixtures deliberately exercise pre-v0.5 schemas. Production
-        // opens run every migration first; only those legacy test schemas lack
-        // this frontier table and therefore retain no false ordering claim.
-        if historical_frontier_schema_available(&mut transaction).await? {
-            insert_historical_write_order(
-                &mut transaction,
-                &event.workspace_id,
-                "event",
-                &event.id,
-            )
-            .await?;
+        if super::test_evidence::is_normalized_test_run_payload(&event.payload) {
+            return Err(CortexError::Analysis(
+                "normalized test-run evidence requires the capture-specific importer".into(),
+            ));
         }
+        let mut transaction = self.pool().begin().await?;
+        insert_event_in_transaction(&mut transaction, event).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -959,7 +942,8 @@ impl SqliteStorage {
         &self,
         record: &ExperienceRecord,
     ) -> Result<ExperienceRecord> {
-        self.insert_experience_checked(record, None, None).await
+        self.insert_experience_checked(record, None, None, false)
+            .await
     }
 
     /// Consolidation acceptance rechecks the exact episode membership frontier
@@ -970,8 +954,13 @@ impl SqliteStorage {
         expected_episode_version: u64,
         input_identity: &ConsolidationInputIdentity,
     ) -> Result<ExperienceRecord> {
-        self.insert_experience_checked(record, Some(expected_episode_version), Some(input_identity))
-            .await
+        self.insert_experience_checked(
+            record,
+            Some(expected_episode_version),
+            Some(input_identity),
+            true,
+        )
+        .await
     }
 
     async fn insert_experience_checked(
@@ -979,6 +968,7 @@ impl SqliteStorage {
         record: &ExperienceRecord,
         expected_episode_version: Option<u64>,
         expected_input_identity: Option<&ConsolidationInputIdentity>,
+        enforce_single_episode: bool,
     ) -> Result<ExperienceRecord> {
         validate_experience_record(record)?;
         let experience = &record.experience;
@@ -1065,6 +1055,21 @@ impl SqliteStorage {
             })?;
             transaction.commit().await?;
             return Ok(existing);
+        }
+
+        if enforce_single_episode
+            && experience_by_episode_in_transaction(
+                &mut transaction,
+                &experience.workspace_id,
+                &experience.episode_id,
+            )
+            .await?
+            .is_some()
+        {
+            return Err(CortexError::Conflict(format!(
+                "episode {} already has a consolidated experience",
+                experience.episode_id
+            )));
         }
 
         insert_experience_row(&mut transaction, experience).await?;
@@ -1188,6 +1193,25 @@ impl SqliteStorage {
             experience_record_in_transaction(&mut transaction, workspace_id, experience_id).await?;
         transaction.commit().await?;
         Ok(result)
+    }
+
+    pub(crate) async fn experience_for_episode(
+        &self,
+        workspace_id: &str,
+        episode_id: &str,
+    ) -> Result<Option<ExperienceRecord>> {
+        let mut transaction = self.pool().begin().await?;
+        let Some(row) =
+            experience_by_episode_in_transaction(&mut transaction, workspace_id, episode_id)
+                .await?
+        else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        let record =
+            experience_record_in_transaction(&mut transaction, workspace_id, &row.id).await?;
+        transaction.commit().await?;
+        Ok(record)
     }
 
     /// Returns bounded identifiers from independent deterministic candidate
@@ -5122,6 +5146,20 @@ async fn experience_by_fingerprint_in_transaction(
     ).bind(workspace_id).bind(fingerprint).fetch_optional(&mut **transaction).await?)
 }
 
+async fn experience_by_episode_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+    episode_id: &str,
+) -> Result<Option<ExperienceRow>> {
+    Ok(sqlx::query_as::<_, ExperienceRow>(
+        "SELECT id, workspace_id, session_id, task_id, episode_id, failure_signature_json, outcome, verification_status, verification_reasons_json, evidence_strength, summary, extractor_id, extractor_version, summary_renderer_version, canonicalization_version, consolidation_fingerprint, proposal_hash, created_at FROM experiences WHERE workspace_id = ? AND episode_id = ? ORDER BY created_at ASC, id ASC LIMIT 1",
+    )
+    .bind(workspace_id)
+    .bind(episode_id)
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
+
 async fn experience_record_in_transaction(
     transaction: &mut Transaction<'_, Sqlite>,
     workspace_id: &str,
@@ -5190,6 +5228,21 @@ async fn experience_record_in_transaction(
         code_snapshots,
         graph_snapshots,
     }))
+}
+
+pub(super) async fn insert_event_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event: &CortexEvent,
+) -> Result<()> {
+    sqlx::query("INSERT INTO events(id, workspace_id, session_id, task_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .bind(&event.id).bind(&event.workspace_id).bind(&event.session_id).bind(&event.task_id)
+        .bind(event.event_type.storage_name()).bind(serde_json::to_string(&event.payload)?).bind(event.created_at)
+        .execute(&mut **transaction).await?;
+    // Pre-v0.5 upgrade fixtures lack this table; production opens migrate first.
+    if historical_frontier_schema_available(transaction).await? {
+        insert_historical_write_order(transaction, &event.workspace_id, "event", &event.id).await?;
+    }
+    Ok(())
 }
 
 async fn insert_historical_write_order(

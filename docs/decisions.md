@@ -1149,24 +1149,28 @@ hash also matches; a mismatch is a deterministic-extractor invariant failure.
 This prevents either retry duplication or silent acceptance of two outputs for
 one versioned input.
 
-## D074: Current Evidence Has One-Way Budget Authority over Experience
+## D074: Current Evidence Retains Authority While Eligible Experience Reserves Bounded Capacity
 
 **Status:** Accepted
 
 Experience is a separate historical context source. Automatic inclusion
-requires either a typed active failure signature or explicit experience
-enablement, exact workspace scope, active lifecycle, a compatible verified
-`Success` or `PartialSuccess`, and at least `Moderate` structured strength.
-Ordinary context admits at most three experiences; the hard service ceiling is
-ten.
+requires a typed active failure signature, or a stored active failure Event ID
+that CortexWeave resolves to one, exact workspace scope, active lifecycle, a
+compatible verified `Success` or `PartialSuccess`, and at least `Moderate`
+structured strength. Ordinary context admits at most three experiences; the
+hard service ceiling is ten.
 
 The initial packet fractions are 50% code, 20% structural, 10% memory, 5%
-event, 5% state, and 10% experience. Experience cannot reclaim unused budget
-from any other category. Higher-authority categories may reclaim unused
-experience allocation. This deliberately narrows the v0.4.1 general fallback
-pass so historical experience cannot displace current source, current graph
-evidence, active state, or current diagnostics. Every selected experience is
-labeled historical and retains an experience-specific selection reason.
+event, 5% state, and 10% experience. The service first attempts ordinary
+selection. If an eligible Experience is excluded only for lack of remaining
+packet capacity, it measures the selected historical item in its separate cap,
+reserves that exact cost, and rebuilds ordinary context in the remaining
+capacity. A duplicate of a selected current member Event is still excluded;
+required task/state, current Event, and pinned evidence are never displaced.
+This makes historical Experience available to clients that request it without
+turning it into present evidence or an unbounded replacement for current code.
+Every selected Experience is labeled historical and retains an
+experience-specific selection reason.
 
 ## D075: Experience Policy Lives Behind Transport-Neutral Services
 
@@ -1803,12 +1807,12 @@ D033 without moving selection policy into an adapter.
 
 ## D104: Normalized Test Evidence and External Runner Capture
 
-**Status:** Proposed for v0.5.1; not implemented.
+**Status:** Accepted for v0.5.1 implementation; BP0 contract frozen on
+2026-09-04.
 
 The [v0.5.1 plan](<../CortexWeave v0.5.1 Test Evidence and Vitest Integration Plan.md>)
-proposes a versioned, runner-neutral test-run contract with Vitest and Python
-unittest as its two qualified producers. This scope was expanded at the user's
-request; implementation details remain proposed. Small externally invoked
+defines a versioned, runner-neutral test-run contract with Vitest and Python
+unittest as its two qualified producers. Small externally invoked
 helpers own process execution and framework-specific observation. Native services
 own validation, verification scope, failure normalization, and consolidation. CLI
 and MCP remain thin adapters; core/application code never starts the runner.
@@ -1826,10 +1830,11 @@ different failure from coarse observations.
 
 Capture imports use minimal SQLite-owned receipts to keep retries from creating
 independent evidence. New contract/extractor versions preserve accepted v0.5
-history and do not silently reconsolidate accepted episodes. The complete
-proposal, supported-version qualification, and review gates are in the plan;
-this entry records a proposed architecture direction rather than acceptance
-of unimplemented behavior. Release qualification requires both real capture
+history and do not silently reconsolidate accepted episodes. The exact v1
+fields, status vocabulary, limits, qualified versions, receipt key, and
+transport operations are frozen in
+[checkpoint 89](checkpoints/89-v0.5.1-test-evidence-contract-freeze.md).
+Release qualification requires both real capture
 workflows, the emCP scored pair, PiHype fresh-session reuse, and preservation of
 the existing Rust/Cargo evidence paths.
 
@@ -1889,8 +1894,9 @@ not claim that the current workspace-isolation contract has already changed.
 
 ## D106: Native Delivery Receipts Support External Harness Recovery
 
-**Status:** Proposed prerequisite in the user-approved Shuttle plan revision;
-not implemented.
+**Status:** Native ingress receipt contract implemented on 2026-09-03 for the
+first Shuttle foundation; complete live-harness recovery qualification remains
+an implementation gate.
 
 Before Shuttle permits its first live-model writes, its adapter needs retry-safe
 native creation of sessions, tasks and episodes, and delivery of factual Events.
@@ -1915,3 +1921,89 @@ acceptance/finalization. Recovery must preserve original identities, avoid dupli
 evidence, distinguish unknown effects from failed commands, and reconcile the
 same snapshot-bound acceptance without inventing a new verifier observation.
 The detailed controller policy stays in the separate harness plan/repository.
+
+The first implementation exposes `deliver_native(NativeDeliveryRequest)` with
+typed session/task/episode creation and factual Event operations. Migration 0013
+stores the request and original receipt under workspace/operation/request-key
+identity. A SQLite immediate write transaction serializes retries, validates
+the actual owner, inserts the domain record, and stores the receipt. Event
+delivery uses the shared insertion helper so its historical ordering is committed
+in that transaction too. Equality uses deserialized JSON values, preserving
+array order and ignoring object-key insertion order. Creation timestamps/IDs
+come from the service; caller-supplied Event identity and occurrence timestamp
+are part of the request and must survive delivery retries unchanged.
+
+Receipts are immutable original commit evidence, not reads of current task,
+session or episode state. Existing-key recovery therefore precedes lifecycle
+validation, allowing recovery after a session has ended without creating new
+records. New creation requests still validate active-session and ownership
+requirements. Workspace deletion retains its established cascade semantics.
+File-backed SQLite now uses synchronous FULL, matching the durable external
+journal; the additional flush cost belongs in subsequent performance qualification.
+
+Native tests cover all four operation retries after reopen, same-key concurrent
+creation, payload conflicts, invalid owners, ended-session creation rejection,
+immutable receipts, and rollback when receipt persistence fails. Existing native
+context, Experience, and migration tests remain required. Shuttle's process and
+acceptance/finalization recovery gates are separately tracked in that repository.
+
+## D107: Test Verification Scope and Failed Attempts Are Factual
+
+**Status:** Accepted and implemented for v0.5.1 on 2026-09-04.
+
+The normalized test verifier binds profile, producer, runner, runtime,
+environment, language, selection, settings, complete parent inventory, and
+verification-input identity into one canonical scope fingerprint. Outcome,
+diagnostic prose, run identity, time, and artifact location do not change
+scope. A later all-pass run verifies the initial failure only when this scope
+is equal; missing cases or changed test/configuration/dependency inputs cannot
+silently pass.
+
+Vitest and unittest failure signatures remain compatible-only and
+runner-qualified. A failed compatible-only verification is recorded as the
+factual `verification_failed` attempt result. `still_failing` and
+`verification_changed_failure` are reserved for comparable exact-capable
+signatures that establish equality or inequality. Consolidator version 2 and
+migration 0014 preserve the earlier stored vocabulary while adding `test_run`
+verification and the new attempt result.
+
+## D108: Capture Imports and Workspace Deregistration Have Their Own Receipts
+
+**Status:** Accepted and implemented for v0.5.1 on 2026-09-04.
+
+Test-run capture identity is not a generic Event delivery key. SQLite stores a
+receipt for the exact producer/version/run identity and canonical capture
+request in the same transaction as the immutable Event and its historical
+write order. Ordinary Event and generic native-delivery ingress reject the
+normalized test-run contract, so a transport retry cannot manufacture a second
+captured run. Stored-event inspection remains workspace-scoped and capability
+reporting names the qualified profiles and deferred integrations.
+
+Workspace deregistration has a separate, deliberately minimal receipt because
+its subject is removed by the operation. A five-minute confirmation plan lives
+outside the workspace cascade and binds the exact UUID, registration identity,
+bounded state/count snapshot, and expiry. Confirmation rechecks that snapshot
+under SQLite's immediate writer transaction, cascades CortexWeave-owned rows,
+then consumes the plan and records the receipt atomically. Repeating the same
+request returns the original receipt; changed keys or content conflict; stale
+plans do not delete. The workflow never operates on the source checkout or
+external artifacts. MCP owns watcher shutdown/restart around its adapter call;
+the application service remains independent of watcher and MCP types.
+
+## D109: Runner Capture Is an External, Bounded Observation
+
+**Status:** Accepted and implemented for v0.5.1 on 2026-09-04.
+
+Vitest and Python `unittest` remain external producers. Each helper resolves a
+selected local runner, executes one complete supported scope, writes a raw
+framework observation and normalizes it into the shared test-run contract.
+The helpers do not submit evidence, start CortexWeave services, edit project
+sources, install dependencies, retry a repair, or make eligibility decisions.
+Core and application services therefore continue to consume runner-neutral
+facts and retain all persistence, identity, and verification policy.
+
+Output artifacts are exclusive: an existing bundle or raw sidecar is an error,
+not material to overwrite. A framework callback does not establish successful
+verification by itself; capture also records the observed process completion
+and exit. Incomplete or unsupported observations remain diagnostics and cannot
+be promoted by the helper to passing evidence.

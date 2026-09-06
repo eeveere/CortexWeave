@@ -56,6 +56,7 @@ impl ExperienceOutcome {
 pub enum AttemptResult {
     StillFailing,
     VerificationPassed,
+    VerificationFailed,
     VerificationChangedFailure,
     Inconclusive,
 }
@@ -65,6 +66,7 @@ impl AttemptResult {
         match self {
             Self::StillFailing => "still_failing",
             Self::VerificationPassed => "verification_passed",
+            Self::VerificationFailed => "verification_failed",
             Self::VerificationChangedFailure => "verification_changed_failure",
             Self::Inconclusive => "inconclusive",
         }
@@ -73,6 +75,7 @@ impl AttemptResult {
         match value {
             "still_failing" => Self::StillFailing,
             "verification_passed" => Self::VerificationPassed,
+            "verification_failed" => Self::VerificationFailed,
             "verification_changed_failure" => Self::VerificationChangedFailure,
             _ => Self::Inconclusive,
         }
@@ -118,6 +121,7 @@ impl VerificationStatus {
 pub enum VerificationKind {
     RustCompiler,
     CargoTest,
+    TestRun,
     RegisteredTool,
     UserAcceptance,
     None,
@@ -128,6 +132,7 @@ impl VerificationKind {
         match self {
             Self::RustCompiler => "rust_compiler",
             Self::CargoTest => "cargo_test",
+            Self::TestRun => "test_run",
             Self::RegisteredTool => "registered_tool",
             Self::UserAcceptance => "user_acceptance",
             Self::None => "none",
@@ -137,6 +142,7 @@ impl VerificationKind {
         match value {
             "rust_compiler" => Self::RustCompiler,
             "cargo_test" => Self::CargoTest,
+            "test_run" => Self::TestRun,
             "registered_tool" => Self::RegisteredTool,
             "user_acceptance" => Self::UserAcceptance,
             _ => Self::None,

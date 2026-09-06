@@ -2,7 +2,7 @@
 
 # CortexWeave
 
-CortexWeave v0.5 is a local-first context substrate for coding agents and
+CortexWeave v0.5.1 is a local-first context substrate for coding agents and
 harnesses. It indexes registered workspaces, keeps explicit memory, durable
 structural code provenance, and verified historical Experience, and returns
 bounded, explainable context packets through a CLI and MCP over stdio.
@@ -58,7 +58,10 @@ cortexweave evidence capabilities
 ```
 
 The equivalent MCP tools are `test_evidence_record`,
-`event_evidence_inspect`, and `evidence_capabilities`. Start an explicit
+`test_evidence_record_file`, `event_evidence_inspect`, and
+`evidence_capabilities`. `test_evidence_record_file` reads a bounded JSON file
+only below the registered workspace root, which avoids copying a large capture
+into an agent prompt. Start an explicit
 episode, associate the captured Event, close it, and use the Experience preview
 and acceptance calls when the episode contains a supported failure and later
 verification. A complete file or module/class is required; watch mode,
@@ -147,11 +150,21 @@ Use [`.crushrc.example`](.crushrc.example) as the project-local Crush template.
 - `docs/verified-experience.md`: v0.5 episodes, typed evidence, Experience, retrieval, authority, and limits
 - `docs/test-evidence-workflow.md`: supported Vitest/unittest capture and Crush episode workflow
 - `docs/v0.5-release-boundary.md`: accepted verified-experience release scope and deferred research
-- [v0.5.1 implementation plan](<CortexWeave v0.5.1 Test Evidence and Vitest Integration Plan.md>): proposed Vitest and Python unittest evidence, with Crush qualification on emCP and PiHype
+- [v0.5.1 implementation plan](<CortexWeave v0.5.1 Test Evidence and Vitest Integration Plan.md>): completed Vitest and Python unittest evidence, qualification, and release boundary
+- [v0.5.1 release notes](docs/release-notes-v0.5.1.md): delivered capability, qualified versions, and known limitations
 
-## Known Issues/Limitation
-- *Verified Experience is **incomplete***. the foundation is present, rust+`cargo test` support is present; but test verifiers for other currently supported languages still need to be written. v0.5.1 will contain vitest support and python unitest support.
-- ***v0.5 contains no safe method to deregister a workspace.*** current behavior *may* lead to unintended deletion0s. safe deletion will be included in v0.5.1 in addition to vitest/unitest support for Verified Experience.
+## Known Limitations
+
+- Automatic test verification is qualified only for Vitest 4.1.10 on Node
+  24.19.0 and Python `unittest` on Python 3.14.7. Pytest, Jest, Mocha, Node's
+  test runner, Go, .NET, and aggregate check commands remain unsupported.
+- `unittest` subtest-containing scopes remain inspectable but are not eligible
+  for automatic verification. Complete non-watch files, modules, or selected
+  `TestCase` classes are required.
+- CortexWeave supplies evidence and bounded context; it does not enforce an
+  agent's tool budget, command discipline, or stop conditions. The qualification
+  includes an Experience-exposed assisted emCP smoke, but no clean matched
+  baseline/assisted model-performance comparison. It makes no performance claim.
 
 ## Context and Memory Boundaries
 

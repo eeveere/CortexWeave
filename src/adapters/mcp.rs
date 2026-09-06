@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    fs,
+    path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -23,7 +24,8 @@ use crate::{
         ExperienceDisputeProposalRequest, ExperienceSearchRequest, FailureSignature,
         GraphRepairMode, MAX_EPISODE_EVENTS, MAX_EXPERIENCE_ASSESSMENT_EVIDENCE,
         MAX_EXPERIENCE_ASSESSMENT_PAGE_LIMIT, MemoryKind, MemoryRecord, ResumeContextRequest,
-        StructuralReadOptions,
+        StructuralReadOptions, TestEvidenceRecordRequest, Workspace,
+        WorkspaceDeregistrationOutcome, WorkspaceDeregistrationRequest,
     },
     indexing::{WorkspaceWatcher, WorkspaceWatcherHandle},
     workspace::WorkspaceSelector,
@@ -57,6 +59,8 @@ pub struct McpServer {
     workspace_hint: Option<WorkspaceHint>,
     initialized: AtomicBool,
     watcher_state: Arc<Mutex<BTreeMap<String, String>>>,
+    watcher_handles: Arc<tokio::sync::Mutex<BTreeMap<String, WorkspaceWatcherHandle>>>,
+    watcher_lifecycle: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl McpServer {
@@ -73,6 +77,8 @@ impl McpServer {
             workspace_hint,
             initialized: AtomicBool::new(false),
             watcher_state: Arc::new(Mutex::new(BTreeMap::new())),
+            watcher_handles: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            watcher_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -80,7 +86,7 @@ impl McpServer {
         let mut input = BufReader::new(tokio::io::stdin());
         let mut output = tokio::io::stdout();
         let mut frame = Vec::new();
-        let mut watcher_startup: Option<JoinHandle<Vec<WorkspaceWatcherHandle>>> = None;
+        let mut watcher_startup: Option<JoinHandle<()>> = None;
         while let Some(line) = read_mcp_frame(&mut input, &mut frame).await? {
             if line.trim().is_empty() {
                 continue;
@@ -94,6 +100,8 @@ impl McpServer {
                         watcher_startup = Some(tokio::spawn(Self::start_workspace_watchers_for(
                             Arc::clone(&self.service),
                             Arc::clone(&self.watcher_state),
+                            Arc::clone(&self.watcher_handles),
+                            Arc::clone(&self.watcher_lifecycle),
                         )));
                     }
                     response
@@ -107,70 +115,92 @@ impl McpServer {
                 output.flush().await?;
             }
         }
-        if let Some(startup) = watcher_startup
-            && let Ok(watchers) = startup.await
-        {
-            for watcher in watchers {
-                watcher.shutdown().await;
-            }
+        if let Some(startup) = watcher_startup {
+            let _ = startup.await;
         }
+        self.shutdown_workspace_watchers().await;
         Ok(())
     }
 
     #[cfg(test)]
-    async fn start_workspace_watchers(&self) -> Vec<WorkspaceWatcherHandle> {
+    async fn start_workspace_watchers(&self) -> usize {
         Self::start_workspace_watchers_for(
             Arc::clone(&self.service),
             Arc::clone(&self.watcher_state),
+            Arc::clone(&self.watcher_handles),
+            Arc::clone(&self.watcher_lifecycle),
         )
-        .await
+        .await;
+        self.watcher_handles.lock().await.len()
     }
 
     async fn start_workspace_watchers_for(
         service: Arc<CortexWeaveService>,
         watcher_state: Arc<Mutex<BTreeMap<String, String>>>,
-    ) -> Vec<WorkspaceWatcherHandle> {
-        let mut watchers = Vec::new();
+        watcher_handles: Arc<tokio::sync::Mutex<BTreeMap<String, WorkspaceWatcherHandle>>>,
+        watcher_lifecycle: Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let _lifecycle = watcher_lifecycle.lock().await;
         let workspaces = match service.list_workspaces().await {
             Ok(workspaces) => workspaces,
             Err(error) => {
                 tracing::error!(%error, "failed to list workspaces for MCP watchers");
-                return watchers;
+                return;
             }
         };
         for workspace in workspaces {
-            let workspace_id = workspace.id.clone();
-            watcher_state
-                .lock()
-                .expect("watcher state lock poisoned")
-                .insert(workspace_id.clone(), "starting".into());
-            match WorkspaceWatcher::start(
-                workspace,
-                service.indexing_handle(),
-                service.storage_handle(),
-                std::time::Duration::from_millis(service.config().indexing.debounce_ms),
-                1_024,
-            )
-            .await
-            {
-                Ok(watcher) => {
-                    watcher_state
-                        .lock()
-                        .expect("watcher state lock poisoned")
-                        .insert(workspace_id, "ready".into());
-                    watchers.push(watcher);
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    watcher_state
-                        .lock()
-                        .expect("watcher state lock poisoned")
-                        .insert(workspace_id, format!("failed: {message}"));
-                    tracing::warn!(%error, "failed to start workspace watcher for MCP");
-                }
+            Self::start_workspace_watcher(&service, &watcher_state, &watcher_handles, workspace)
+                .await;
+        }
+    }
+
+    async fn start_workspace_watcher(
+        service: &Arc<CortexWeaveService>,
+        watcher_state: &Arc<Mutex<BTreeMap<String, String>>>,
+        watcher_handles: &Arc<tokio::sync::Mutex<BTreeMap<String, WorkspaceWatcherHandle>>>,
+        workspace: Workspace,
+    ) {
+        let workspace_id = workspace.id.clone();
+        watcher_state
+            .lock()
+            .expect("watcher state lock poisoned")
+            .insert(workspace_id.clone(), "starting".into());
+        match WorkspaceWatcher::start(
+            workspace,
+            service.indexing_handle(),
+            service.storage_handle(),
+            std::time::Duration::from_millis(service.config().indexing.debounce_ms),
+            1_024,
+        )
+        .await
+        {
+            Ok(watcher) => {
+                watcher_state
+                    .lock()
+                    .expect("watcher state lock poisoned")
+                    .insert(workspace_id.clone(), "ready".into());
+                watcher_handles.lock().await.insert(workspace_id, watcher);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                watcher_state
+                    .lock()
+                    .expect("watcher state lock poisoned")
+                    .insert(workspace_id, format!("failed: {message}"));
+                tracing::warn!(%error, "failed to start workspace watcher for MCP");
             }
         }
-        watchers
+    }
+
+    async fn shutdown_workspace_watchers(&self) {
+        let _lifecycle = self.watcher_lifecycle.lock().await;
+        let watchers = {
+            let mut handles = self.watcher_handles.lock().await;
+            std::mem::take(&mut *handles)
+        };
+        for (_, watcher) in watchers {
+            watcher.shutdown().await;
+        }
     }
 
     pub async fn handle_json(&self, request: Value) -> Option<Value> {
@@ -274,9 +304,15 @@ impl McpServer {
             "workspace_status" => self.workspace_status(arguments).await,
             "workspace_readiness" => self.workspace_readiness(arguments).await,
             "workspace_reindex" => self.workspace_reindex(arguments).await,
+            "workspace_deregister_preview" => self.workspace_deregister_preview(arguments).await,
+            "workspace_deregister" => self.workspace_deregister(arguments).await,
             "session_start" => self.session_start(arguments).await,
             "session_end" => self.session_end(arguments).await,
             "event_record" => self.event_record(arguments).await,
+            "test_evidence_record" => self.test_evidence_record(arguments).await,
+            "test_evidence_record_file" => self.test_evidence_record_file(arguments).await,
+            "event_evidence_inspect" => self.event_evidence_inspect(arguments).await,
+            "evidence_capabilities" => self.evidence_capabilities().await,
             "episode_start" => self.episode_start(arguments).await,
             "episode_add_events" => self.episode_add_events(arguments).await,
             "episode_close" => self.episode_terminal(arguments, true).await,
@@ -328,6 +364,7 @@ impl McpServer {
         request.include_explanation = optional_bool(args, "include_explanation", false)?;
         request.active_failure_signature =
             optional_failure_signature(args, "active_failure_signature")?;
+        request.active_failure_event_id = optional_string(args, "active_failure_event_id")?;
         serialize_service(self.service.semantic_context(request).await)
     }
 
@@ -630,6 +667,70 @@ impl McpServer {
         serialize_service(self.service.workspace_reindex(&workspace.id).await)
     }
 
+    async fn workspace_deregister_preview(&self, args: &Map<String, Value>) -> ToolResult {
+        let selector = parse_workspace_selector(required_string(args, "workspace")?);
+        if matches!(selector, WorkspaceSelector::Default) {
+            return Err("workspace deregistration preview requires an explicit selector".into());
+        }
+        serialize_service(
+            self.service
+                .preview_workspace_deregistration(selector)
+                .await,
+        )
+    }
+
+    async fn workspace_deregister(&self, args: &Map<String, Value>) -> ToolResult {
+        let request = WorkspaceDeregistrationRequest {
+            workspace_id: required_string(args, "workspace_id")?.to_owned(),
+            plan_id: required_string(args, "plan_id")?.to_owned(),
+            request_key: required_string(args, "request_key")?.to_owned(),
+        };
+        let _lifecycle = self.watcher_lifecycle.lock().await;
+        let stopped = self
+            .watcher_handles
+            .lock()
+            .await
+            .remove(&request.workspace_id);
+        if stopped.is_some() {
+            self.watcher_state
+                .lock()
+                .expect("watcher state lock poisoned")
+                .insert(
+                    request.workspace_id.clone(),
+                    "stopping_for_deregistration".into(),
+                );
+        }
+        if let Some(watcher) = stopped {
+            watcher.shutdown().await;
+            self.watcher_state
+                .lock()
+                .expect("watcher state lock poisoned")
+                .insert(
+                    request.workspace_id.clone(),
+                    "stopped_for_deregistration".into(),
+                );
+        }
+        let outcome = self.service.deregister_workspace(request.clone()).await;
+        let restart: Option<Workspace> = match &outcome {
+            Ok(WorkspaceDeregistrationOutcome::Deregistered { .. }) => None,
+            Ok(WorkspaceDeregistrationOutcome::StalePreview { .. }) | Err(_) => self
+                .service
+                .resolve_workspace(WorkspaceSelector::Id(request.workspace_id.clone()), None)
+                .await
+                .ok(),
+        };
+        if let Some(workspace) = restart {
+            Self::start_workspace_watcher(
+                &self.service,
+                &self.watcher_state,
+                &self.watcher_handles,
+                workspace,
+            )
+            .await;
+        }
+        serialize_service(outcome)
+    }
+
     async fn session_start(&self, args: &Map<String, Value>) -> ToolResult {
         let workspace = self.resolve_workspace(args).await?;
         serialize_service(
@@ -661,6 +762,55 @@ impl McpServer {
         event.session_id = optional_string(args, "session_id")?;
         event.task_id = optional_string(args, "task_id")?;
         serialize_service(self.service.record_event(event).await)
+    }
+
+    async fn test_evidence_record(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        self.service
+            .record_test_evidence(TestEvidenceRecordRequest {
+                workspace_id: workspace.id,
+                session_id: required_string(args, "session_id")?.to_owned(),
+                task_id: optional_string(args, "task_id")?,
+                request_key: required_string(args, "request_key")?.to_owned(),
+                bundle: args
+                    .get("bundle")
+                    .cloned()
+                    .ok_or_else(|| "bundle is required".to_owned())?,
+            })
+            .await
+            .map(mcp_test_evidence_record_result)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn test_evidence_record_file(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        let bundle =
+            read_workspace_evidence_bundle(&workspace, required_string(args, "bundle_path")?)?;
+        self.service
+            .record_test_evidence(TestEvidenceRecordRequest {
+                workspace_id: workspace.id,
+                session_id: required_string(args, "session_id")?.to_owned(),
+                task_id: optional_string(args, "task_id")?,
+                request_key: required_string(args, "request_key")?.to_owned(),
+                bundle,
+            })
+            .await
+            .map(mcp_test_evidence_record_result)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn event_evidence_inspect(&self, args: &Map<String, Value>) -> ToolResult {
+        let workspace = self.resolve_workspace(args).await?;
+        self.service
+            .inspect_event_evidence(&workspace.id, required_string(args, "event_id")?)
+            .await
+            .map(mcp_event_evidence_inspection)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn evidence_capabilities(&self) -> ToolResult {
+        serde_json::to_value(self.service.evidence_capabilities())
+            .map_err(|error| error.to_string())
     }
 
     async fn episode_start(&self, args: &Map<String, Value>) -> ToolResult {
@@ -960,7 +1110,8 @@ fn tool_definitions() -> Vec<Value> {
                 "include_events": { "type": "boolean" },
                 "path_scope": { "type": "array", "items": string_schema() },
                 "language_scope": { "type": "array", "items": string_schema() },
-                "active_failure_signature": { "type": "object", "description": "Canonical FailureSignature that may request bounded historical Experience context." },
+                "active_failure_event_id": { "type": "string", "description": "Preferred: stored event ID whose normalized failure signature selects bounded historical Experience context." },
+                "active_failure_signature": { "type": "object", "description": "Canonical FailureSignature for bounded historical Experience context. Prefer active_failure_event_id when the failure is stored." },
                 "include_explanation": { "type": "boolean" }
             })),
             &["query"],
@@ -1150,6 +1301,18 @@ fn tool_definitions() -> Vec<Value> {
             &[],
         ),
         tool(
+            "workspace_deregister_preview",
+            "Create a short-lived deletion confirmation plan for one explicit workspace selector. This only previews CortexWeave database-state removal and never touches the source directory.",
+            json!({ "workspace": string_schema() }),
+            &["workspace"],
+        ),
+        tool(
+            "workspace_deregister",
+            "Execute one current workspace deregistration plan by exact UUID. The matching watcher is stopped first; retries with the same request key return the original receipt.",
+            json!({ "workspace_id": string_schema(), "plan_id": string_schema(), "request_key": string_schema() }),
+            &["workspace_id", "plan_id", "request_key"],
+        ),
+        tool(
             "session_start",
             "Start a session in the resolved workspace.",
             workspace_properties(json!({ "metadata": {} })),
@@ -1168,6 +1331,34 @@ fn tool_definitions() -> Vec<Value> {
                 json!({ "event_type": string_schema(), "payload": {}, "session_id": string_schema(), "task_id": string_schema() }),
             ),
             &["event_type"],
+        ),
+        tool(
+            "test_evidence_record",
+            "Record one completed external Vitest or Python unittest capture bundle with capture-specific idempotency and eligibility diagnostics.",
+            workspace_properties(
+                json!({ "session_id": string_schema(), "task_id": string_schema(), "request_key": string_schema(), "bundle": { "type": "object" } }),
+            ),
+            &["session_id", "request_key", "bundle"],
+        ),
+        tool(
+            "test_evidence_record_file",
+            "Record a completed external Vitest or Python unittest capture JSON already stored below the registered workspace. bundle_path must be a workspace-relative .json file; paths outside the workspace are rejected.",
+            workspace_properties(
+                json!({ "session_id": string_schema(), "task_id": string_schema(), "request_key": string_schema(), "bundle_path": string_schema() }),
+            ),
+            &["session_id", "request_key", "bundle_path"],
+        ),
+        tool(
+            "event_evidence_inspect",
+            "Inspect stored evidence, normalization, and test-run eligibility for one event in the resolved workspace.",
+            workspace_properties(json!({ "event_id": string_schema() })),
+            &["event_id"],
+        ),
+        tool(
+            "evidence_capabilities",
+            "List registered evidence contracts, qualified Vitest and unittest profiles, bounds, and deferred integrations.",
+            json!({}),
+            &[],
         ),
         tool(
             "episode_start",
@@ -1603,6 +1794,50 @@ fn looks_like_absolute_path(value: &str) -> bool {
             && matches!(bytes.get(2), Some(b'/' | b'\\')))
 }
 
+fn read_workspace_evidence_bundle(
+    workspace: &Workspace,
+    bundle_path: &str,
+) -> Result<Value, String> {
+    let relative = Path::new(bundle_path);
+    if bundle_path.is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+        || !relative
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        return Err("bundle_path must be a non-empty workspace-relative .json file path".into());
+    }
+
+    let root = fs::canonicalize(&workspace.root_path)
+        .map_err(|error| format!("could not resolve registered workspace root: {error}"))?;
+    let candidate = fs::canonicalize(root.join(relative)).map_err(|error| {
+        format!("could not resolve evidence bundle below the workspace: {error}")
+    })?;
+    if !candidate.starts_with(&root) {
+        return Err("bundle_path must resolve below the registered workspace root".into());
+    }
+    let metadata = fs::metadata(&candidate)
+        .map_err(|error| format!("could not inspect evidence bundle: {error}"))?;
+    if !metadata.is_file() {
+        return Err("bundle_path must resolve to a regular file".into());
+    }
+    if metadata.len() > MAX_MCP_FRAME_BYTES as u64 {
+        return Err(format!(
+            "evidence bundle is {} bytes; maximum is {MAX_MCP_FRAME_BYTES}",
+            metadata.len()
+        ));
+    }
+    let text = fs::read_to_string(&candidate)
+        .map_err(|error| format!("could not read evidence bundle: {error}"))?;
+    serde_json::from_str(&text).map_err(|error| format!("evidence bundle must be JSON: {error}"))
+}
+
 fn optional_limit(args: &Map<String, Value>, default: usize) -> Result<usize, String> {
     let Some(value) = args.get("limit") else {
         return Ok(default);
@@ -1703,6 +1938,45 @@ fn parse_memory_kind(value: &str) -> Result<MemoryKind, String> {
     }
 }
 
+fn mcp_test_evidence_record_result(result: crate::domain::TestEvidenceRecordResult) -> Value {
+    let event = result.event;
+    json!({
+        "event": mcp_event_reference(&event),
+        "replayed": result.replayed,
+        "eligibility": result.eligibility,
+        "failure_normalization": result.failure_normalization,
+    })
+}
+
+fn mcp_event_evidence_inspection(inspection: crate::domain::EventEvidenceInspection) -> Value {
+    let decoding = match inspection.decoding {
+        crate::domain::EvidenceDecodeResult::Decoded { .. } => json!({ "status": "decoded" }),
+        crate::domain::EvidenceDecodeResult::Unsupported { reason } => {
+            json!({ "status": "unsupported", "reason": reason })
+        }
+        crate::domain::EvidenceDecodeResult::Invalid { issue } => {
+            json!({ "status": "invalid", "issue": issue })
+        }
+    };
+    json!({
+        "event": mcp_event_reference(&inspection.event),
+        "decoding": decoding,
+        "test_run_eligibility": inspection.test_run_eligibility,
+        "failure_normalization": inspection.failure_normalization,
+    })
+}
+
+fn mcp_event_reference(event: &CortexEvent) -> Value {
+    json!({
+        "id": &event.id,
+        "workspace_id": &event.workspace_id,
+        "session_id": &event.session_id,
+        "task_id": &event.task_id,
+        "event_type": &event.event_type,
+        "created_at": &event.created_at,
+    })
+}
+
 fn json_value(value: impl Serialize) -> ToolResult {
     serde_json::to_value(value).map_err(|error| error.to_string())
 }
@@ -1773,7 +2047,7 @@ mod tests {
             initialized["result"]["capabilities"]["tools"]["listChanged"],
             false
         );
-        assert_eq!(initialized["result"]["serverInfo"]["version"], "0.5.0");
+        assert_eq!(initialized["result"]["serverInfo"]["version"], "0.5.1");
         let listed = server
             .handle_json(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
             .await
@@ -1800,6 +2074,12 @@ mod tests {
             "workspace_list",
             "workspace_status",
             "workspace_reindex",
+            "workspace_deregister_preview",
+            "workspace_deregister",
+            "test_evidence_record",
+            "test_evidence_record_file",
+            "event_evidence_inspect",
+            "evidence_capabilities",
             "graph_rebuild",
             "graph_status",
             "graph_find",
@@ -1823,6 +2103,94 @@ mod tests {
         ] {
             assert!(names.contains(&required));
         }
+        for name in [
+            "workspace_deregister_preview",
+            "workspace_deregister",
+            "evidence_capabilities",
+            "test_evidence_record_file",
+        ] {
+            let tool = listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            let properties = tool["inputSchema"]["properties"].as_object().unwrap();
+            assert!(!properties.contains_key("type"));
+            assert!(!properties.contains_key("properties"));
+            assert!(!properties.contains_key("required"));
+            assert!(!properties.contains_key("additionalProperties"));
+        }
+        let capabilities = call_tool(&server, "evidence_capabilities", json!({})).await;
+        assert_eq!(capabilities["isError"], false);
+        assert!(
+            capabilities["structuredContent"]["test_profiles"]
+                .as_array()
+                .is_some_and(|profiles| profiles.len() >= 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn deregistration_tools_require_a_preview_and_exact_ids() {
+        let (server, workspace_id) = server().await;
+        initialize(&server).await;
+        let missing_selector = call_tool(&server, "workspace_deregister_preview", json!({})).await;
+        assert_eq!(missing_selector["isError"], true);
+        let preview = call_tool(
+            &server,
+            "workspace_deregister_preview",
+            json!({ "workspace": workspace_id }),
+        )
+        .await;
+        assert_eq!(preview["isError"], false);
+        let plan_id = preview["structuredContent"]["plan_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let deleted = call_tool(
+            &server,
+            "workspace_deregister",
+            json!({
+                "workspace_id": workspace_id,
+                "plan_id": plan_id,
+                "request_key": "mcp-delete"
+            }),
+        )
+        .await;
+        assert_eq!(deleted["isError"], false);
+        assert_eq!(deleted["structuredContent"]["status"], "deregistered");
+        assert_eq!(deleted["structuredContent"]["replayed"], false);
+        let replay = call_tool(
+            &server,
+            "workspace_deregister",
+            json!({
+                "workspace_id": workspace_id,
+                "plan_id": plan_id,
+                "request_key": "mcp-delete"
+            }),
+        )
+        .await;
+        assert_eq!(replay["isError"], false);
+        assert_eq!(replay["structuredContent"]["replayed"], true);
+    }
+
+    #[test]
+    fn workspace_evidence_bundle_reader_rejects_paths_outside_the_workspace() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        let outside = temporary.path().join("outside.json");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("capture.json"), "{\"contract\":\"example\"}").unwrap();
+        fs::write(&outside, "{}").unwrap();
+        let workspace = Workspace::new(root.to_string_lossy(), "mcp");
+
+        assert_eq!(
+            read_workspace_evidence_bundle(&workspace, "capture.json").unwrap(),
+            json!({ "contract": "example" })
+        );
+        assert!(read_workspace_evidence_bundle(&workspace, "../outside.json").is_err());
+        assert!(read_workspace_evidence_bundle(&workspace, &outside.to_string_lossy()).is_err());
+        assert!(read_workspace_evidence_bundle(&workspace, "capture.txt").is_err());
     }
 
     #[tokio::test]
@@ -2271,8 +2639,8 @@ mod tests {
             .unwrap();
         let server = McpServer::new(Arc::clone(&service));
         initialize(&server).await;
-        let watchers = server.start_workspace_watchers().await;
-        assert_eq!(watchers.len(), 1);
+        let watcher_count = server.start_workspace_watchers().await;
+        assert_eq!(watcher_count, 1);
 
         for (query, expected_path) in [
             ("rust_marker", "lib.rs"),
@@ -2343,9 +2711,7 @@ mod tests {
             "Use BLAKE3 for deterministic change detection."
         );
 
-        for watcher in watchers {
-            watcher.shutdown().await;
-        }
+        server.shutdown_workspace_watchers().await;
     }
 
     #[tokio::test]

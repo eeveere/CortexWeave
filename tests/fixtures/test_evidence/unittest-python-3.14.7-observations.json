@@ -1,0 +1,45 @@
+{
+  "fixture_format": "cortexweave.bp0.runner_observations.v1",
+  "runner": { "id": "python.unittest", "version": "3.14.7" },
+  "runtime": { "id": "python", "version": "3.14.7" },
+  "result_callbacks": [
+    "startTest",
+    "stopTest",
+    "addSuccess",
+    "addFailure",
+    "addError",
+    "addSkip",
+    "addExpectedFailure",
+    "addUnexpectedSuccess",
+    "addSubTest"
+  ],
+  "probe": {
+    "parent_tests_run": 7,
+    "successful": false,
+    "observations": [
+      { "kind": "success", "case": ["fixture", "ProbeTests", "test_pass"], "error_class": null },
+      { "kind": "failure", "case": ["fixture", "ProbeTests", "test_assertion_failure"], "error_class": "AssertionError" },
+      { "kind": "error", "case": ["fixture", "ProbeTests", "test_execution_error"], "error_class": "RuntimeError" },
+      { "kind": "skip", "case": ["fixture", "ProbeTests", "test_skip"], "error_class": null },
+      { "kind": "expected_failure", "case": ["fixture", "ProbeTests", "test_expected_failure"], "error_class": "AssertionError" },
+      { "kind": "unexpected_success", "case": ["fixture", "ProbeTests", "test_unexpected_success"], "error_class": null },
+      { "kind": "subtest", "parent": ["fixture", "ProbeTests", "test_subtests"], "ordinal": 0, "outcome": "success", "error_class": null },
+      { "kind": "subtest", "parent": ["fixture", "ProbeTests", "test_subtests"], "ordinal": 1, "outcome": "failure", "error_class": "AssertionError" }
+    ]
+  },
+  "pihype_positive_scope": {
+    "selection": "tests.test_core.StagnationTests",
+    "relative_file": "tests/test_core.py",
+    "case_count": 8,
+    "passed": 8,
+    "failed": 0,
+    "errored": 0,
+    "skipped": 0,
+    "subtest_observations": 0,
+    "duration_seconds": 0.002
+  },
+  "pihype_negative_control": {
+    "relative_file": "tests/test_core.py",
+    "classes_with_subtests": ["RunContractTests", "VerdictParsingTests"]
+  }
+}

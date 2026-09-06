@@ -82,7 +82,7 @@ level = "info"
 [languages]
 rust = false
 python = true
-javascript = false
-typescript = false
+javascript = true
+typescript = true
 csharp = false
 go = false

@@ -14,7 +14,7 @@ use cortexweave::{
         EpisodeStartRequest, EpisodeTerminalRequest, EpisodeType, ExperienceAssessmentKind,
         ExperienceAssessmentReviewRequest, ExperienceDisputeProposalRequest,
         ExperienceSearchRequest, FailureSignature, MemoryKind, MemoryRecord, ResumeContextRequest,
-        StructuralReadOptions,
+        StructuralReadOptions, TestEvidenceRecordRequest, WorkspaceDeregistrationRequest,
     },
     workspace::WorkspaceSelector,
 };
@@ -76,6 +76,10 @@ enum Command {
         #[command(subcommand)]
         command: ExperienceCommand,
     },
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
+    },
     Reindex {
         workspace_id: String,
     },
@@ -95,6 +99,42 @@ enum WorkspaceCommand {
         name: Option<String>,
     },
     List,
+    DeregisterPreview {
+        selector: String,
+    },
+    Deregister {
+        workspace_id: String,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        request_key: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EvidenceCommand {
+    Record(EvidenceRecordArgs),
+    Inspect(EvidenceInspectArgs),
+    Capabilities,
+}
+
+#[derive(Debug, Args)]
+struct EvidenceRecordArgs {
+    workspace_id: String,
+    #[arg(long)]
+    session_id: String,
+    #[arg(long)]
+    task_id: Option<String>,
+    #[arg(long)]
+    request_key: String,
+    #[arg(long)]
+    bundle: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct EvidenceInspectArgs {
+    workspace_id: String,
+    event_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -224,6 +264,11 @@ struct ContextArgs {
         help = "Canonical FailureSignature JSON for optional historical Experience context"
     )]
     active_failure_signature: Option<String>,
+    #[arg(
+        long,
+        help = "Stored failure event ID for optional historical Experience context"
+    )]
+    active_failure_event_id: Option<String>,
     #[arg(long)]
     explain: bool,
 }
@@ -676,6 +721,24 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
                 print_json(service.register_workspace(root_path, name).await?)?;
             }
             WorkspaceCommand::List => print_json(service.list_workspaces().await?)?,
+            WorkspaceCommand::DeregisterPreview { selector } => print_json(
+                service
+                    .preview_workspace_deregistration(parse_workspace_selector(&selector))
+                    .await?,
+            )?,
+            WorkspaceCommand::Deregister {
+                workspace_id,
+                plan,
+                request_key,
+            } => print_json(
+                service
+                    .deregister_workspace(WorkspaceDeregistrationRequest {
+                        workspace_id,
+                        plan_id: plan,
+                        request_key,
+                    })
+                    .await?,
+            )?,
         },
         Command::Graph { command } => match command {
             GraphCommand::Rebuild {
@@ -875,6 +938,7 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
             request.language_scope = args.language_scope;
             request.active_failure_signature =
                 parse_cli_failure_signature(args.active_failure_signature.as_deref())?;
+            request.active_failure_event_id = args.active_failure_event_id;
             request.include_explanation = args.explain;
             print_json(service.semantic_context(request).await?)?;
         }
@@ -957,6 +1021,37 @@ async fn run(service: CortexWeaveService, command: Command) -> Result<()> {
                 };
                 print_json(checkpoint)?;
             }
+        },
+        Command::Evidence { command } => match command {
+            EvidenceCommand::Record(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                let bundle_text = std::fs::read_to_string(&args.bundle).map_err(|error| {
+                    CortexError::Analysis(format!("could not read evidence bundle: {error}"))
+                })?;
+                let bundle = serde_json::from_str(&bundle_text).map_err(|error| {
+                    CortexError::Analysis(format!("evidence bundle must be JSON: {error}"))
+                })?;
+                print_json(
+                    service
+                        .record_test_evidence(TestEvidenceRecordRequest {
+                            workspace_id,
+                            session_id: args.session_id,
+                            task_id: args.task_id,
+                            request_key: args.request_key,
+                            bundle,
+                        })
+                        .await?,
+                )?;
+            }
+            EvidenceCommand::Inspect(args) => {
+                let workspace_id = cli_workspace_id(&service, &args.workspace_id).await?;
+                print_json(
+                    service
+                        .inspect_event_evidence(&workspace_id, &args.event_id)
+                        .await?,
+                )?;
+            }
+            EvidenceCommand::Capabilities => print_json(service.evidence_capabilities())?,
         },
         Command::Memory { command } => match command {
             MemoryCommand::Add(args) => {

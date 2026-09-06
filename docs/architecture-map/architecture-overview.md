@@ -2,7 +2,7 @@
 
 ## Scope and evidence
 
-This map describes the repository state of CortexWeave `0.5.0`, observed on
+This map describes the repository state of CortexWeave `0.5.1`, observed on
 2026-09-01. It is an evidence-based runtime map, not a target architecture.
 Primary evidence is the executable crate in `src/`, its 12 SQLite migrations,
 the integration tests in `tests/`, and the current v0.5 release material.

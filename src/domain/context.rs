@@ -104,6 +104,8 @@ pub struct ContextRequest {
     pub include_events: bool,
     #[serde(default)]
     pub active_failure_signature: Option<super::FailureSignature>,
+    #[serde(default)]
+    pub active_failure_event_id: Option<String>,
     pub path_scope: Vec<String>,
     pub language_scope: Vec<String>,
     pub include_explanation: bool,
@@ -209,6 +211,7 @@ impl ContextRequest {
             include_memories: true,
             include_events: true,
             active_failure_signature: None,
+            active_failure_event_id: None,
             path_scope: Vec::new(),
             language_scope: Vec::new(),
             include_explanation: false,

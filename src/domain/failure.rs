@@ -15,6 +15,7 @@ pub const MAX_FAILURE_COMPONENT_BYTES: usize = 512;
 pub enum FailureDomain {
     RustCompiler,
     CargoTest,
+    TestRun,
     RegisteredTool,
 }
 
@@ -23,6 +24,7 @@ impl FailureDomain {
         match self {
             Self::RustCompiler => "rust_compiler",
             Self::CargoTest => "cargo_test",
+            Self::TestRun => "test_run",
             Self::RegisteredTool => "registered_tool",
         }
     }
@@ -164,6 +166,7 @@ pub struct VerifierRule {
     pub declared_verifier_version: String,
     pub required_tool: String,
     pub required_operation: String,
+    pub language: Option<String>,
     pub allowed_subject_kinds: BTreeSet<VerificationSubjectKind>,
 }
 
@@ -177,6 +180,7 @@ impl VerifierRule {
             declared_verifier_version: "1".into(),
             required_tool: "cargo".into(),
             required_operation: "check".into(),
+            language: Some("rust".into()),
             allowed_subject_kinds: [
                 VerificationSubjectKind::Workspace,
                 VerificationSubjectKind::Package,
@@ -201,6 +205,13 @@ impl VerifierRule {
         if self.evidence_contract != EvidenceContract::GenericVerifierResult {
             return Err(CortexError::Configuration(
                 "v1 verifier rules support generic verifier evidence only".into(),
+            ));
+        }
+        if self.language.as_ref().is_some_and(|value| {
+            value.trim().is_empty() || value.len() > MAX_FAILURE_COMPONENT_BYTES
+        }) {
+            return Err(CortexError::Configuration(
+                "verifier-rule language must be a bounded non-empty value when present".into(),
             ));
         }
         if self.allowed_subject_kinds.is_empty() {
