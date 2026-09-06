@@ -1,5 +1,5 @@
 ![CortexWeave-banner](https://github.com/eeveere/CortexWeave/blob/9c9fd34b5557527124bb3f1039d45dfc4a564553/CortexWeave-banner.JPG)
-[![CI](https://github.com/eeveere/CortexWeave/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/eeveere/CortexWeave/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Latest release](https://img.shields.io/github/v/release/eeveere/CortexWeave)](https://github.com/eeveere/CortexWeave/releases/latest)
+[![CI](https://github.com/eeveere/CortexWeave/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/eeveere/CortexWeave/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![Latest release](https://img.shields.io/github/v/release/eeveere/CortexWeave)](https://github.com/eeveere/CortexWeave/releases/latest)
 
 # CortexWeave
 
