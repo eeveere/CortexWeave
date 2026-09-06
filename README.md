@@ -1,4 +1,5 @@
 ![CortexWeave-banner](https://github.com/eeveere/CortexWeave/blob/9c9fd34b5557527124bb3f1039d45dfc4a564553/CortexWeave-banner.JPG)
+[![CI](https://github.com/eeveere/CortexWeave/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/eeveere/CortexWeave/actions/workflows/ci.yml)
 
 # CortexWeave
 
