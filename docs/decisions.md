@@ -2007,3 +2007,39 @@ not material to overwrite. A framework callback does not establish successful
 verification by itself; capture also records the observed process completion
 and exit. Incomplete or unsupported observations remain diagnostics and cannot
 be promoted by the helper to passing evidence.
+
+## D110: Native Terminal Effects Carry Transactional Receipts
+
+**Status:** Implemented locally on 2026-09-07; uncommitted development patch.
+
+Native `CompleteTask` and `EndSession` operations use the existing application
+`deliver_native` boundary. A SQLite immediate transaction owns precondition
+validation, the terminal mutation and its immutable receipt. Completion requires
+an active task with exact declared prior details in the specified workspace and
+open session. Closure requires the exact completion receipt, unchanged completed
+task and explicit matching nonempty session metadata. The substrate does not
+interpret these details as harness acceptance or an Experience claim.
+
+Identity is workspace, operation and request key plus canonical operation content.
+Retries return the original receipt, including timestamps, before consulting
+current lifecycle state. Reused keys with different content conflict. Other keys
+cannot claim an existing terminal mutation. Request and receipt JSON are each
+bounded to 64 KiB; persistence or size failure rolls back the entire mutation.
+Legacy terminal storage updates are conditional on nonterminal state, so a stale
+service read cannot overwrite a competing completion or end timestamp.
+
+Migration 0017 uses a separate terminal receipt table to preserve the existing
+native-ingress table and its constrained operation set. Receipts are immutable
+until their workspace is explicitly deregistered; the existing native receipt
+footprint count includes both tables. No harness outbox or orchestration policy
+moves into the substrate. Ownership metadata is an exact-match precondition, not
+an authentication system or a lease preventing unrelated task admission.
+
+An effect committed by an older unkeyed API has no recoverable delivery identity.
+The keyed API fails closed rather than adopting it, even when details match.
+Automatic repair of that historical ambiguity is outside this contract. The
+focused native contract suite covers restart/lost acknowledgements, same/different
+key races, legacy writer ordering, exact provenance and ownership, receipt failure,
+size rollback, immutability and workspace cascade. Shuttle qualifies its existing
+ordered outbox against this uncommitted sibling patch; publication requires a
+separately qualified immutable revision.

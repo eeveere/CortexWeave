@@ -15,6 +15,12 @@ impl SqliteStorage {
         &self,
         request: &NativeDeliveryRequest,
     ) -> Result<NativeDeliveryReceipt> {
+        if matches!(
+            request.operation,
+            NativeOperation::CompleteTask { .. } | NativeOperation::EndSession { .. }
+        ) {
+            return self.deliver_native_terminal(request).await;
+        }
         let workspace_id = request.operation.workspace_id();
         let operation = request.operation.name();
         // Compare canonical values, not object insertion order or caller-generated timestamps.
@@ -41,6 +47,9 @@ impl SqliteStorage {
             return Err(CortexError::NotFound(format!("workspace {workspace_id}")));
         }
         let record = match &request.operation {
+            NativeOperation::CompleteTask { .. } | NativeOperation::EndSession { .. } => {
+                unreachable!("terminal operations dispatched above")
+            }
             NativeOperation::StartSession { metadata, .. } => {
                 let session = Session::new(workspace_id, metadata.clone());
                 sqlx::query("INSERT INTO sessions(id, workspace_id, started_at, ended_at, metadata_json) VALUES (?, ?, ?, ?, ?)")

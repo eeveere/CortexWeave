@@ -247,11 +247,12 @@ impl SqliteStorage {
     }
 
     pub async fn end_session(&self, session_id: &str, ended_at: DateTime<Utc>) -> Result<()> {
-        let result = sqlx::query("UPDATE sessions SET ended_at = ? WHERE id = ?")
-            .bind(ended_at)
-            .bind(session_id)
-            .execute(self.pool())
-            .await?;
+        let result =
+            sqlx::query("UPDATE sessions SET ended_at = ? WHERE id = ? AND ended_at IS NULL")
+                .bind(ended_at)
+                .bind(session_id)
+                .execute(self.pool())
+                .await?;
         require_one(result.rows_affected(), "session", session_id)
     }
 
@@ -334,7 +335,7 @@ impl SqliteStorage {
         )
         .then_some(now);
         let result = sqlx::query(
-            "UPDATE tasks SET status = ?, details_json = ?, updated_at = ?, completed_at = ? WHERE id = ?",
+            "UPDATE tasks SET status = ?, details_json = ?, updated_at = ?, completed_at = ? WHERE id = ? AND status IN ('pending', 'active')",
         )
         .bind(status.as_str())
         .bind(serde_json::to_string(details)?)
@@ -4242,7 +4243,7 @@ impl From<WorkspaceRow> for Workspace {
 }
 
 #[derive(FromRow)]
-struct SessionRow {
+pub(super) struct SessionRow {
     id: String,
     workspace_id: String,
     started_at: DateTime<Utc>,
@@ -4265,7 +4266,7 @@ impl TryFrom<SessionRow> for Session {
 }
 
 #[derive(FromRow)]
-struct TaskRow {
+pub(super) struct TaskRow {
     id: String,
     workspace_id: String,
     session_id: Option<String>,

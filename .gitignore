@@ -39,5 +39,7 @@ __pycache__/
 /CortexWeave v0.4.1 Upgrade Repair and Operational Hardening Plan.md
 /CortexWeave v0.5.1 Test Evidence and Vitest Integration Plan.md
 
-/docs/dedicated-harness-plan.md
+/docs/.shuttle-priv
+
+docs\dedicated-harness-plan.md
 /Small Models, Smart Systems_ A Roadmap Toward Frontier-Level Agentic Results.md

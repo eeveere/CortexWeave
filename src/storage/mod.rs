@@ -1,4 +1,5 @@
 mod native_delivery;
+mod native_terminal;
 mod repositories;
 mod sqlite;
 mod test_evidence;

@@ -336,7 +336,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         );
     }
 
@@ -378,7 +378,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         );
         assert_eq!(
             upgraded.recent_memories(&workspace.id, 10).await.unwrap(),

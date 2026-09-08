@@ -237,7 +237,7 @@ async fn workspace_deregistration_snapshot(
         working_set_entries: count(transaction, "SELECT COUNT(*) FROM working_set_entries WHERE workspace_id = ?", workspace_id).await?,
         checkpoints: count(transaction, "SELECT COUNT(*) FROM checkpoints WHERE workspace_id = ?", workspace_id).await?,
         test_evidence_receipts: count(transaction, "SELECT COUNT(*) FROM test_evidence_import_receipts WHERE workspace_id = ?", workspace_id).await?,
-        native_delivery_receipts: count(transaction, "SELECT COUNT(*) FROM native_delivery_receipts WHERE workspace_id = ?", workspace_id).await?,
+        native_delivery_receipts: count(transaction, "SELECT COUNT(*) FROM (SELECT workspace_id FROM native_delivery_receipts UNION ALL SELECT workspace_id FROM native_terminal_receipts) WHERE workspace_id = ?", workspace_id).await?,
     };
     let graph = sqlx::query(
         "SELECT content_revision, graph_content_revision, graph_state FROM workspace_graph_revisions WHERE workspace_id = ?",

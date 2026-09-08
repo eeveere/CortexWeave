@@ -26,6 +26,23 @@ pub enum NativeOperation {
     StartEpisode {
         request: EpisodeStartRequest,
     },
+    /// Complete an active task only when its declared prior details still match.
+    CompleteTask {
+        workspace_id: String,
+        session_id: String,
+        task_id: String,
+        expected_details: Value,
+        details: Value,
+    },
+    /// End an open session after the exact receipt-backed task completion.
+    EndSession {
+        workspace_id: String,
+        session_id: String,
+        task_id: String,
+        task_completion_key: String,
+        completed_task_details: Value,
+        owner_metadata: Value,
+    },
     RecordEvent {
         event: CortexEvent,
     },
@@ -34,9 +51,10 @@ pub enum NativeOperation {
 impl NativeOperation {
     pub fn workspace_id(&self) -> &str {
         match self {
-            Self::StartSession { workspace_id, .. } | Self::StartTask { workspace_id, .. } => {
-                workspace_id
-            }
+            Self::StartSession { workspace_id, .. }
+            | Self::StartTask { workspace_id, .. }
+            | Self::CompleteTask { workspace_id, .. }
+            | Self::EndSession { workspace_id, .. } => workspace_id,
             Self::StartEpisode { request } => &request.workspace_id,
             Self::RecordEvent { event } => &event.workspace_id,
         }
@@ -48,6 +66,8 @@ impl NativeOperation {
             Self::StartTask { .. } => "start_task",
             Self::StartEpisode { .. } => "start_episode",
             Self::RecordEvent { .. } => "record_event",
+            Self::CompleteTask { .. } => "complete_task",
+            Self::EndSession { .. } => "end_session",
         }
     }
 }
