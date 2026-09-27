@@ -1,8 +1,8 @@
 mcp add cortexweave \
   --type stdio \
-  --command C:/dev/CortexWeave/target/release/cortexweave.exe \
+  --command C:/den/CortexWeave/target/release/cortexweave.exe \
   --args --config \
-  --args C:/dev/CortexWeave/cortexweave.toml \
+  --args C:/den/CortexWeave/cortexweave.toml \
   --args serve \
   --args --workspace-root \
   --args "$PWD" \

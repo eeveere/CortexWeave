@@ -2,7 +2,7 @@
 mcp_transport = "stdio"
 
 [database]
-path = "C:/dev/CortexWeave/.cortexweave/cortexweave.db"
+path = "C:/den/CortexWeave/.cortexweave/cortexweave.db"
 
 [embedding]
 base_url = "http://127.0.0.1:8081"

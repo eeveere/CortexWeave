@@ -12,7 +12,7 @@ for the Crush session you are currently running.
 ## Before You Start
 
 Use the CortexWeave release binary built from this repository. The examples
-below assume CortexWeave lives at `C:\dev\CortexWeave`.
+below assume CortexWeave lives at `C:\den\CortexWeave`.
 
 Choose a short, unique name for each project. For example, the project at
 `C:\Users\Capta\dev.work\projects\agentic.things\OPiHype` can be named
@@ -23,8 +23,8 @@ Choose a short, unique name for each project. For example, the project at
 Open PowerShell and run this command once for the project:
 
 ```powershell
-& "C:\dev\CortexWeave\target\release\cortexweave.exe" `
-  --config "C:\dev\CortexWeave\cortexweave.toml" `
+& "C:\den\CortexWeave\target\release\cortexweave.exe" `
+  --config "C:\den\CortexWeave\cortexweave.toml" `
   workspace add "C:\Users\Capta\dev.work\projects\agentic.things\OPiHype" `
   --name opihype
 ```
@@ -36,8 +36,8 @@ usually easier to read than the ID.
 To see every registered project, run:
 
 ```powershell
-& "C:\dev\CortexWeave\target\release\cortexweave.exe" `
-  --config "C:\dev\CortexWeave\cortexweave.toml" `
+& "C:\den\CortexWeave\target\release\cortexweave.exe" `
+  --config "C:\den\CortexWeave\cortexweave.toml" `
   workspace list
 ```
 
@@ -54,9 +54,9 @@ repository, or add this entry directly:
 ```text
 mcp add cortexweave \
   --type stdio \
-  --command C:/dev/CortexWeave/target/release/cortexweave.exe \
+  --command C:/den/CortexWeave/target/release/cortexweave.exe \
   --args --config \
-  --args C:/dev/CortexWeave/cortexweave.toml \
+  --args C:/den/CortexWeave/cortexweave.toml \
   --args serve \
   --args --workspace-root \
   --args "$PWD" \

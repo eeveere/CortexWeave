@@ -46,8 +46,8 @@ Capture helpers are run from the target project's own environment. They do not
 install dependencies, edit source files, retry repairs, or submit data:
 
 ```text
-node integrations/vitest/capture_vitest.mjs --workspace C:/dev/project --test-file tests/unit/example.test.ts --output .cortexweave/run.json
-python integrations/unittest/capture_unittest.py tests.test_core.ExampleTests --workspace C:/dev/project --output .cortexweave/run.json
+node integrations/vitest/capture_vitest.mjs --workspace C:/den/project --test-file tests/unit/example.test.ts --output .cortexweave/run.json
+python integrations/unittest/capture_unittest.py tests.test_core.ExampleTests --workspace C:/den/project --output .cortexweave/run.json
 ```
 
 Record a completed bundle through the CLI, then inspect the stored Event:
@@ -92,7 +92,7 @@ target/release/cortexweave --config cortexweave.toml doctor
 4. Register and index a workspace:
 
 ```text
-target/release/cortexweave --config cortexweave.toml workspace add C:/dev/project --name project
+target/release/cortexweave --config cortexweave.toml workspace add C:/den/project --name project
 target/release/cortexweave --config cortexweave.toml workspace list
 target/release/cortexweave --config cortexweave.toml reindex <workspace-id>
 ```

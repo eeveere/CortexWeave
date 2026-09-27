@@ -15,13 +15,13 @@ launch servers from an unrelated working directory.
 {
   "mcpServers": {
     "cortexweave": {
-      "command": "C:\\dev\\CortexWeave\\target\\release\\cortexweave.exe",
+      "command": "C:\\den\\CortexWeave\\target\\release\\cortexweave.exe",
       "args": [
         "--config",
-        "C:\\dev\\CortexWeave\\cortexweave.toml",
+        "C:\\den\\CortexWeave\\cortexweave.toml",
         "serve",
         "--workspace-root",
-        "C:\\dev\\your-project"
+        "C:\\den\\your-project"
       ]
     }
   }
@@ -175,9 +175,9 @@ Put this release-build entry in the project's `.crushrc`, not the global
 ```text
 mcp add cortexweave \
   --type stdio \
-  --command C:/dev/CortexWeave/target/release/cortexweave.exe \
+  --command C:/den/CortexWeave/target/release/cortexweave.exe \
   --args --config \
-  --args C:/dev/CortexWeave/cortexweave.toml \
+  --args C:/den/CortexWeave/cortexweave.toml \
   --args serve \
   --args --workspace-root \
   --args "$PWD" \
@@ -192,10 +192,10 @@ mcp add cortexweave \
   --command cargo \
   --args run \
   --args --manifest-path \
-  --args C:/dev/CortexWeave/Cargo.toml \
+  --args C:/den/CortexWeave/Cargo.toml \
   --args -- \
   --args --config \
-  --args C:/dev/CortexWeave/cortexweave.toml \
+  --args C:/den/CortexWeave/cortexweave.toml \
   --args serve \
   --args --workspace-root \
   --args "$PWD" \
