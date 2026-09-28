@@ -2043,3 +2043,26 @@ key races, legacy writer ordering, exact provenance and ownership, receipt failu
 size rollback, immutability and workspace cascade. Shuttle qualifies its existing
 ordered outbox against this uncommitted sibling patch; publication requires a
 separately qualified immutable revision.
+
+## D111: Generic Chunks Advance Past Their Predecessor
+
+**Status:** Implemented locally on 2026-09-28; uncommitted development patch.
+
+Generic fallback chunking previously rewound every chunk by the configured
+overlap, bounded below by one character. A Markdown heading or blank-line cut
+that produced a chunk no longer than the overlap therefore advanced by a single
+character, and each rewound window rediscovered the same boundary. One short
+section could emit about `overlap` near-identical chunks, wasting embedding work
+and crowding retrieval results with copies of one passage.
+
+Heading and paragraph cuts are now accepted only when they end past the previous
+chunk, so no chunk is contained in its predecessor. A chunk no longer than the
+overlap starts its successor at its own end instead of rewinding. Longer chunks
+keep the configured overlap, and UTF-8 boundary handling is unchanged.
+
+Because boundaries change for existing documents, the generic analyzer version
+moves from `2-target{T}-overlap{O}` to `3-target{T}-overlap{O}`. Analyzer
+version drift makes unchanged fallback documents incompatible, so reconciliation
+re-chunks them rather than retaining duplicate rows. Embedding segmentation
+identity is unaffected: it governs provider splitting of oversized logical
+chunks, not analyzer boundaries.

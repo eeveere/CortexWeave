@@ -39,7 +39,7 @@ impl LanguageAnalyzer for GenericAnalyzer {
     }
     fn analyzer_version(&self) -> String {
         format!(
-            "2-target{}-overlap{}",
+            "3-target{}-overlap{}",
             self.target_chars, self.overlap_chars
         )
     }
@@ -97,12 +97,17 @@ impl LanguageAnalyzer for GenericAnalyzer {
 fn chunk_boundaries(source: &str, target: usize, overlap: usize) -> Vec<(usize, usize)> {
     let mut chunks = Vec::new();
     let mut start = 0;
+    let mut previous_end = 0;
 
     while start < source.len() {
         let target_end = (start + target).min(source.len());
         let mut end = floor_char_boundary(source, target_end);
+        // Structural cuts must extend past the previous chunk. Otherwise an
+        // overlap-rewound window rediscovers the boundary that ended the
+        // previous chunk and emits a chunk contained in it.
         if end < source.len()
             && let Some(heading_end) = markdown_heading_boundary(&source[start..end])
+            && start + heading_end > previous_end
         {
             end = start + heading_end;
         }
@@ -110,18 +115,25 @@ fn chunk_boundaries(source: &str, target: usize, overlap: usize) -> Vec<(usize, 
             && let Some(relative) = source[start..end].rfind("\n\n")
         {
             let paragraph_end = start + relative + 2;
-            if paragraph_end > start {
+            if paragraph_end > previous_end {
                 end = paragraph_end;
             }
         }
-        if end <= start {
-            end = next_char_boundary(source, start);
+        if end <= previous_end {
+            end = next_char_boundary(source, previous_end);
         }
         chunks.push((start, end));
         if end == source.len() {
             break;
         }
-        let proposed = end.saturating_sub(overlap).max(start + 1);
+        // A chunk no longer than the overlap is not rewound; rewinding would
+        // only advance `start` by a character and repeat the same content.
+        let proposed = if end - start <= overlap {
+            end
+        } else {
+            end - overlap
+        };
+        previous_end = end;
         start = next_char_boundary_at_or_after(source, proposed).min(end);
     }
 
@@ -192,5 +204,49 @@ mod tests {
     fn prefers_markdown_heading_boundaries() {
         let chunks = chunk_boundaries("intro words\n# Next\nbody", 18, 0);
         assert_eq!(chunks[0], (0, 12));
+    }
+
+    fn assert_no_slide(source: &str, target: usize, overlap: usize) -> Vec<(usize, usize)> {
+        let chunks = chunk_boundaries(source, target, overlap);
+        assert_eq!(chunks.first().map(|chunk| chunk.0), Some(0));
+        assert_eq!(chunks.last().map(|chunk| chunk.1), Some(source.len()));
+        for pair in chunks.windows(2) {
+            let ((previous_start, previous_end), (start, end)) = (pair[0], pair[1]);
+            assert!(start > previous_start, "no forward progress: {pair:?}");
+            assert!(start <= previous_end, "gap between chunks: {pair:?}");
+            assert!(end > previous_end, "chunk contained in previous: {pair:?}");
+        }
+        let expected = source.len().div_ceil(target - overlap);
+        assert!(
+            chunks.len() <= expected * 2 + 1,
+            "{} chunks for {} bytes, expected about {expected}",
+            chunks.len(),
+            source.len()
+        );
+        chunks
+    }
+
+    #[test]
+    fn short_markdown_sections_do_not_slide_one_character_at_a_time() {
+        let mut source = String::new();
+        for section in 0..20 {
+            source.push_str(&format!("# Section {section}\n\nShort note {section}.\n\n"));
+            source.push_str(&format!("## Detail {section}\n"));
+            for line in 0..30 {
+                source.push_str(&format!(
+                    "- configuration item {section}.{line} stays put\n"
+                ));
+            }
+            source.push('\n');
+        }
+        assert_no_slide(&source, 900, 100);
+    }
+
+    #[test]
+    fn short_paragraphs_do_not_slide_one_character_at_a_time() {
+        let source = "tiny\n\n".to_owned() + &"word ".repeat(40) + "\n\nend\n\n" + &"x".repeat(60);
+        let chunks = assert_no_slide(&source, 40, 10);
+        assert_eq!(chunks[0], (0, 6));
+        assert_eq!(chunks[1].0, 6);
     }
 }
