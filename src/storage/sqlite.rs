@@ -336,7 +336,9 @@ mod tests {
                 .unwrap();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+            ]
         );
     }
 
@@ -378,7 +380,9 @@ mod tests {
                 .unwrap();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+            ]
         );
         assert_eq!(
             upgraded.recent_memories(&workspace.id, 10).await.unwrap(),
@@ -944,6 +948,193 @@ mod tests {
         assert_eq!(provider.embedded_text_count(), 0);
         let repair = result.graph_repair.as_ref().unwrap();
         assert_eq!(repair.final_graph_state, GraphRepairState::Completed);
+    }
+
+    #[tokio::test]
+    async fn foreign_key_child_lookups_use_an_index() {
+        // SQLite resolves foreign-key actions once per deleted parent row, so an
+        // unindexed child key turns a workspace cascade into repeated scans.
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name",
+        )
+        .fetch_all(storage.pool())
+        .await
+        .unwrap();
+        let mut unindexed = Vec::new();
+        for table in tables {
+            let references: Vec<(i64, i64, String, String)> = sqlx::query_as(&format!(
+                "SELECT id, seq, \"table\", \"from\" FROM pragma_foreign_key_list('{table}') ORDER BY id, seq"
+            ))
+            .fetch_all(storage.pool())
+            .await
+            .unwrap();
+            let mut keys: Vec<(String, Vec<String>)> = Vec::new();
+            let mut current_id = None;
+            for (id, _, parent, column) in references {
+                if current_id != Some(id) {
+                    keys.push((parent, Vec::new()));
+                    current_id = Some(id);
+                }
+                keys.last_mut().unwrap().1.push(column);
+            }
+            for (parent, columns) in keys {
+                // One workspace row is deleted per deregistration, so this
+                // lookup runs once and a scan stays linear.
+                if parent == "workspaces" && columns == ["workspace_id"] {
+                    continue;
+                }
+                let predicate = columns
+                    .iter()
+                    .map(|column| format!("{column} = ?"))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let explain = format!("EXPLAIN QUERY PLAN SELECT 1 FROM {table} WHERE {predicate}");
+                let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
+                for _ in &columns {
+                    query = query.bind("");
+                }
+                let plan = query.fetch_all(storage.pool()).await.unwrap();
+                let detail = &plan[0].3;
+                let keyed = columns
+                    .iter()
+                    .filter(|column| column.as_str() != "workspace_id")
+                    .any(|column| {
+                        detail.contains(&format!("({column}=?"))
+                            || detail.contains(&format!(" {column}=?"))
+                    });
+                if !detail.starts_with("SEARCH") || !keyed {
+                    unindexed.push(format!(
+                        "{table}({}) -> {parent}: {detail}",
+                        columns.join(", ")
+                    ));
+                }
+            }
+        }
+        assert!(
+            unindexed.is_empty(),
+            "foreign-key child lookups without a keyed index:\n{}",
+            unindexed.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_fts_projection_follows_chunk_lifecycle_by_rowid() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let workspace = Workspace::new("C:/fts-lifecycle", "fts-lifecycle");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let document = Document::new(&workspace.id, "src/lifecycle.rs");
+        storage.insert_document(&document).await.unwrap();
+        let kept = StoredChunk::new(&document.id, "lifecycle::kept", "fn first_marker() {}");
+        let removed =
+            StoredChunk::new(&document.id, "lifecycle::removed", "fn removed_marker() {}");
+        storage.insert_chunk(&kept).await.unwrap();
+        storage.insert_chunk(&removed).await.unwrap();
+        assert_chunk_fts_matches_chunks(&storage, 2).await;
+
+        sqlx::query("UPDATE chunks SET content = 'fn renamed_marker() {}' WHERE id = ?")
+            .bind(&kept.id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM chunks WHERE id = ?")
+            .bind(&removed.id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        assert_chunk_fts_matches_chunks(&storage, 1).await;
+        assert_eq!(
+            fts_chunk_ids(&storage, "renamed_marker").await,
+            vec![kept.id]
+        );
+        assert!(fts_chunk_ids(&storage, "first_marker").await.is_empty());
+        assert!(fts_chunk_ids(&storage, "removed_marker").await.is_empty());
+
+        sqlx::query("DELETE FROM workspaces WHERE id = ?")
+            .bind(&workspace.id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        assert_chunk_fts_matches_chunks(&storage, 0).await;
+    }
+
+    #[tokio::test]
+    async fn migration_0018_maps_one_fts_projection_per_existing_chunk() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cortexweave.sqlite");
+        let legacy = storage_at_migration(&path, 17).await;
+        let workspace = Workspace::new("C:/fts-upgrade", "fts-upgrade");
+        legacy.insert_workspace(&workspace).await.unwrap();
+        let document = Document::new(&workspace.id, "src/upgrade.rs");
+        legacy.insert_document(&document).await.unwrap();
+        let duplicated =
+            StoredChunk::new(&document.id, "upgrade::duplicated", "fn dup_marker() {}");
+        let unprojected = StoredChunk::new(
+            &document.id,
+            "upgrade::unprojected",
+            "fn missing_marker() {}",
+        );
+        legacy.insert_chunk(&duplicated).await.unwrap();
+        legacy.insert_chunk(&unprojected).await.unwrap();
+        for (chunk_id, content) in [
+            (duplicated.id.as_str(), "fn dup_marker() {}"),
+            ("deleted-chunk", "fn orphan_marker() {}"),
+        ] {
+            sqlx::query(
+                "INSERT INTO chunk_fts(chunk_id, content, symbol, qualified_symbol, relative_path) VALUES (?, ?, '', '', 'src/upgrade.rs')",
+            )
+            .bind(chunk_id)
+            .bind(content)
+            .execute(legacy.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query("DELETE FROM chunk_fts WHERE chunk_id = ?")
+            .bind(&unprojected.id)
+            .execute(legacy.pool())
+            .await
+            .unwrap();
+        legacy.pool.close().await;
+
+        let upgraded = SqliteStorage::open(&path).await.unwrap();
+        assert_chunk_fts_matches_chunks(&upgraded, 2).await;
+        assert_eq!(
+            fts_chunk_ids(&upgraded, "dup_marker").await,
+            vec![duplicated.id.clone()]
+        );
+        assert_eq!(
+            fts_chunk_ids(&upgraded, "missing_marker").await,
+            vec![unprojected.id]
+        );
+        assert!(fts_chunk_ids(&upgraded, "orphan_marker").await.is_empty());
+
+        sqlx::query("DELETE FROM chunks WHERE id = ?")
+            .bind(&duplicated.id)
+            .execute(upgraded.pool())
+            .await
+            .unwrap();
+        assert_chunk_fts_matches_chunks(&upgraded, 1).await;
+        assert!(fts_chunk_ids(&upgraded, "dup_marker").await.is_empty());
+    }
+
+    async fn assert_chunk_fts_matches_chunks(storage: &SqliteStorage, expected: i64) {
+        let counts: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM chunks), (SELECT COUNT(*) FROM chunk_fts_rows), (SELECT COUNT(*) FROM chunk_fts), (SELECT COUNT(*) FROM chunk_fts_rows map JOIN chunk_fts fts ON fts.rowid = map.fts_rowid JOIN chunks chunk ON chunk.id = map.chunk_id WHERE fts.chunk_id = map.chunk_id AND fts.content = chunk.content)",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts, (expected, expected, expected, expected));
+    }
+
+    async fn fts_chunk_ids(storage: &SqliteStorage, term: &str) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT chunk_id FROM chunk_fts WHERE chunk_fts MATCH ? ORDER BY chunk_id",
+        )
+        .bind(term)
+        .fetch_all(storage.pool())
+        .await
+        .unwrap()
     }
 
     struct PopulatedPreGraphFixture {

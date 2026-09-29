@@ -2066,3 +2066,56 @@ version drift makes unchanged fallback documents incompatible, so reconciliation
 re-chunks them rather than retaining duplicate rows. Embedding segmentation
 identity is unaffected: it governs provider splitting of oversized logical
 chunks, not analyzer boundaries.
+
+## D112: Cascaded Deletes Resolve Every Child by Index
+
+**Status:** Implemented locally on 2026-09-28; uncommitted development patch.
+
+Workspace deregistration deletes one workspace row and relies on `ON DELETE`
+actions and triggers, which SQLite resolves once per deleted parent row. Two
+per-row lookups scanned whole tables. The `chunks_fts_delete` and
+`chunks_fts_update` triggers located the projection through `chunk_fts.chunk_id`.
+That is an FTS5 `UNINDEXED` column, which `CREATE INDEX` cannot cover, so every
+chunk delete or update scanned the whole FTS table. `graph_nodes.chunk_id` had
+no index, so each chunk delete also scanned `graph_nodes` to apply `SET NULL`.
+The same shape, at smaller scale, appeared for graph facts, candidates, task and
+session references, and Experience references to Events, where the only usable
+index narrowed the lookup to the workspace.
+
+Migration 0018 adds `chunk_fts_rows(fts_rowid INTEGER PRIMARY KEY, chunk_id
+UNIQUE)`. The chunk triggers are its only writers and address FTS rows by rowid.
+It has no foreign key to `chunks`, because a cascade would remove the map row
+before the AFTER DELETE trigger reads it. Explicit integer keys and FTS5 rowids
+both survive VACUUM, whereas implicit `chunks.rowid` would not. The migration
+first enforces one projection per live chunk. It drops orphans and older
+duplicates, backfills missing projections, then maps the existing rows. The
+migration also indexes every foreign-key child key whose lookup was a scan or a
+workspace-only range. Foreign keys to `workspaces(id)` alone are exempt: one
+workspace is deleted at a time, so they cost one linear pass. A
+`foreign_key_child_lookups_use_an_index` test checks the query plan of every
+foreign key, so a later migration cannot reintroduce the scan.
+
+The deregistration transaction is unchanged, keeping D108's single-transaction
+receipt. Batching per document or across transactions would not reduce total
+work, and cross-transaction batches would expose a partially deleted workspace.
+Incremental reindexing benefits too, because chunk upserts fire the update
+trigger.
+
+Measured on a scratch copy of the 2026-09-28 pre-deregistration backup
+(227,105 chunks in total), deregistering workspace `75e0d2e2…` (706 documents,
+168,523 chunks and embeddings, 189 graph nodes) gave these results:
+
+- Before: 227 ms per chunk, from 5 documents and 1,195 chunks deleted in 271 s
+  and then rolled back. That extrapolates to several hours, which matches the
+  run killed after one hour.
+- After: 0.20 ms per chunk on the same sample. The whole cascaded delete took
+  24.3 s, or 26.2 s with commit. Migration 0018 took about 9 s on that copy.
+  Afterwards `foreign_key_check` was clean, the FTS5 integrity check passed,
+  and no FTS or map row was left without its chunk.
+- End to end with the release CLI on a fresh copy, opening the database and
+  applying migration 0018 took 11.5 s. `workspace deregister` then completed in
+  29.6 s wall-clock, 22.9 s of it the cascaded delete, and returned the receipt
+  with the previewed counts.
+
+`memory_fts` and `experience_fts` keep the old identity-column delete triggers.
+Their cardinality is small today, but they have the same per-row scan shape.
