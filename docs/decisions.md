@@ -2119,3 +2119,30 @@ Measured on a scratch copy of the 2026-09-28 pre-deregistration backup
 
 `memory_fts` and `experience_fts` keep the old identity-column delete triggers.
 Their cardinality is small today, but they have the same per-row scan shape.
+D113 moves both to the rowid pattern.
+
+## D113: Memory and Experience FTS Projections Are Keyed by Rowid
+
+**Status:** Implemented locally on 2026-09-28; uncommitted development patch.
+
+After D112, `memory_fts` and `experience_fts` were the last projections whose
+triggers located rows through an FTS5 `UNINDEXED` identity column. Each memory
+update or delete, and each Experience removed by a workspace cascade, scanned
+the whole FTS table. `experience_health_check` had the same shape: it left-joined
+`experience_fts` on `experience_id`, which costs a full FTS scan per Experience.
+
+Migration 0019 applies D112 unchanged. It adds `memory_fts_rows` and
+`experience_fts_rows`, each with an `INTEGER PRIMARY KEY` FTS rowid and a
+`UNIQUE` identity column and no foreign key. The migration drops orphan
+projections and older duplicates, maps the survivors, and backfills rows that
+lack a projection. It then replaces the insert, update and delete triggers.
+Experiences reject `UPDATE`, so they keep no update trigger, and they are
+deleted only by the workspace cascade (D108). The health check now reaches each
+projection through the map and FTS rowid, and still requires the projection's
+identity column to match. It reports a missing projection exactly as before.
+
+Search queries are unchanged. They start from an FTS `MATCH` and join the
+owning row by its primary key, so they never look up the identity column.
+Tests cover the trigger lifecycle for both domains, the health check detecting
+a lost projection, and upgrading from migration 0018 with duplicate, missing
+and orphan projections.

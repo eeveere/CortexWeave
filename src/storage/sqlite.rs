@@ -104,7 +104,8 @@ impl SqliteStorage {
                 .await?;
         }
         let missing_fts_projection: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM experiences experience LEFT JOIN experience_fts fts ON fts.experience_id = experience.id WHERE fts.experience_id IS NULL",
+            // experience_fts.experience_id is UNINDEXED; reach the projection by rowid.
+            "SELECT COUNT(*) FROM experiences experience WHERE NOT EXISTS (SELECT 1 FROM experience_fts_rows map JOIN experience_fts fts ON fts.rowid = map.fts_rowid WHERE map.experience_id = experience.id AND fts.experience_id = experience.id)",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -337,7 +338,7 @@ mod tests {
         assert_eq!(
             applied,
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
             ]
         );
     }
@@ -381,7 +382,7 @@ mod tests {
         assert_eq!(
             applied,
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
             ]
         );
         assert_eq!(
@@ -1135,6 +1136,298 @@ mod tests {
         .fetch_all(storage.pool())
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn memory_fts_projection_follows_memory_lifecycle_by_rowid() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let workspace = Workspace::new("C:/memory-fts-lifecycle", "memory-fts-lifecycle");
+        storage.insert_workspace(&workspace).await.unwrap();
+        let kept = MemoryRecord::new(&workspace.id, MemoryKind::Decision, "keep first_marker");
+        let removed = MemoryRecord::new(&workspace.id, MemoryKind::Decision, "drop removed_marker");
+        storage.insert_memory(&kept).await.unwrap();
+        storage.insert_memory(&removed).await.unwrap();
+        assert_memory_fts_matches_memories(&storage, 2).await;
+
+        sqlx::query("UPDATE memories SET content = 'keep renamed_marker' WHERE id = ?")
+            .bind(&kept.id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM memories WHERE id = ?")
+            .bind(&removed.id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        assert_memory_fts_matches_memories(&storage, 1).await;
+        assert_eq!(
+            fts_memory_ids(&storage, "renamed_marker").await,
+            vec![kept.id]
+        );
+        assert!(fts_memory_ids(&storage, "first_marker").await.is_empty());
+        assert!(fts_memory_ids(&storage, "removed_marker").await.is_empty());
+
+        sqlx::query("DELETE FROM workspaces WHERE id = ?")
+            .bind(&workspace.id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        assert_memory_fts_matches_memories(&storage, 0).await;
+    }
+
+    #[tokio::test]
+    async fn experience_fts_projection_follows_experience_lifecycle_by_rowid() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let scope = closed_experience_scope(&storage, "experience-fts-lifecycle").await;
+        insert_raw_experience(&storage, &scope, "lifecycle-first", 1, "first_marker run.").await;
+        insert_raw_experience(
+            &storage,
+            &scope,
+            "lifecycle-second",
+            2,
+            "second_marker run.",
+        )
+        .await;
+        assert_experience_fts_matches_experiences(&storage, 2).await;
+        storage.experience_health_check().await.unwrap();
+        assert_eq!(
+            fts_experience_ids(&storage, "second_marker").await,
+            vec!["lifecycle-second".to_string()]
+        );
+
+        // The health check reaches projections through the rowid map, so a lost
+        // projection is still reported.
+        sqlx::query(
+            "DELETE FROM experience_fts WHERE rowid = (SELECT fts_rowid FROM experience_fts_rows WHERE experience_id = ?)",
+        )
+        .bind("lifecycle-first")
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        assert!(storage.experience_health_check().await.is_err());
+
+        // Experiences are deleted only through their workspace cascade.
+        sqlx::query("DELETE FROM workspaces WHERE id = ?")
+            .bind(&scope.workspace.id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        assert_experience_fts_matches_experiences(&storage, 0).await;
+    }
+
+    #[tokio::test]
+    async fn migration_0019_maps_one_fts_projection_per_existing_memory_and_experience() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cortexweave.sqlite");
+        let legacy = storage_at_migration(&path, 18).await;
+        let scope = closed_experience_scope(&legacy, "fts-projection-upgrade").await;
+        let workspace_id = scope.workspace.id.clone();
+
+        let duplicated_memory =
+            MemoryRecord::new(&workspace_id, MemoryKind::Decision, "memory dup_marker");
+        let unprojected_memory =
+            MemoryRecord::new(&workspace_id, MemoryKind::Decision, "memory missing_marker");
+        legacy.insert_memory(&duplicated_memory).await.unwrap();
+        legacy.insert_memory(&unprojected_memory).await.unwrap();
+        for (memory_id, content) in [
+            (duplicated_memory.id.as_str(), "memory dup_marker"),
+            ("deleted-memory", "memory orphan_marker"),
+        ] {
+            sqlx::query(
+                "INSERT INTO memory_fts(memory_id, content, kind) VALUES (?, ?, 'decision')",
+            )
+            .bind(memory_id)
+            .bind(content)
+            .execute(legacy.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query("DELETE FROM memory_fts WHERE memory_id = ?")
+            .bind(&unprojected_memory.id)
+            .execute(legacy.pool())
+            .await
+            .unwrap();
+
+        insert_raw_experience(&legacy, &scope, "upgrade-duplicated", 1, "dup_marker run.").await;
+        insert_raw_experience(
+            &legacy,
+            &scope,
+            "upgrade-unprojected",
+            2,
+            "missing_marker run.",
+        )
+        .await;
+        for (experience_id, summary) in [
+            ("upgrade-duplicated", "dup_marker run."),
+            ("deleted-experience", "orphan_marker run."),
+        ] {
+            sqlx::query(
+                "INSERT INTO experience_fts(experience_id, summary, failure_key, failure_components, failure_path, failure_symbol_key, outcome, verification_status) VALUES (?, ?, '', '', '', '', 'success', 'explicitly_accepted')",
+            )
+            .bind(experience_id)
+            .bind(summary)
+            .execute(legacy.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query("DELETE FROM experience_fts WHERE experience_id = ?")
+            .bind("upgrade-unprojected")
+            .execute(legacy.pool())
+            .await
+            .unwrap();
+        legacy.pool.close().await;
+
+        let upgraded = SqliteStorage::open(&path).await.unwrap();
+        assert_memory_fts_matches_memories(&upgraded, 2).await;
+        assert_eq!(
+            fts_memory_ids(&upgraded, "dup_marker").await,
+            vec![duplicated_memory.id.clone()]
+        );
+        assert_eq!(
+            fts_memory_ids(&upgraded, "missing_marker").await,
+            vec![unprojected_memory.id]
+        );
+        assert!(fts_memory_ids(&upgraded, "orphan_marker").await.is_empty());
+        assert_experience_fts_matches_experiences(&upgraded, 2).await;
+        upgraded.experience_health_check().await.unwrap();
+        assert_eq!(
+            fts_experience_ids(&upgraded, "dup_marker").await,
+            vec!["upgrade-duplicated".to_string()]
+        );
+        assert_eq!(
+            fts_experience_ids(&upgraded, "missing_marker").await,
+            vec!["upgrade-unprojected".to_string()]
+        );
+        assert!(
+            fts_experience_ids(&upgraded, "orphan_marker")
+                .await
+                .is_empty()
+        );
+
+        sqlx::query("DELETE FROM memories WHERE id = ?")
+            .bind(&duplicated_memory.id)
+            .execute(upgraded.pool())
+            .await
+            .unwrap();
+        assert_memory_fts_matches_memories(&upgraded, 1).await;
+        assert!(fts_memory_ids(&upgraded, "dup_marker").await.is_empty());
+
+        sqlx::query("DELETE FROM workspaces WHERE id = ?")
+            .bind(&workspace_id)
+            .execute(upgraded.pool())
+            .await
+            .unwrap();
+        assert_memory_fts_matches_memories(&upgraded, 0).await;
+        assert_experience_fts_matches_experiences(&upgraded, 0).await;
+    }
+
+    async fn assert_memory_fts_matches_memories(storage: &SqliteStorage, expected: i64) {
+        let counts: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM memories), (SELECT COUNT(*) FROM memory_fts_rows), (SELECT COUNT(*) FROM memory_fts), (SELECT COUNT(*) FROM memory_fts_rows map JOIN memory_fts fts ON fts.rowid = map.fts_rowid JOIN memories memory ON memory.id = map.memory_id WHERE fts.memory_id = map.memory_id AND fts.content = memory.content)",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts, (expected, expected, expected, expected));
+    }
+
+    async fn fts_memory_ids(storage: &SqliteStorage, term: &str) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT memory_id FROM memory_fts WHERE memory_fts MATCH ? ORDER BY memory_id",
+        )
+        .bind(term)
+        .fetch_all(storage.pool())
+        .await
+        .unwrap()
+    }
+
+    async fn assert_experience_fts_matches_experiences(storage: &SqliteStorage, expected: i64) {
+        let counts: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM experiences), (SELECT COUNT(*) FROM experience_fts_rows), (SELECT COUNT(*) FROM experience_fts), (SELECT COUNT(*) FROM experience_fts_rows map JOIN experience_fts fts ON fts.rowid = map.fts_rowid JOIN experiences experience ON experience.id = map.experience_id WHERE fts.experience_id = map.experience_id AND fts.summary = experience.summary)",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts, (expected, expected, expected, expected));
+    }
+
+    async fn fts_experience_ids(storage: &SqliteStorage, term: &str) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT experience_id FROM experience_fts WHERE experience_fts MATCH ? ORDER BY experience_id",
+        )
+        .bind(term)
+        .fetch_all(storage.pool())
+        .await
+        .unwrap()
+    }
+
+    struct ExperienceScope {
+        workspace: Workspace,
+        session: Session,
+        task: Task,
+        episode: Episode,
+    }
+
+    async fn closed_experience_scope(storage: &SqliteStorage, name: &str) -> ExperienceScope {
+        let workspace = Workspace::new(format!("C:/{name}"), name);
+        storage.insert_workspace(&workspace).await.unwrap();
+        let session = Session::new(&workspace.id, serde_json::json!({}));
+        storage.insert_session(&session).await.unwrap();
+        let task = Task::new(
+            &workspace.id,
+            Some(session.id.clone()),
+            "project experiences",
+            serde_json::json!({}),
+        );
+        storage.insert_task(&task).await.unwrap();
+        let episode = Episode::new(
+            &workspace.id,
+            &session.id,
+            Some(task.id.clone()),
+            EpisodeType::Debugging,
+            None,
+            EpisodeCreator::User,
+        );
+        storage.insert_episode(&episode).await.unwrap();
+        sqlx::query("UPDATE episodes SET status = ?, version = ?, ended_at = ? WHERE workspace_id = ? AND id = ?")
+            .bind(EpisodeStatus::Closed.as_str())
+            .bind(1_i64)
+            .bind(Utc::now())
+            .bind(&workspace.id)
+            .bind(&episode.id)
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        ExperienceScope {
+            workspace,
+            session,
+            task,
+            episode,
+        }
+    }
+
+    async fn insert_raw_experience(
+        storage: &SqliteStorage,
+        scope: &ExperienceScope,
+        id: &str,
+        fingerprint: u8,
+        summary: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO experiences(id, workspace_id, session_id, task_id, episode_id, failure_signature_json, failure_key, failure_components, failure_path, failure_symbol_key, outcome, verification_status, verification_reasons_json, evidence_strength, summary, extractor_id, extractor_version, summary_renderer_version, canonicalization_version, consolidation_fingerprint, proposal_hash, created_at) VALUES (?, ?, ?, ?, ?, NULL, NULL, '', NULL, NULL, 'success', 'explicitly_accepted', '[]', 'moderate', ?, 'cortexweave.failure_to_verification', '1', '1', '1', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(&scope.workspace.id)
+        .bind(&scope.session.id)
+        .bind(&scope.task.id)
+        .bind(&scope.episode.id)
+        .bind(summary)
+        .bind(format!("{fingerprint:064x}"))
+        .bind("b".repeat(64))
+        .bind(Utc::now())
+        .execute(storage.pool())
+        .await
+        .unwrap();
     }
 
     struct PopulatedPreGraphFixture {
